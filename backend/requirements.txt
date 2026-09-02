@@ -1,0 +1,4 @@
+PyMuPDF==1.28.0
+numpy==2.4.4
+scipy==1.18.1
+openpyxl==3.1.5
