@@ -40,7 +40,7 @@ PCF_LIBRARY_ROOT = ROOT / "backend" / "PCF"
 TUTORIAL_ROOT = ROOT / "backend" / "tutorial"
 TUTORIAL_EXPORT_ROOT = ROOT / "data" / "tutorial-exports"
 AUDIT_ROOT = ROOT / "data" / "audit"
-APP_VERSION = os.environ.get("DRAWING_MARK_RECOGNITION_VERSION", "2.0.3")
+APP_VERSION = os.environ.get("DRAWING_MARK_RECOGNITION_VERSION", "2.0.4")
 BUILD_ID = os.environ.get("DRAWING_MARK_RECOGNITION_BUILD_ID", "local")
 MAX_BODY_BYTES = int(os.environ.get("DRAWING_MARK_RECOGNITION_MAX_BODY_MB", "350")) * 1024 * 1024
 MAX_PENDING_ANALYSES = max(1, int(os.environ.get("DRAWING_MARK_RECOGNITION_MAX_PENDING_ANALYSES", "50")))
@@ -859,8 +859,29 @@ def _run_analysis_job(
             ANALYSIS_CONDITION.notify_all()
 
 
+CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+
+
+def _is_client_disconnect(exc: BaseException) -> bool:
+    """Return whether a response failed because the browser closed the socket."""
+
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, CLIENT_DISCONNECT_ERRORS):
+            return True
+        if isinstance(current, OSError) and (
+            getattr(current, "winerror", None) in {10053, 10054}
+            or getattr(current, "errno", None) in {32, 54, 103, 104}
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class ApiHandler(SimpleHTTPRequestHandler):
-    server_version = f"WeldMarker/{APP_VERSION}"
+    server_version = f"DrawingMarkRecognition/{APP_VERSION}"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if args and "GET /api/health " in str(args[0]):
@@ -880,8 +901,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_OPTIONS(self) -> None:  # noqa: N802
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self.end_headers()
+        try:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+        except Exception as exc:
+            self._handle_exception(exc)
 
     def _json(self, status: int, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -910,16 +934,28 @@ class ApiHandler(SimpleHTTPRequestHandler):
         return payload
 
     def _handle_exception(self, exc: Exception) -> None:
-        if isinstance(exc, ApiError):
-            self._json(exc.status, {"error": str(exc)})
+        # Closing a tab cancels in-flight PDF and API requests.  The standard
+        # library reports this as WinError 10053/10054 (or BrokenPipe on Unix);
+        # it is normal client behaviour and must not trigger a second write.
+        if _is_client_disconnect(exc):
             return
-        if isinstance(exc, (ValueError, TypeError, KeyError, json.JSONDecodeError)):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
-        error_id = uuid.uuid4().hex[:12]
-        _console(f"请求处理失败 [{error_id}]：{exc}")
-        traceback.print_exc()
-        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"服务器内部错误，错误编号：{error_id}"})
+        try:
+            if isinstance(exc, ApiError):
+                self._json(exc.status, {"error": str(exc)})
+                return
+            if isinstance(exc, (ValueError, TypeError, KeyError, json.JSONDecodeError)):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            error_id = uuid.uuid4().hex[:12]
+            _console(f"请求处理失败 [{error_id}]：{exc}")
+            traceback.print_exc()
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"服务器内部错误，错误编号：{error_id}"})
+        except OSError as response_error:
+            # The client can disconnect between the original failure and the
+            # error response headers/body.  Nothing remains to send.
+            if _is_client_disconnect(response_error):
+                return
+            raise
 
     def _file(self, path: Path, download_name: str | None = None, cache_control: str | None = None) -> None:
         if not path.is_file():

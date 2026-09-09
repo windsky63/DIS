@@ -34,6 +34,18 @@ class _Response:
 
 
 class ServerTests(unittest.TestCase):
+    def test_client_disconnect_does_not_write_an_error_response(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler._json = lambda *_args, **_kwargs: self.fail("断开的客户端不应再次写入响应")
+        with patch.object(server.traceback, "print_exc") as print_exc:
+            handler._handle_exception(ConnectionAbortedError(10053, "客户端已关闭"))
+        print_exc.assert_not_called()
+
+    def test_disconnect_while_writing_error_response_is_suppressed(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler._json = lambda *_args, **_kwargs: (_ for _ in ()).throw(BrokenPipeError())
+        handler._handle_exception(server.ApiError("请求失败"))
+
     def test_module_worker_is_served_with_javascript_mime_type(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             worker = Path(folder_name) / "pdf.worker.mjs"

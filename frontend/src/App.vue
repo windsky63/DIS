@@ -146,6 +146,7 @@ const notice = ref('')
 const errorOpen = ref(false)
 const noticeOpen = ref(false)
 const messagesEnabled = ref(localStorage.getItem('weld-marker.messages-enabled') !== 'false')
+const clearReferencesOnDesignUpload = ref(localStorage.getItem('weld-marker.clear-references-on-design-upload') !== 'false')
 const noticeChannel = createLatestMessageChannel(value => {
   if (value) {
     notice.value = value
@@ -475,6 +476,9 @@ watch(messagesEnabled, value => {
     errorOpen.value = false
     clearNotice()
   }
+})
+watch(clearReferencesOnDesignUpload, value => {
+  localStorage.setItem('weld-marker.clear-references-on-design-upload', String(value))
 })
 watch(error, value => {
   if (value && messagesEnabled.value) errorOpen.value = true
@@ -1161,6 +1165,7 @@ async function setProjectFiles(value) {
   clearProject()
   if (!rawFiles.length) return
   if (!pdfs.length) { error.value = '所选内容中没有 PDF 文件。'; return }
+  if (clearReferencesOnDesignUpload.value) clearReferenceFiles()
   projectPdfs.value = pdfs
   projectResults.value = new Array(pdfs.length).fill(null)
   targetPdf.value = pdfs[0]
@@ -1171,7 +1176,9 @@ async function loadTutorialSample() {
   tutorialSampleLoading.value = true
   try {
     const [sample, tutorialResult] = await Promise.all([api.getTutorialFile(), api.getTutorialSession()])
-    const tutorialReferences = await api.getJobReferenceFiles(tutorialResult.jobId)
+    // Keep the tutorial responsive on remote servers: register the reference
+    // manifest now and download only the PDF matched to the visible page.
+    const tutorialReferences = await api.getJobReferenceManifest(tutorialResult.jobId)
     projectMode.value = 'single'
     referenceMode.value = 'pdf'
     referenceProjectMode.value = 'single'
@@ -3201,6 +3208,11 @@ function exportCsv() {
             <div class="section-label">草稿与恢复</div>
             <div class="shortcut-settings__hint">查看浏览器中自动保存的图纸工作区，可继续编辑或删除不需要的草稿。</div>
             <v-btn block color="secondary" variant="tonal" class="mt-3" @click="openDraftManager">打开草稿</v-btn>
+          </div>
+          <div class="settings-section">
+            <div class="section-label">文件切换</div>
+            <v-switch v-model="clearReferencesOnDesignUpload" color="secondary" hide-details label="上传设计图时清除已选对照文件" />
+            <div class="shortcut-settings__hint mt-2">默认开启，避免新设计图误用上一个任务的对照 PDF；取消文件选择或选择无效文件不会清除。</div>
           </div>
           <div class="settings-section">
             <div class="section-label">画布性能</div>

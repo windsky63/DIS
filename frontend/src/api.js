@@ -35,7 +35,7 @@ async function getJobReferenceFiles(jobId) {
 }
 
 async function getJobReferenceManifest(jobId) {
-  const manifest = await request(`/api/jobs/${jobId}/references`)
+  const manifest = await request(jobId === 'tutorial-000207' ? '/api/tutorial/references' : `/api/jobs/${jobId}/references`)
   return (manifest.files || []).map(item => ({
     ...item,
     weldMarkerReferenceIndex: Number(item.index),
