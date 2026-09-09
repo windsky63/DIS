@@ -1,0 +1,33 @@
+services:
+  drawing-mark-recognition:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: "${DRAWING_MARK_RECOGNITION_VERSION:-2.0.3}"
+        BUILD_ID: "${DRAWING_MARK_RECOGNITION_BUILD_ID:-manual}"
+        NODE_IMAGE: "${DRAWING_MARK_RECOGNITION_NODE_IMAGE:-node:24-bookworm-slim}"
+        PYTHON_IMAGE: "${DRAWING_MARK_RECOGNITION_PYTHON_IMAGE:-python:3.14-slim-bookworm}"
+        NPM_REGISTRY: "${NPM_REGISTRY:-https://registry.npmjs.org}"
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
+    image: "drawing-mark-recognition:${DRAWING_MARK_RECOGNITION_VERSION:-2.0.3}"
+    pull_policy: build
+    container_name: drawing-mark-recognition
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${DRAWING_MARK_RECOGNITION_PORT:-8768}:8768"
+    environment:
+      DRAWING_MARK_RECOGNITION_VERSION: "${DRAWING_MARK_RECOGNITION_VERSION:-2.0.3}"
+      DRAWING_MARK_RECOGNITION_BUILD_ID: "${DRAWING_MARK_RECOGNITION_BUILD_ID:-manual}"
+      DRAWING_MARK_RECOGNITION_MAX_BODY_MB: "${DRAWING_MARK_RECOGNITION_MAX_BODY_MB:-350}"
+      DRAWING_MARK_RECOGNITION_MAX_CONCURRENT_ANALYSES: "${DRAWING_MARK_RECOGNITION_MAX_CONCURRENT_ANALYSES:-2}"
+      DRAWING_MARK_RECOGNITION_MAX_PENDING_ANALYSES: "${DRAWING_MARK_RECOGNITION_MAX_PENDING_ANALYSES:-4}"
+      DRAWING_MARK_RECOGNITION_JOB_RETENTION_DAYS: "${DRAWING_MARK_RECOGNITION_JOB_RETENTION_DAYS:-90}"
+      DRAWING_MARK_RECOGNITION_AUDIT_MAX_MB: "${DRAWING_MARK_RECOGNITION_AUDIT_MAX_MB:-10}"
+      DRAWING_MARK_RECOGNITION_AUDIT_BACKUPS: "${DRAWING_MARK_RECOGNITION_AUDIT_BACKUPS:-5}"
+    volumes:
+      - drawing-mark-recognition-data:/app/data
+
+volumes:
+  drawing-mark-recognition-data:

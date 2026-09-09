@@ -1,0 +1,23 @@
+{
+  "name": "drawing-mark-recognition-frontend",
+  "private": true,
+  "version": "2.0.3",
+  "type": "module",
+  "packageManager": "npm@11.12.1",
+  "engines": {
+    "node": ">=22.13 <25"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 3004",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 3004",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "6.0.8",
+    "pdfjs-dist": "6.3.289",
+    "vite": "8.2.2",
+    "vue": "3.5.42",
+    "vuetify": "4.1.12"
+  }
+}
