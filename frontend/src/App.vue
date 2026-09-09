@@ -7,6 +7,7 @@ import { createLatestMessageChannel } from './messageChannel'
 import { readEditablePdfAttachments } from './pdfWorkspace'
 import { referenceFileSlot, resolveMatchedReference, resolveReferenceFileIndex } from './referenceIdentity'
 import { deleteDraft, fileFingerprint, listDrafts, loadDraft, loadDraftPage, loadSnapshot, loadStoredFile, saveDraft, saveSnapshot } from './workspaceStorage'
+import { materializeWorkspaceFile, restoreWorkspaceFile } from './workspaceFile'
 import TutorialTour from './components/TutorialTour.vue'
 
 let pdfjsModulePromise
@@ -525,19 +526,8 @@ function storeWorkspaceFile(file) {
     referenceIndex: Number.isInteger(file.weldMarkerReferenceIndex) ? file.weldMarkerReferenceIndex : null
   }
 }
-function restoreWorkspaceFile(saved) {
-  if (saved?.storedFileKey && !saved?.blob) return saved
-  if (!saved?.blob || !(saved.blob instanceof Blob)) return null
-  const file = new File([saved.blob], saved.name || 'file', { type: saved.type || saved.blob.type, lastModified: Number(saved.lastModified) || Date.now() })
-  if (saved.relativePath) Object.defineProperty(file, 'webkitRelativePath', { configurable: true, value: saved.relativePath })
-  if (Number.isInteger(saved.referenceIndex)) Object.defineProperty(file, 'weldMarkerReferenceIndex', { configurable: true, value: saved.referenceIndex })
-  if (saved.storedFileKey) Object.defineProperty(file, 'weldMarkerStoredFileKey', { configurable: true, value: saved.storedFileKey })
-  return file
-}
 async function materializeStoredWorkspaceFile(saved) {
-  const restored = restoreWorkspaceFile(saved)
-  if (restored instanceof Blob || !restored?.storedFileKey) return restored
-  return restoreWorkspaceFile(await loadStoredFile(restored))
+  return materializeWorkspaceFile(saved, loadStoredFile)
 }
 function firstSavedStyle(documentResult, componentType = '') {
   return (documentResult?.pages || []).flatMap(page => page.candidates || []).find(item => (
@@ -1191,7 +1181,8 @@ async function loadTutorialSample() {
     activeReferenceIndex.value = tutorialReferences.length ? 0 : -1
     referencePdf.value = tutorialReferences[0] || null
     const tutorialStartPage = tutorialResult.pages?.[0]?.page || tutorialResult.analyzedRange?.[0] || 1
-    await loadTargetPdf(sample, true, false, tutorialStartPage)
+    const targetLoaded = await loadTargetPdf(sample, true, false, tutorialStartPage)
+    if (!targetLoaded || !targetDocument.value) throw new Error('教程图纸未能交给 PDF 渲染器')
     result.value = cloneValue(tutorialResult)
     restoreMarkerAppearances({ result: tutorialResult })
     if (resultHasMissingNumbers(result.value)) {
@@ -1219,7 +1210,7 @@ async function loadTargetPdf(file, fitAfter = true, checkRecovery = true, initia
   targetLoadToken.value = token
   const requestedFile = file
   file = await materializeStoredWorkspaceFile(file)
-  if (token !== targetLoadToken.value || !file) return
+  if (token !== targetLoadToken.value || !file) return false
   if (targetPdf.value === requestedFile) targetPdf.value = file
   const projectFileIndex = projectPdfs.value.indexOf(requestedFile)
   if (projectFileIndex >= 0) projectPdfs.value[projectFileIndex] = file
@@ -1228,7 +1219,7 @@ async function loadTargetPdf(file, fitAfter = true, checkRecovery = true, initia
   const previousDocument = targetDocument.value
   targetDocument.value = null
   previousDocument?.destroy?.()
-  if (!file) return
+  if (!file) return false
   if (checkRecovery) targetPreparation.value = { active: true, completed: 0, total: 4, message: '正在读取 PDF 并检查可恢复版本' }
   const markPreparationStep = () => {
     if (!checkRecovery || token !== targetLoadToken.value) return
@@ -1251,7 +1242,7 @@ async function loadTargetPdf(file, fitAfter = true, checkRecovery = true, initia
       : Promise.resolve(null)
 
     const document = await documentPromise
-    if (token !== targetLoadToken.value) { document.destroy(); return }
+    if (token !== targetLoadToken.value) { document.destroy?.(); return false }
     const embeddedPromise = checkRecovery
       ? readEditablePdfAttachments(document).then(({ embedded, sourceContent }) => {
           const sourceFile = embedded && sourceContent
@@ -1262,14 +1253,14 @@ async function loadTargetPdf(file, fitAfter = true, checkRecovery = true, initia
       : Promise.resolve(null)
     const [{ fingerprint, draft }, embeddedAssets, recent] = await Promise.all([fingerprintAndDraftPromise, embeddedPromise, recentPromise])
     const embedded = embeddedAssets?.embedded || null
-    if (token !== targetLoadToken.value) { document.destroy(); return }
+    if (token !== targetLoadToken.value) { document.destroy?.(); return false }
     targetDocument.value = document
     activeFileFingerprint.value = fingerprint
     previewPage.value = Math.max(1, Math.min(document.numPages, Number(initialPage) || 1))
     await nextTick()
     if (!checkRecovery) {
       await renderUnifiedCanvas(fitAfter)
-      return
+      return true
     }
     const options = []
     if (embedded) {
@@ -1314,11 +1305,13 @@ async function loadTargetPdf(file, fitAfter = true, checkRecovery = true, initia
       await renderUnifiedCanvas(fitAfter)
       if (token === targetLoadToken.value) targetPreparation.value = { ...targetPreparation.value, active: false }
     }
+    return token === targetLoadToken.value && Boolean(targetDocument.value)
   } catch (cause) {
     if (token === targetLoadToken.value) {
       targetPreparation.value = { ...targetPreparation.value, active: false }
       error.value = `PDF 加载失败：${cause.message || cause}`
     }
+    return false
   }
 }
 
@@ -1675,7 +1668,7 @@ async function loadReferencePdf(file, fitAfter = true) {
     referencePdf.value = resolvedFile
     const pdfjs = await loadPdfjs()
     const document = await pdfjs.getDocument({ data: await resolvedFile.arrayBuffer() }).promise
-    if (token !== referenceLoadToken.value) { document.destroy(); return }
+    if (token !== referenceLoadToken.value) { document.destroy?.(); return }
     referenceDocument.value = document
     await nextTick()
     await renderUnifiedCanvas(fitAfter)
