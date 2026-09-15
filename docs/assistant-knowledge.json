@@ -5,6 +5,7 @@
     { "id": "usage-guide", "path": "docs/usage.md", "title": "使用指南" },
     { "id": "system-architecture", "path": "docs/architecture.md", "title": "系统架构与工作机制" },
     { "id": "development-guide", "path": "docs/development.md", "title": "开发与测试" },
-    { "id": "deployment-guide", "path": "docs/deployment.md", "title": "部署、配置、数据与安全" }
+    { "id": "deployment-guide", "path": "docs/deployment.md", "title": "部署、配置、数据与安全" },
+    { "id": "ai-assistant-guide", "path": "docs/ai-assistant.md", "title": "AI 助手与本地文档检索" }
   ]
 }
