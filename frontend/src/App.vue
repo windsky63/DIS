@@ -37,6 +37,8 @@ import { useServiceHealth } from './composables/useServiceHealth'
 import { useUploadCloseGuard } from './composables/useUploadCloseGuard'
 import { useWorkspaceHistory } from './composables/useWorkspaceHistory'
 import { useMarkerPresentation } from './composables/useMarkerPresentation'
+import { useRegionDeletion } from './composables/useRegionDeletion.js'
+import { useThemeSettings } from './composables/useThemeSettings.js'
 import { useMarkerEditor } from './composables/useMarkerEditor'
 import { useReferenceWorkspace } from './composables/useReferenceWorkspace'
 import { useDetachedReferenceWindow } from './composables/useDetachedReferenceWindow'
@@ -58,6 +60,7 @@ import { saveAndCloseWorkspace } from './saveAndCloseWorkspace'
 import { DEFAULT_MANUAL_LEADER_LENGTH, normalizeManualLeaderLength } from './manualMarkerPlacement'
 import { createProjectProfiles } from './projectProfiles'
 
+const { preference: themePreference, options: themeOptions } = useThemeSettings()
 let pageCollaboration = null
 const clientInstanceId = browserClientInstanceId()
 const auth = useAuthSession({ client: api })
@@ -886,6 +889,12 @@ pageCollaboration = usePageCollaboration({
   switchPage: page => projectWorkspace.changePage(page),
 })
 const collaborationReadOnly = computed(() => pageCollaboration.readOnly.value)
+const regionDeletion = useRegionDeletion({
+  pageData, canvasSurface, canvasLayout, readOnly: collaborationReadOnly,
+  manualAddMode, selectedId, swapSourceId, editingId,
+  operations: { beginHistory, commitHistory, logAudit, showNotice },
+})
+const { active: regionDeleteMode, rectangle: regionDeleteRectangle, rectangleStyle: regionDeleteRectangleStyle } = regionDeletion
 watch(pageCollaboration.dirtyPages, dirty => { unsavedReviewChanges.value = dirty.size > 0 }, { deep: true })
 watch([pageCollaboration.saveState, pageCollaboration.leaseUncertain], ([state, leaseUncertain]) => {
   uncertainReviewSave.value = leaseUncertain || state === 'saving' || state === 'error'
@@ -1157,6 +1166,7 @@ onBeforeUnmount(() => {
   targetDocument.value?.destroy?.()
   referenceDocument.value?.destroy?.()
   disposeAnalysisWorkflow()
+  regionDeletion.exit()
 })
 
 function syncAppViewport() {
@@ -1182,6 +1192,11 @@ function handleShortcut(event) {
   if (matchesShortcut(event, shortcutSettings.value.analyze)) { event.preventDefault(); if (!shortcutConflict.value && !loading.value && targetPdf.value) void analyze(); return }
   if (matchesShortcut(event, shortcutSettings.value.save)) { event.preventDefault(); if (!shortcutConflict.value && result.value) void save(); return }
   if (matchesShortcut(event, shortcutSettings.value.openReferenceWindow)) { event.preventDefault(); if (!shortcutConflict.value) void openReferenceWindow(); return }
+  if (matchesShortcut(event, shortcutSettings.value.deleteRegion)) {
+    event.preventDefault()
+    if (!shortcutConflict.value && !event.repeat) regionDeletion.toggle()
+    return
+  }
   if (manualAddMode.value && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'a') {
     event.preventDefault()
     const point = canvasPointerPosition.value
@@ -1201,7 +1216,7 @@ function handleShortcut(event) {
   if (event.key === '0') { event.preventDefault(); fitCanvas(); return }
   if (event.key === 'ArrowLeft') { event.preventDefault(); stepPage(-1); return }
   if (event.key === 'ArrowRight') { event.preventDefault(); stepPage(1); return }
-  if (event.key === 'Escape') { cancelInlineEdit(); selectedId.value = ''; swapSourceId.value = ''; shortcutMenu.value = false; manualAddMode.value = false }
+  if (event.key === 'Escape') { regionDeletion.exit(); cancelInlineEdit(); selectedId.value = ''; swapSourceId.value = ''; shortcutMenu.value = false; manualAddMode.value = false }
 }
 
 async function changePage(pageNumber) {
@@ -1455,7 +1470,7 @@ function exportCsv() {
 
           <div class="work-grid">
             <v-card class="canvas-card" elevation="2">
-              <v-toolbar data-tour="canvas-toolbar" density="compact" color="#1c2b35" theme="dark">
+              <v-toolbar data-tour="canvas-toolbar" density="compact" color="header">
                 <v-chip class="ml-2" size="small" color="primary">待标识 ISO PDF</v-chip>
                 <v-chip v-if="referenceDocument" class="ml-2" size="small" color="secondary">对照 PDF</v-chip>
                 <v-btn v-if="referenceDetached" size="x-small" icon class="ml-1 detached-reference-button" variant="text" aria-label="恢复同屏显示对照图" @click="restoreEmbeddedReference"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5.5" width="8" height="13" rx="1.3" /><rect x="12.5" y="5.5" width="8" height="13" rx="1.3" /><path d="m16.5 9-3 3 3 3" /></svg><v-tooltip activator="parent">恢复同屏显示对照图</v-tooltip></v-btn>
@@ -1482,9 +1497,11 @@ function exportCsv() {
                 <v-btn size="small" @click="zoomBy(.8)">−</v-btn><span class="zoom-indicator">{{ Math.round(zoom * 100) }}%</span><v-btn size="small" @click="zoomBy(1.25)">+</v-btn><v-btn size="small" @click="fitCanvas">适合</v-btn>
               </v-toolbar>
 
-              <div ref="canvasViewport" data-tour="canvas-surface" class="canvas-viewport" :class="{ panning: canvasPanState, 'manual-adding': manualAddMode }" @click="onCanvasClick" @wheel.prevent="onCanvasWheel" @pointerdown.capture="clearReferenceHintSelection" @pointerdown="startCanvasPan" @pointermove="moveCanvasPan" @pointerleave="canvasPointerPosition = null" @pointerup="endCanvasPan" @pointercancel="endCanvasPan" @auxclick.prevent>
+              <div ref="canvasViewport" data-tour="canvas-surface" class="canvas-viewport" :class="{ panning: canvasPanState, 'manual-adding': manualAddMode, 'region-deleting': regionDeleteMode }" @click="onCanvasClick" @wheel.prevent="onCanvasWheel" @pointerdown.capture="clearReferenceHintSelection($event); regionDeletion.start($event)" @pointerdown="startCanvasPan" @pointermove="moveCanvasPan($event); regionDeletion.move($event)" @pointerleave="canvasPointerPosition = null" @pointerup="endCanvasPan($event); regionDeletion.finish($event)" @pointercancel="endCanvasPan($event); regionDeletion.cancelSelection()" @lostpointercapture="regionDeletion.cancelSelection()" @auxclick.prevent>
+                <div v-if="regionDeleteMode" class="region-delete-hint" role="status">区域删除 · 左键拖框 · Esc 退出 · Ctrl+Z 撤销</div>
                 <div ref="canvasSurface" class="canvas-surface" :style="canvasSurfaceStyle">
                   <canvas ref="pdfCanvas" class="pdf-canvas"></canvas>
+                  <div v-if="regionDeleteRectangle" class="region-delete-rectangle" :style="regionDeleteRectangleStyle" aria-hidden="true" />
                   <div v-for="marker in (displayEmbeddedReference ? referenceDisplayMarkers : [])" :key="marker.key" class="reference-focus-marker" :class="[`reference-focus-marker--${marker.type}`, { 'reference-focus-marker--all': referenceShowAll }]" :style="marker.style" :title="marker.label"><i :style="marker.linkStyle" aria-hidden="true" /><span>{{ marker.label }}</span></div>
                   <svg v-if="result && pageData" class="leader-layer" :viewBox="`0 0 ${canvasLayout.width} ${canvasLayout.height}`" preserveAspectRatio="none" aria-hidden="true">
                     <line v-for="item in pageData.candidates.filter(candidate => candidate.included !== false)" :key="`line-${item.id}`" :ref="element => setLeaderLineElement(item.id, element)" :x1="anchorPoint(item).x" :y1="anchorPoint(item).y" :x2="leaderEnd(item).x" :y2="leaderEnd(item).y" :style="leaderStyle(item)" />
@@ -1637,6 +1654,8 @@ function exportCsv() {
       v-model:performance-mode="canvasPerformanceMode"
       v-model:appearance-tab="settingsAppearanceTab"
       v-model:manual-leader-length="manualLeaderLength"
+      v-model:theme-preference="themePreference"
+      :theme-options="themeOptions"
       :canvas-performance-options="canvasPerformanceOptions"
       :canvas-performance-profile="canvasPerformanceProfile"
       :marker-appearance-groups="markerAppearanceGroups"

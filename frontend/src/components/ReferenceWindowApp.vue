@@ -12,6 +12,10 @@ import { createDetachedReferenceFocus, resolveDetachedReferenceViewport } from '
 import { loadPdfDocument } from '../services/pdfDocument.js'
 import { useCanvasViewport } from '../composables/useCanvasViewport.js'
 
+import { useThemeSettings } from '../composables/useThemeSettings.js'
+
+useThemeSettings()
+
 const channelId = referenceChannelFromLocation()
 const channel = channelId && typeof BroadcastChannel !== 'undefined'
   ? new BroadcastChannel(referenceChannelName(channelId))
@@ -246,7 +250,7 @@ onBeforeUnmount(() => {
 
 <template>
   <v-app class="reference-window-app">
-    <v-app-bar color="#1c2b35" density="compact" theme="dark" class="reference-window-toolbar">
+    <v-app-bar color="header" density="compact" class="reference-window-toolbar">
       <div class="reference-document-meta ml-3">
         <v-chip size="small" color="secondary">对照 PDF</v-chip>
         <div class="reference-window-title"><strong>{{ title }}</strong><span>{{ subtitle }}</span></div>
@@ -354,4 +358,14 @@ onBeforeUnmount(() => {
   .reference-document-meta { min-width: 160px; }.reference-window-title strong { max-width: 130px; }
   .reference-follow-button { width: 30px; padding: 0; justify-content: center; overflow: hidden; color: transparent; gap: 0; }.reference-follow-button i { flex: 0 0 auto; }
 }
+
+.reference-window-app { background: rgb(var(--v-theme-background)); }
+.reference-window-title strong, .reference-page-total, .reference-zoom-indicator, .reference-follow-button { color: rgb(var(--v-theme-on-header)); }
+.reference-window-title span { color: rgb(var(--v-theme-on-surface-muted)); }
+.reference-toolbar-button:hover, .reference-follow-button:hover { background: rgb(var(--v-theme-surface-muted)) !important; }
+.reference-follow-button.active { background: rgb(var(--v-theme-surface-selected)); color: rgb(var(--v-theme-on-surface)); }
+.reference-hints-panel, .reference-hints-panel__header, .reference-hints-panel .reference-hint-list { background: rgb(var(--v-theme-surface)); border-color: rgb(var(--v-theme-outline)); }
+.reference-hints-panel__header strong, .reference-window-empty strong { color: rgb(var(--v-theme-on-surface)); }
+.reference-hints-panel__header span, .reference-window-empty { color: rgb(var(--v-theme-on-surface-muted)); }
+.reference-window-viewport { background: rgb(var(--v-theme-background)); }
 </style>

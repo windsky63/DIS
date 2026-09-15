@@ -23,7 +23,7 @@ defineEmits([
 </script>
 
 <template>
-  <v-app-bar color="#173e57" elevation="3" :height="height">
+  <v-app-bar color="header" elevation="3" :height="height">
     <v-app-bar-title class="ml-5">
       <div class="app-title">
         <span class="app-title__icon" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M5 16h7m8 0h7M12 9v14m8-14v14" /><circle cx="16" cy="16" r="5" /><path d="m13.2 13.2 5.6 5.6m0-5.6-5.6 5.6" /></svg></span>
@@ -72,6 +72,7 @@ defineEmits([
               <v-list-item title="A" subtitle="在 W、V、F、S 模式中，于当前鼠标位置新增对应类型的人工编号" />
               <v-list-item title="Ctrl+C / Ctrl+V" subtitle="复制选中标识 / 在当前鼠标位置粘贴" />
               <v-list-item :title="shortcuts.deleteWeld" subtitle="删除当前选中焊口，可用 Ctrl+Z 撤销" />
+              <v-list-item :title="shortcuts.deleteRegion" subtitle="区域删除：左键拖框删除定位点在框内的标识；Esc 退出" />
               <v-list-item :title="shortcuts.openReferenceWindow" subtitle="打开对照图分屏窗口；已打开时聚焦" />
               <v-list-item title="← / →" subtitle="切换上一张或下一张设计图页" />
               <v-list-item title="+ / − / 0" subtitle="放大、缩小、适合画布" />

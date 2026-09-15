@@ -56,5 +56,5 @@ test('tutorial seen value is written and checked consistently', async () => {
 test('clicking anywhere in the drawing clears a selected reference hint', async () => {
   const source = await readFile(new URL('../src/App.vue', import.meta.url), 'utf8')
   assert.match(source, /function clearReferenceHintSelection\(\)/)
-  assert.match(source, /@pointerdown\.capture="clearReferenceHintSelection"/)
+  assert.match(source, /@pointerdown\.capture="clearReferenceHintSelection\(\$event\); regionDeletion.start\(\$event\)"/)
 })

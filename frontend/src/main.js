@@ -12,6 +12,7 @@ import 'vuetify/styles'
 import App from './App.vue'
 import ReferenceWindowApp from './components/ReferenceWindowApp.vue'
 import './style.css'
+import { APP_THEMES, loadThemePreference, resolveThemeName } from './themePreferences.js'
 
 const vuetify = createVuetify({
   components: {
@@ -23,21 +24,8 @@ const vuetify = createVuetify({
   },
   directives: { Ripple },
   theme: {
-    defaultTheme: 'weldLight',
-    themes: {
-      weldLight: {
-        dark: false,
-        colors: {
-          primary: '#102a43',
-          secondary: '#2d8b89',
-          accent: '#c45d3c',
-          background: '#edf2f5',
-          surface: '#ffffff',
-          error: '#b64932',
-          info: '#2d8b89'
-        }
-      }
-    }
+    defaultTheme: resolveThemeName(loadThemePreference(), window.matchMedia('(prefers-color-scheme: dark)').matches),
+    themes: APP_THEMES,
   },
   defaults: {
     VBtn: { rounded: 0 },

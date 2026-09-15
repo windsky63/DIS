@@ -4,6 +4,8 @@ import test from 'node:test'
 import { createSSRApp } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createServer } from 'vite'
+import { createVuetify } from 'vuetify'
+import { APP_THEMES } from '../src/themePreferences.js'
 
 
 test('App setup resolves every workspace operation binding', async () => {
@@ -24,6 +26,7 @@ test('App setup resolves every workspace operation binding', async () => {
   try {
     const { default: App } = await vite.ssrLoadModule('/src/App.vue')
     const app = createSSRApp(App)
+    app.use(createVuetify({ theme: { defaultTheme: 'weldLight', themes: APP_THEMES } }))
     app.config.warnHandler = () => undefined
     await assert.doesNotReject(() => renderToString(app))
   } finally {

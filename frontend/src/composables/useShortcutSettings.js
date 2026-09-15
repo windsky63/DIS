@@ -10,6 +10,7 @@ export const SHORTCUT_DEFAULTS = Object.freeze({
   modifyAll: 'M',
   swapWeld: 'X',
   deleteWeld: 'Backspace',
+  deleteRegion: 'D',
   openReferenceWindow: 'Ctrl+M',
 })
 
@@ -22,6 +23,7 @@ export const SHORTCUT_SETTING_ROWS = Object.freeze([
   { action: 'addSupport', label: '进入支架修改模式' },
   { action: 'modifyAll', label: '进入全局标识修改模式' },
   { action: 'swapWeld', label: '交换焊口编号' },
+  { action: 'deleteRegion', label: '进入区域删除模式' },
   { action: 'deleteWeld', label: '删除选中焊口' },
   { action: 'openReferenceWindow', label: '打开对照图分屏窗口' },
 ])
