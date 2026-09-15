@@ -3,7 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
-  steps: { type: Array, default: () => [] }
+  steps: { type: Array, default: () => [] },
+  tutorialTitle: { type: String, default: '操作教程' },
 })
 const emit = defineEmits(['update:modelValue', 'close', 'step-change'])
 const currentIndex = ref(0)
@@ -101,7 +102,7 @@ onBeforeUnmount(() => {
       <div v-if="targetRect" class="tutorial-tour__focus" :style="{ left: `${targetRect.left}px`, top: `${targetRect.top}px`, width: `${targetRect.width}px`, height: `${targetRect.height}px` }" />
       <section ref="cardElement" class="tutorial-tour__card" :style="cardStyle">
         <header class="tutorial-tour__header">
-          <span class="tutorial-tour__eyebrow">操作教程 · {{ currentIndex + 1 }} / {{ steps.length }}</span>
+          <span class="tutorial-tour__eyebrow">{{ tutorialTitle }} · {{ currentStep.stage || '操作讲解' }} · {{ currentIndex + 1 }} / {{ steps.length }}</span>
           <button type="button" class="tutorial-tour__close" aria-label="退出教程" @click="close(false)">×</button>
         </header>
         <div class="tutorial-tour__progress" aria-hidden="true"><i v-for="(_, index) in steps" :key="index" :class="{ active: index <= currentIndex }" /></div>
@@ -112,7 +113,7 @@ onBeforeUnmount(() => {
         <footer>
           <span />
           <button v-if="currentIndex" type="button" class="tutorial-tour__previous" @click="previous">上一步</button>
-          <button type="button" class="tutorial-tour__next" @click="next">{{ isLastStep ? '开始使用' : '下一步' }}</button>
+          <button type="button" class="tutorial-tour__next" @click="next">{{ isLastStep ? '完成教程' : '下一步' }}</button>
         </footer>
       </section>
     </div>

@@ -285,11 +285,13 @@ class ServerTests(unittest.TestCase):
                     }
                     handler._json = lambda status, payload, headers=None: responses.append((status, payload))
                     handler.do_PUT()
+                review_history = server._job_store().page_review_history(job_id)
 
             saved = json.loads(result_path.read_text(encoding="utf-8"))
             self.assertEqual([response[0] for response in responses], [200, 200])
             self.assertEqual([page["reviewRevision"] for page in saved["pages"]], [1, 1])
             self.assertEqual([page["candidates"][0]["number"] for page in saved["pages"]], ["A1", "B1"])
+            self.assertEqual([(item["page_number"], item["username"]) for item in review_history], [(1, "张三"), (2, "李四")])
 
     def test_stale_page_revision_is_rejected_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -661,8 +663,10 @@ class ServerTests(unittest.TestCase):
         first = server._analysis_signature(payload)
         different_range = server._analysis_signature({**payload, "startPage": 99, "endPage": 120})
         different_mode = server._analysis_signature({**payload, "symbolConfig": {"detectionMode": "comparison"}})
+        different_project = server._analysis_signature({**payload, "project": {"id": "another-project", "name": "其他项目"}})
         self.assertNotEqual(first, different_range)
         self.assertNotEqual(first, different_mode)
+        self.assertNotEqual(first, different_project)
         with patch.object(server, "ANALYSIS_ALGORITHM_VERSION", "next-version"):
             self.assertNotEqual(first, server._analysis_signature(payload))
 
@@ -683,6 +687,7 @@ class ServerTests(unittest.TestCase):
             handler._request_user = {"userId": "user-1", "username": "Reviewer01"}
             handler._read_json = lambda *_args: {
                 "targetPdf": {"name": "drawing.pdf", "dataBase64": base64.b64encode(pdf_bytes).decode("ascii")},
+                "project": {"id": "chengda-indonesia", "name": "成达印尼项目"},
                 "symbolConfig": {"detectionMode": "placement"},
             }
             responses = []
@@ -699,6 +704,8 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(created["createdBy"], expected)
             self.assertEqual(meta["createdBy"], expected)
             self.assertEqual(result["createdBy"], expected)
+            self.assertEqual(meta["project"]["id"], "chengda-indonesia")
+            self.assertEqual(result["project"]["name"], "成达印尼项目")
             self.assertEqual(row["createdBy"], expected)
 
     def test_reconcile_imports_interrupted_jobs_back_into_queue(self) -> None:

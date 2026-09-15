@@ -13,6 +13,7 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 from engine import analyze_documents, dump_result  # noqa: E402
+from label_layout import optimize_result_label_positions  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parent
@@ -65,6 +66,7 @@ def main() -> None:
         "progressMessage": "教程预解析结果已就绪",
         "revision": 0,
     })
+    optimize_result_label_positions(result)
     dump_result(RESULT_PATH, result)
     print(f"pages={len(result.get('pages', []))}, candidates={sum(len(page.get('candidates', [])) for page in result.get('pages', []))}")
 

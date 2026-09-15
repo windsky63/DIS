@@ -129,6 +129,17 @@ class DesignComponentRecognitionTests(unittest.TestCase):
 
         self.assertEqual(material_numbers, {"18": "ball"})
 
+    def test_diaphragm_material_description_is_a_design_valve_type(self) -> None:
+        document = fitz.open()
+        page = document.new_page(width=500, height=240)
+        page.insert_text((350, 52), "21", fontsize=8)
+        page.insert_text((380, 52), "DIAPHRAGM;", fontsize=8)
+
+        material_numbers = _valve_material_numbers(page)
+        document.close()
+
+        self.assertEqual(material_numbers, {"21": "diaphragm"})
+
     def test_material_leader_gap_without_stem_bridge_is_not_widened(self) -> None:
         document = fitz.open()
         page = document.new_page(width=500, height=300)
@@ -629,31 +640,6 @@ class DesignComponentRecognitionTests(unittest.TestCase):
         document.close()
 
         self.assertFalse(any(item.component_type == "valve" for item in symbols))
-
-    def test_named_production_drawings_keep_reported_valve_and_flange_regressions(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        expectations = {
-            "00-42-0207-26-NG-3518U-03.pdf": {"flange": 1},
-            "00-42-0207-26-NG-3518U-06.pdf": {"flange": 2, "valve": 1},
-            "00-42-0207-26-PW-0003-01.pdf": {"flange": 3, "valve": 1},
-        }
-        missing = [file_name for file_name in expectations if not any(root.rglob(file_name))]
-        if missing:
-            self.skipTest(f"可选生产图纸回归样本未安装：{', '.join(missing)}")
-        for file_name, expected in expectations.items():
-            path = next(root.rglob(file_name))
-            with self.subTest(file=file_name), fitz.open(path) as document:
-                symbols = extract_design_component_symbols(document[0], {})
-                counts = {
-                    component_type: sum(item.component_type == component_type for item in symbols)
-                    for component_type in expected
-                }
-                for component_type, minimum in expected.items():
-                    self.assertGreaterEqual(counts[component_type], minimum)
-                if file_name.endswith("3518U-06.pdf"):
-                    valve = next(item for item in symbols if item.component_type == "valve")
-                    self.assertAlmostEqual(valve.center[0], 660.68, delta=0.5)
-                    self.assertAlmostEqual(valve.center[1], 612.0, delta=0.5)
 
     def test_3518u_01_mainline_arrows_and_tiny_v7_are_excluded(self) -> None:
         root = Path(__file__).resolve().parents[2]

@@ -4,12 +4,13 @@ import {
   VAlert, VApp, VAppBar, VAppBarTitle, VBtn, VBtnToggle, VCard, VCardActions,
   VCardText, VCardTitle, VChip, VContainer, VDialog, VDivider, VFileInput, VList,
   VListItem, VListItemTitle, VMain, VMenu, VNavigationDrawer, VProgressCircular,
-  VProgressLinear, VSelect, VSlider, VSnackbar, VSpacer, VTab, VTabs,
+  VForm, VProgressLinear, VSelect, VSlider, VSnackbar, VSpacer, VTab, VTabs,
   VSwitch, VTextField, VToolbar, VTooltip
 } from 'vuetify/components'
 import { Ripple } from 'vuetify/directives'
 import 'vuetify/styles'
 import App from './App.vue'
+import ReferenceWindowApp from './components/ReferenceWindowApp.vue'
 import './style.css'
 
 const vuetify = createVuetify({
@@ -17,7 +18,7 @@ const vuetify = createVuetify({
     VAlert, VApp, VAppBar, VAppBarTitle, VBtn, VBtnToggle, VCard, VCardActions,
     VCardText, VCardTitle, VChip, VContainer, VDialog, VDivider, VFileInput, VList,
     VListItem, VListItemTitle, VMain, VMenu, VNavigationDrawer, VProgressCircular,
-    VProgressLinear, VSelect, VSlider, VSnackbar, VSpacer, VTab, VTabs,
+    VForm, VProgressLinear, VSelect, VSlider, VSnackbar, VSpacer, VTab, VTabs,
     VSwitch, VTextField, VToolbar, VTooltip
   },
   directives: { Ripple },
@@ -47,4 +48,8 @@ const vuetify = createVuetify({
   }
 })
 
-createApp(App).use(vuetify).mount('#app')
+const rootComponent = new URLSearchParams(window.location.search).get('view') === 'reference'
+  ? ReferenceWindowApp
+  : App
+
+createApp(rootComponent).use(vuetify).mount('#app')

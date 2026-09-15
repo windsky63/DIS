@@ -238,7 +238,8 @@ def _valve_material_numbers(page: fitz.Page) -> dict[str, str]:
     for keyword in words:
         value = str(keyword[4]).upper()
         valve_type = (
-            "ball" if "BALL" in value
+            "diaphragm" if "DIAPHRAGM" in value
+            else "ball" if "BALL" in value
             else "gate" if value == "GATE"
             else "lift-check" if value == "LIFT"
             else None

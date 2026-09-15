@@ -6,7 +6,7 @@ title Drawing Mark Recognition System - Service Console
 
 echo ============================================================
 echo   Drawing Mark Recognition System
-echo   This window owns both services. Closing it stops both.
+echo   This window owns the frontend, API and analysis worker.
 echo ============================================================
 echo.
 

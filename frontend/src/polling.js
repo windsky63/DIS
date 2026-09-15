@@ -1,0 +1,1 @@
+export const ANALYSIS_POLL_INTERVAL_MS = 2000

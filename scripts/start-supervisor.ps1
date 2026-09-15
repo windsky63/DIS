@@ -12,6 +12,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 
 $systemRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $backendScript = Join-Path $systemRoot 'backend\server.py'
+$workerScript = Join-Path $systemRoot 'backend\worker.py'
 $frontendRoot = Join-Path $systemRoot 'frontend'
 $frontendPackage = Join-Path $frontendRoot 'package.json'
 $frontendModules = Join-Path $frontendRoot 'node_modules'
@@ -171,10 +172,12 @@ function Assert-PortFree([int]$Port) {
 
 $job = [IntPtr]::Zero
 $backendProcess = $null
+$workerProcess = $null
 $frontendProcess = $null
 
 try {
     if (-not (Test-Path -LiteralPath $backendScript -PathType Leaf)) { throw "Backend entry is missing: $backendScript" }
+    if (-not (Test-Path -LiteralPath $workerScript -PathType Leaf)) { throw "Worker entry is missing: $workerScript" }
     if (-not (Test-Path -LiteralPath $frontendPackage -PathType Leaf)) { throw "Frontend package is missing: $frontendPackage" }
     if (-not (Test-Path -LiteralPath $frontendModules -PathType Container)) {
         throw 'Vue dependencies are missing. Run npm.cmd install in the frontend directory.'
@@ -195,6 +198,10 @@ try {
         -FileName $python -Arguments '-u -X utf8 backend\server.py' -WorkingDirectory $systemRoot -Job $job
     Wait-ServiceReady -Name 'Python API' -Url 'http://127.0.0.1:8768/api/health' -Process $backendProcess
 
+    Write-Host '[START] Python analysis worker...' -ForegroundColor Cyan
+    $workerProcess = Start-ConsoleProcess `
+        -FileName $python -Arguments '-u -X utf8 backend\worker.py' -WorkingDirectory $systemRoot -Job $job
+
     Write-Host '[START] Vue 3 frontend...' -ForegroundColor Cyan
     $viteArguments = '"' + $viteScript + '" --host 127.0.0.1 --port 3004'
     $frontendProcess = Start-ConsoleProcess `
@@ -211,6 +218,7 @@ try {
     $startedAt = [DateTime]::UtcNow
     while ($true) {
         if ($backendProcess.HasExited) { throw "Python API stopped with code $($backendProcess.ExitCode)." }
+        if ($workerProcess.HasExited) { throw "Python worker stopped with code $($workerProcess.ExitCode)." }
         if ($frontendProcess.HasExited) { throw "Vue frontend stopped with code $($frontendProcess.ExitCode)." }
         if ($RunSeconds -gt 0 -and ([DateTime]::UtcNow - $startedAt).TotalSeconds -ge $RunSeconds) { break }
         Start-Sleep -Seconds 1
@@ -224,10 +232,10 @@ catch {
 finally {
     if ($job -ne [IntPtr]::Zero) {
         Write-Host ''
-        Write-Host '[STOP] Shutting down backend and frontend...' -ForegroundColor Yellow
+        Write-Host '[STOP] Shutting down API, worker and frontend...' -ForegroundColor Yellow
         [void][DrawingMarkRecognitionJob]::CloseHandle($job)
     }
-    foreach ($process in @($frontendProcess, $backendProcess)) {
+    foreach ($process in @($frontendProcess, $workerProcess, $backendProcess)) {
         if (-not $process) { continue }
         try {
             if (-not $process.HasExited) {

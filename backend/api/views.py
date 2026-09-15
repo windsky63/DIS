@@ -62,7 +62,7 @@ PCF_LIBRARY_ROOT = ROOT / "backend" / "PCF"
 TUTORIAL_ROOT = ROOT / "backend" / "tutorial"
 TUTORIAL_EXPORT_ROOT = ROOT / "data" / "tutorial-exports"
 AUDIT_ROOT = ROOT / "data" / "audit"
-APP_VERSION = os.environ.get("DRAWING_MARK_RECOGNITION_VERSION", "2.0.6")
+APP_VERSION = os.environ.get("DRAWING_MARK_RECOGNITION_VERSION", "2.0.9")
 BUILD_ID = os.environ.get("DRAWING_MARK_RECOGNITION_BUILD_ID", "local")
 MAX_BODY_BYTES = int(os.environ.get("DRAWING_MARK_RECOGNITION_MAX_BODY_MB", "350")) * 1024 * 1024
 MAX_JOB_REQUEST_BYTES = 2 * 1024 * 1024
@@ -441,6 +441,7 @@ def _analysis_signature(payload: dict[str, Any]) -> str:
         "pcfFile": _payload_file_signature(payload.get("pcfFile")),
         "pcfFolder": payload.get("pcfFolder") or None,
         "pcfInventory": pcf_inventory,
+        "project": payload.get("project") or {},
         "symbolConfig": payload.get("symbolConfig") or {},
         "startPage": max(1, int(payload.get("startPage") or 1)),
         "endPage": int(payload["endPage"]) if payload.get("endPage") else None,
@@ -1373,6 +1374,13 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     )
                     current.pop("labelLayout", None)
                     _atomic_dump(result_path, current)
+                    _job_store().record_page_review(
+                        job_id,
+                        page_number,
+                        int(updated_page["reviewRevision"]),
+                        user,
+                        str(updated_page["reviewedAt"]),
+                    )
                 self._json(HTTPStatus.OK, {
                     "saved": True,
                     "page": page_number,
@@ -1489,6 +1497,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 "batchIndex": int(payload.get("batchIndex") or 0),
                 "analysisSignature": analysis_signature,
                 "analysisAlgorithmVersion": ANALYSIS_ALGORITHM_VERSION,
+                "project": payload.get("project") if isinstance(payload.get("project"), dict) else {},
                 "symbolConfig": payload.get("symbolConfig") if isinstance(payload.get("symbolConfig"), dict) else {},
                 "startPage": requested_start,
                 "endPage": requested_end,
@@ -1513,6 +1522,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 "progressTotalUnits": max(1, len(references) + total_pages),
                 "progressPercent": 15,
                 "progressMessage": "任务已创建，等待进入解析队列",
+                "project": payload.get("project") if isinstance(payload.get("project"), dict) else {},
                 "numberingConfig": payload.get("numberingConfig") if isinstance(payload.get("numberingConfig"), dict) else {},
                 "createdBy": created_by,
             }
@@ -1605,7 +1615,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
             component_type = str(candidate.get("componentType") or "").lower()
             if component_type in {"valve", "flange", "support"}:
                 component_styles.setdefault(component_type, style)
-            elif not weld_style:
+            elif component_type != "special" and str(candidate.get("componentKind") or "").lower() != "special-marker" and not weld_style:
                 weld_style = style
         embedded_result.update({
             "schema": "weld-marker.editable.v1",
@@ -1648,7 +1658,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
             component_type = str(candidate.get("componentType") or "").lower()
             if component_type in {"valve", "flange", "support"}:
                 component_styles.setdefault(component_type, style)
-            elif not weld_style:
+            elif component_type != "special" and str(candidate.get("componentKind") or "").lower() != "special-marker" and not weld_style:
                 weld_style = style
         embedded_result.update({
             "markerStyle": weld_style,

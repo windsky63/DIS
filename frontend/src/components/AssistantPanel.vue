@@ -8,7 +8,8 @@ import {
 } from '../assistantConversations'
 import { resizeComposerTextarea, shouldSubmitComposer } from '../assistantComposer'
 import { renderAssistantMarkdown } from '../assistantMarkdown'
-import { assistantConfigurationAlert, visibleAssistantError } from '../assistantPresentation'
+import { assistantConfigurationAlert, replaceQuickStart, selectQuickStarts, visibleAssistantError } from '../assistantPresentation'
+import { createStreamingAssistantMessage } from '../assistantStreamState'
 import AssistantRetrievalDetails from './AssistantRetrievalDetails.vue'
 
 const props = defineProps({
@@ -34,12 +35,21 @@ let persistenceChain = Promise.resolve()
 const activeConversation = computed(() => conversations.value.find(item => item.id === activeId.value) || conversations.value[0])
 const displayedError = computed(() => visibleAssistantError(configuration.value.configured, error.value))
 const configurationAlert = computed(() => assistantConfigurationAlert(configuration.value.configured))
-const quickStarts = [
+const quickStartPool = [
   '如何开始识别？',
   '怎样选择对照资料？',
   '如何核对识别结果？',
   '怎样保存和导出？',
+  '如何推入解析队列？',
+  '怎样恢复已完成的任务？',
+  '如何调整标识框和引线？',
+  '怎样新增遗漏的标识？',
+  '如何修改标识编号？',
+  '怎样撤销或重做操作？',
+  '如何调整各类标识外观？',
+  '怎样归档或删除解析任务？',
 ]
+const quickStarts = ref(selectQuickStarts(quickStartPool))
 
 function persist() {
   if (!loadedUsername) return
@@ -74,8 +84,13 @@ function newConversation() {
   draft.value = ''
   error.value = ''
   historyOpen.value = false
+  quickStarts.value = selectQuickStarts(quickStartPool)
   persist()
   nextTick(scrollToBottom)
+}
+
+function refreshQuickStart(index) {
+  quickStarts.value = replaceQuickStart(quickStarts.value, quickStartPool, index)
 }
 
 function selectConversation(id) {
@@ -123,7 +138,7 @@ async function sendMessage(content = draft.value) {
   scrollToBottom()
   sending.value = true
   retrievalStatus.value = '正在连接 AI 服务'
-  const streamedMessage = { role: 'assistant', content: '', sources: [] }
+  const streamedMessage = createStreamingAssistantMessage()
   conversation.messages.push(streamedMessage)
   try {
     const response = await api.chatStream(requestMessages, props.context, delta => {
@@ -235,7 +250,10 @@ onMounted(() => { if (props.modelValue) void loadHistory() })
 
               <div class="assistant-composer-area">
                 <div v-if="(activeConversation?.messages?.length || 0) <= 1" class="assistant-quick-starts">
-                  <button v-for="item in quickStarts" :key="item" type="button" @click="sendMessage(item)">{{ item }}</button>
+                  <div v-for="(item, index) in quickStarts" :key="item" class="assistant-quick-start-row">
+                    <button class="assistant-quick-start-question" type="button" @click="sendMessage(item)">{{ item }}</button>
+                    <button class="assistant-quick-start-refresh" type="button" :aria-label="`换一个问题：${item}`" title="换一个问题" @click="refreshQuickStart(index)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5" /><path d="M18.1 16.5A8 8 0 1 1 19.5 9L20 12" /></svg></button>
+                  </div>
                 </div>
                 <div v-if="configurationAlert" class="assistant-config-error" role="alert">{{ configurationAlert.message }}</div>
                 <div v-if="displayedError" class="assistant-error" role="alert">{{ displayedError }}</div>
@@ -275,7 +293,7 @@ onMounted(() => { if (props.modelValue) void loadHistory() })
 .assistant-message { max-width: 760px; margin: 0 auto 26px; display: flex; align-items: flex-start; gap: 12px; }.assistant-message-avatar { width: 32px; height: 32px; flex: 0 0 32px; display: grid; place-items: center; border-radius: 9px; background: #e5f2f1; color: #287475; font-size: 10px; font-weight: 800; }.assistant-message--user .assistant-message-avatar { background: #e9eef1; color: #526b78; }.assistant-message > div { min-width: 0; flex: 1; }.assistant-message small { color: #71858f; font-size: 10px; font-weight: 700; }.assistant-message p { margin: 5px 0 0; color: #294957; font-size: 13px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
 .assistant-markdown { margin-top: 6px; overflow-x: auto; color: #294957; font-size: 13px; line-height: 1.75; overflow-wrap: anywhere; }.assistant-markdown :deep(> :first-child) { margin-top: 0; }.assistant-markdown :deep(> :last-child) { margin-bottom: 0; }.assistant-markdown :deep(p) { margin: 0 0 10px; white-space: normal; }.assistant-markdown :deep(h1), .assistant-markdown :deep(h2), .assistant-markdown :deep(h3), .assistant-markdown :deep(h4) { margin: 18px 0 8px; color: #173e57; line-height: 1.4; }.assistant-markdown :deep(h1) { font-size: 19px; }.assistant-markdown :deep(h2) { padding-bottom: 5px; border-bottom: 1px solid #dce7ea; font-size: 17px; }.assistant-markdown :deep(h3) { font-size: 15px; }.assistant-markdown :deep(h4) { font-size: 13px; }.assistant-markdown :deep(ul), .assistant-markdown :deep(ol) { margin: 6px 0 12px; padding-left: 24px; }.assistant-markdown :deep(li) { margin: 3px 0; padding-left: 2px; }.assistant-markdown :deep(blockquote) { margin: 10px 0; padding: 8px 12px; border-left: 3px solid #61aaa7; border-radius: 0 7px 7px 0; background: #f0f7f7; color: #496974; }.assistant-markdown :deep(code) { padding: 2px 5px; border-radius: 5px; background: #edf2f4; color: #9a4938; font-family: Consolas, "SFMono-Regular", monospace; font-size: .9em; }.assistant-markdown :deep(pre) { margin: 10px 0 12px; padding: 12px 14px; overflow-x: auto; border: 1px solid #d6e1e4; border-radius: 9px; background: #182a34; color: #dcebee; line-height: 1.6; }.assistant-markdown :deep(pre code) { padding: 0; background: transparent; color: inherit; font-size: 11px; white-space: pre; }.assistant-markdown :deep(a) { color: #237b80; text-decoration-thickness: 1px; text-underline-offset: 2px; }.assistant-markdown :deep(a:hover) { color: #185d64; }.assistant-markdown :deep(table) { width: 100%; min-width: 420px; margin: 10px 0 12px; border-collapse: collapse; font-size: 12px; }.assistant-markdown :deep(th), .assistant-markdown :deep(td) { padding: 7px 9px; border: 1px solid #d5e1e4; text-align: left; vertical-align: top; }.assistant-markdown :deep(th) { background: #edf5f5; color: #244d5c; font-weight: 700; }.assistant-markdown :deep(hr) { margin: 16px 0; border: 0; border-top: 1px solid #d8e3e7; }
 .assistant-thinking { display: flex; gap: 5px; padding-top: 7px; }.assistant-thinking i { width: 6px; height: 6px; border-radius: 50%; background: #61aaa7; animation: assistant-dot 1.2s infinite ease-in-out; }.assistant-thinking i:nth-child(2) { animation-delay: .15s; }.assistant-thinking i:nth-child(3) { animation-delay: .3s; }
-.assistant-composer-area { padding: 10px clamp(24px,6vw,78px) 18px; background: linear-gradient(180deg,rgba(255,255,255,0),#fff 20%); }.assistant-quick-starts { max-width: 760px; margin: 0 auto 10px; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 7px; }.assistant-quick-starts button { padding: 9px 12px; border: 1px solid #d9e5e7; border-radius: 9px; background: #f8fbfb; color: #426674; font-size: 11px; text-align: left; cursor: pointer; }.assistant-quick-starts button:hover { border-color: #68aaa8; background: #edf8f7; color: #246d70; }
+.assistant-composer-area { padding: 10px clamp(24px,6vw,78px) 18px; background: linear-gradient(180deg,rgba(255,255,255,0),#fff 20%); }.assistant-quick-starts { max-width: 760px; margin: 0 auto 10px; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 7px; }.assistant-quick-start-row { min-width: 0; display: flex; overflow: hidden; border: 1px solid #d9e5e7; border-radius: 9px; background: #f8fbfb; }.assistant-quick-start-row:hover { border-color: #68aaa8; background: #edf8f7; }.assistant-quick-start-row button { background: inherit; color: #426674; cursor: pointer; }.assistant-quick-start-question { min-width: 0; padding: 9px 8px 9px 12px; flex: 1; border: 0; font-size: 11px; text-align: left; }.assistant-quick-start-refresh { width: 34px; min-width: 34px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 0; }.assistant-quick-start-refresh svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }.assistant-quick-start-row button:hover { color: #246d70; }.assistant-quick-start-refresh:hover { background: rgba(45,139,137,.08); }
 .assistant-config-error, .assistant-error { max-width: 760px; margin: 0 auto 8px; padding: 8px 11px; border: 1px solid #efb8ab; border-radius: 8px; background: #fff0ec; color: #a34531; font-size: 10px; }
 .assistant-composer { max-width: 760px; margin: 0 auto; padding: 8px 8px 8px 14px; display: flex; align-items: flex-end; gap: 10px; border: 1px solid #c7d8dc; border-radius: 16px; background: #fff; box-shadow: 0 8px 30px rgba(18,57,75,.1); transition: border-color .16s ease, box-shadow .16s ease; }.assistant-composer:focus-within { border-color: #4d9b99; box-shadow: 0 0 0 3px rgba(45,139,137,.1),0 10px 32px rgba(18,57,75,.12); }.assistant-composer textarea { width: 100%; height: 52px; min-height: 52px; max-height: 168px; padding: 7px 2px; flex: 1; resize: none; overflow-y: hidden; border: 0; outline: 0; background: transparent; color: #264653; font: inherit; font-size: 13px; line-height: 1.65; scrollbar-width: thin; }.assistant-composer textarea::placeholder { color: #93a4ab; }.assistant-composer textarea:disabled { color: #6f838c; cursor: wait; }.assistant-composer button { width: 40px; height: 40px; margin-bottom: 1px; flex: 0 0 40px; display: grid; place-items: center; border: 0; border-radius: 11px; background: #2d7d80; color: #fff; cursor: pointer; box-shadow: 0 4px 12px rgba(45,125,128,.2); }.assistant-composer button:disabled { background: #d4dfe2; box-shadow: none; cursor: not-allowed; }.assistant-composer button:not(:disabled):hover { background: #236b70; }
 .assistant-disclaimer { display: block; max-width: 760px; margin: 7px auto 0; color: #91a0a6; font-size: 9px; text-align: center; }

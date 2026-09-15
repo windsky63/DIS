@@ -9,7 +9,6 @@ function openDatabase() {
     request.onerror = () => reject(request.error)
     request.onupgradeneeded = () => {
       const database = request.result
-      if (!database.objectStoreNames.contains('drafts')) database.createObjectStore('drafts', { keyPath: 'key' })
       if (!database.objectStoreNames.contains('snapshots')) database.createObjectStore('snapshots', { keyPath: 'key' })
       if (!database.objectStoreNames.contains('draftMetadata')) database.createObjectStore('draftMetadata', { keyPath: 'key' })
       if (!database.objectStoreNames.contains('workspaceManifests')) database.createObjectStore('workspaceManifests', { keyPath: 'key' })
@@ -217,7 +216,7 @@ export async function saveDraft(key, payload) {
   const database = await openDatabase()
   return new Promise((resolve, reject) => {
     const tx = database.transaction(
-      ['draftMetadata', 'workspaceManifests', 'workspacePages', 'workspaceFiles', 'drafts'],
+      ['draftMetadata', 'workspaceManifests', 'workspacePages', 'workspaceFiles'],
       'readwrite'
     )
     tx.onerror = () => reject(tx.error)
@@ -233,7 +232,6 @@ export async function saveDraft(key, payload) {
     Object.values(prepared.fileGroups).flat().forEach(file => {
       if (file.blob) tx.objectStore('workspaceFiles').put({ key: file.storedFileKey, blob: file.blob, size: file.size })
     })
-    tx.objectStore('drafts').delete(key)
   })
 }
 
@@ -269,7 +267,7 @@ async function loadV2Draft(key) {
 }
 
 export async function loadDraft(key) {
-  return await loadV2Draft(key) || transaction('drafts', 'readonly', store => store.get(key))
+  return loadV2Draft(key)
 }
 
 export function loadDraftPage(workspaceKey, projectIndex, page) {
@@ -288,10 +286,7 @@ export function loadStoredFile(reference) {
 }
 
 export async function listDrafts() {
-  const [metadata, legacy] = await Promise.all([
-    transaction('draftMetadata', 'readonly', store => store.getAll()),
-    transaction('drafts', 'readonly', store => store.getAll()),
-  ])
+  const metadata = await transaction('draftMetadata', 'readonly', store => store.getAll())
   const modern = metadata.map(item => ({
     key: item.key,
     savedAt: item.savedAt,
@@ -305,20 +300,17 @@ export async function listDrafts() {
       referenceFiles: Array.from({ length: item.referenceCount || 0 }),
     },
   }))
-  const modernKeys = new Set(modern.map(item => item.key))
-  return [...modern, ...legacy.filter(item => !modernKeys.has(item.key))]
-    .sort((left, right) => String(right.savedAt || '').localeCompare(String(left.savedAt || '')))
+  return modern.sort((left, right) => String(right.savedAt || '').localeCompare(String(left.savedAt || '')))
 }
 
 export async function deleteDraft(key) {
   const database = await openDatabase()
   return new Promise((resolve, reject) => {
-    const tx = database.transaction(['draftMetadata', 'workspaceManifests', 'workspacePages', 'drafts'], 'readwrite')
+    const tx = database.transaction(['draftMetadata', 'workspaceManifests', 'workspacePages'], 'readwrite')
     tx.onerror = () => reject(tx.error)
     tx.oncomplete = () => { database.close(); resolve() }
     tx.objectStore('draftMetadata').delete(key)
     tx.objectStore('workspaceManifests').delete(key)
-    tx.objectStore('drafts').delete(key)
     const cursor = tx.objectStore('workspacePages').openCursor()
     cursor.onsuccess = () => {
       const value = cursor.result

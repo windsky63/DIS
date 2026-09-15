@@ -9,6 +9,7 @@ frontend/node_modules
 frontend/dist
 frontend/.npm-audit-cache
 frontend/tests
+frontend/**/*.test.js
 
 backend/__pycache__
 backend/tests
@@ -21,6 +22,7 @@ backend/tutorial/build_tutorial_result.py
 
 data
 backups
+releases
 output
 tmp
 scripts

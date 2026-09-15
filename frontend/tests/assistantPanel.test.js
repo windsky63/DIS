@@ -22,7 +22,8 @@ test('assistant panel renders conversation history, quick starts, and input affo
     assert.match(html, /AI 助手/)
     assert.match(html, /新建对话/)
     assert.match(html, /同步到服务器/)
-    assert.match(html, /如何开始识别/)
+    assert.equal((html.match(/class="assistant-quick-start-question"/g) || []).length, 4)
+    assert.equal((html.match(/class="assistant-quick-start-refresh"/g) || []).length, 4)
     assert.match(html, /输入你的问题/)
     assert.match(html, /批准的系统文档片段会发送到已配置的 AI 服务/)
   } finally {
