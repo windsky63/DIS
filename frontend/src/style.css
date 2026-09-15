@@ -440,6 +440,16 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 .analysis-queue-summary, .analysis-queue-page-review-title, .analysis-queue-detail-grid span, .analysis-queue-detail-grid small { color: rgb(var(--v-theme-on-surface-muted)); }
 
 /* Keep separators and idle input outlines subdued against dark surfaces. */
+.v-theme--weldLight .canvas-card {
+  border-color: rgb(var(--v-theme-outline));
+  box-shadow: 0 3px 12px rgba(48,72,88,.06) !important;
+}
+.v-theme--weldLight .canvas-viewport {
+  background-color: #eef2f5;
+  background-image: linear-gradient(rgba(90,114,130,.04) 1px, transparent 1px), linear-gradient(90deg, rgba(90,114,130,.04) 1px, transparent 1px);
+}
+.v-theme--weldLight .canvas-surface { box-shadow: 0 3px 14px rgba(48,72,88,.1); }
+.v-theme--weldLight .design-page-jump { border-left-color: rgb(var(--v-theme-outline)); }
 .v-theme--weldDark .v-divider { border-color: rgb(var(--v-theme-outline)); opacity: .8; }
 .v-theme--weldDark .v-field:not(.v-field--error) .v-field__outline {
   color: rgb(var(--v-theme-outline));
