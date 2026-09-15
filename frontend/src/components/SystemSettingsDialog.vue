@@ -44,10 +44,9 @@ defineEmits(['open-drafts', 'update-shortcut-modifier', 'capture-shortcut-key', 
         <div class="settings-section"><div class="section-label">文件切换</div><v-switch v-model="clearReferences" color="secondary" hide-details label="上传设计图时清除已选对照文件" /><div class="shortcut-settings__hint mt-2">默认开启，避免新设计图误用上一个任务的对照 PDF；取消文件选择或选择无效文件不会清除。</div></div>
         <div class="settings-section"><div class="section-label">画布性能</div><v-select v-model="performanceMode" :items="canvasPerformanceOptions" label="清晰度与内存档位" hide-details class="mb-3" /><div class="canvas-profile-summary"><v-chip size="small" color="secondary" variant="tonal">{{ canvasPerformanceProfile.label }}</v-chip><span>单画布最高 {{ Math.round(canvasPerformanceProfile.maxPixels / 1_000_000) }} 百万像素 · 位图缓存约 {{ Math.round(canvasPerformanceProfile.cacheBytes / 1024 / 1024) }} MB</span></div><div class="shortcut-settings__hint mt-2">自动模式依据设备内存、CPU 核心数和触控屏尺寸选择；也可手动固定档位，选择后立即生效。</div></div>
         <div class="settings-section">
-          <div class="section-label">标识设置</div>
+          <div class="section-label">标识默认设置</div>
           <v-text-field v-model.number="manualLeaderLength" type="number" min="20" max="240" step="4" label="新增标识引线长度" suffix="图纸单位" hint="仅影响之后通过 W、V、F、S 模式新增的标识；默认 72" persistent-hint />
-          <div class="section-label mt-4">标识默认外观</div>
-          <div class="marker-appearance-card settings-marker-appearance">
+          <div class="marker-appearance-card settings-marker-appearance mt-4">
             <div class="marker-appearance-tabs" role="tablist" aria-label="默认标识外观分类">
               <button v-for="group in markerAppearanceGroups" :key="group.key" type="button" role="tab" :aria-selected="appearanceTab === group.key" :class="{ active: appearanceTab === group.key }" @click="appearanceTab = group.key"><i :style="{ backgroundColor: group.style.color }" />{{ group.title.replace('标识', '') }}</button>
             </div>
