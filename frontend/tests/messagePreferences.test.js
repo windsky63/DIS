@@ -17,9 +17,9 @@ function createStorage(entries = {}) {
   }
 }
 
-test('message preferences default both operation and error messages to enabled', () => {
+test('message preferences default operation messages to disabled and error messages to enabled', () => {
   assert.deepEqual(loadMessagePreferences(createStorage()), {
-    operationMessagesEnabled: true,
+    operationMessagesEnabled: false,
     errorMessagesEnabled: true,
   })
 })
@@ -28,7 +28,7 @@ test('message preferences ignore the removed combined setting', () => {
   const storage = createStorage({ 'weld-marker.messages-enabled': 'false' })
 
   assert.deepEqual(loadMessagePreferences(storage), {
-    operationMessagesEnabled: true,
+    operationMessagesEnabled: false,
     errorMessagesEnabled: true,
   })
 })

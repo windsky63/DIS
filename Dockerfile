@@ -16,7 +16,7 @@ RUN npm run build
 
 FROM ${PYTHON_IMAGE} AS runtime
 
-ARG APP_VERSION=2.0.9
+ARG APP_VERSION=2.0.10
 ARG BUILD_ID=local
 ARG PIP_INDEX_URL=https://pypi.org/simple
 

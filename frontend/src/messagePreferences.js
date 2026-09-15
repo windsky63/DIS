@@ -10,7 +10,7 @@ function readPreference(storage, key, fallback) {
 
 export function loadMessagePreferences(storage = globalThis.localStorage) {
   return {
-    operationMessagesEnabled: readPreference(storage, OPERATION_MESSAGES_KEY, true),
+    operationMessagesEnabled: readPreference(storage, OPERATION_MESSAGES_KEY, false),
     errorMessagesEnabled: readPreference(storage, ERROR_MESSAGES_KEY, true),
   }
 }
