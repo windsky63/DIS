@@ -5,8 +5,7 @@ import { loadThemePreference, normalizeThemePreference, resolveThemeName, THEME_
 export function useThemeSettings() {
   const theme = useTheme()
   const preference = ref(loadThemePreference())
-  const media = globalThis.matchMedia?.('(prefers-color-scheme: dark)')
-  const apply = () => theme.change(resolveThemeName(preference.value, media?.matches))
+  const apply = () => theme.change(resolveThemeName(preference.value))
   watch(preference, value => {
     preference.value = normalizeThemePreference(value)
     try { localStorage.setItem(THEME_STORAGE_KEY, preference.value) } catch { /* Storage may be unavailable. */ }
@@ -15,11 +14,9 @@ export function useThemeSettings() {
   const synchronize = event => {
     if (event.key === THEME_STORAGE_KEY || event.key === null) preference.value = loadThemePreference()
   }
-  media?.addEventListener('change', apply)
   globalThis.addEventListener?.('storage', synchronize)
   void apply()
   onBeforeUnmount(() => {
-    media?.removeEventListener('change', apply)
     globalThis.removeEventListener?.('storage', synchronize)
   })
   return { preference, options: THEME_OPTIONS }

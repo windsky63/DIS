@@ -2,7 +2,6 @@ export const THEME_STORAGE_KEY = 'weld-marker.theme'
 export const THEME_OPTIONS = Object.freeze([
   { title: '浅色', value: 'light' },
   { title: '深色', value: 'dark' },
-  { title: '跟随系统', value: 'system' },
 ])
 
 export function normalizeThemePreference(value) {
@@ -13,8 +12,8 @@ export function loadThemePreference(storage = globalThis.localStorage) {
   try { return normalizeThemePreference(storage?.getItem(THEME_STORAGE_KEY)) } catch { return 'light' }
 }
 
-export function resolveThemeName(preference, systemDark = false) {
-  return preference === 'dark' || (preference === 'system' && systemDark) ? 'weldDark' : 'weldLight'
+export function resolveThemeName(preference) {
+  return preference === 'dark' ? 'weldDark' : 'weldLight'
 }
 
 export const APP_THEMES = {
@@ -36,8 +35,9 @@ export const APP_THEMES = {
       background: '#121c25', surface: '#1d2a35', 'on-surface': '#e1ebf2',
       header: '#202f3b', 'on-header': '#e1ebf2',
       'surface-muted': '#253541', 'surface-selected': '#344956',
-      'on-surface-muted': '#adbecb', outline: '#435764',
+      'on-surface-muted': '#adbecb', outline: '#394d5b',
       error: '#f49b89', info: '#a1c4c9', success: '#8ed4ac', warning: '#e5bf7d',
     },
+    variables: { 'border-color': '#394d5b', 'border-opacity': 0.8 },
   },
 }

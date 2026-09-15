@@ -30,14 +30,14 @@ defineEmits(['update:modelValue', 'start'])
 </template>
 
 <style scoped>
-.tutorial-catalog-card { overflow: hidden; border: 1px solid #d9e4e7; border-radius: 14px !important; }
-.tutorial-catalog-header { padding: 20px 22px 15px; display: flex; align-items: center; gap: 13px; border-bottom: 1px solid #e4ebee; background: linear-gradient(135deg, #f7fbfb, #fff); }
+.tutorial-catalog-card { overflow: hidden; border: 1px solid rgb(var(--v-theme-outline)); border-radius: 14px !important; }
+.tutorial-catalog-header { padding: 20px 22px 15px; display: flex; align-items: center; gap: 13px; border-bottom: 1px solid rgb(var(--v-theme-outline)); background: linear-gradient(135deg, #f7fbfb, #fff); }
 .tutorial-catalog-header__icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 12px; background: linear-gradient(145deg, #dff3f1, #edf3f5); color: #2d7778; font-size: 22px; }
 .tutorial-catalog-header .v-card-title, .tutorial-catalog-header .v-card-subtitle { padding: 0; }
 .tutorial-catalog-header .v-card-title { color: #173e57; font-size: 19px; font-weight: 800; }
 .tutorial-catalog-header .v-card-subtitle { margin-top: 3px; color: #71838d; font-size: 11px; }
 .tutorial-catalog-grid { padding: 18px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; background: #f6f9fa; }
-.tutorial-catalog-item { min-height: 128px; padding: 16px; display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; grid-template-rows: 1fr auto; gap: 7px 12px; border: 1px solid #dfe8eb; border-radius: 11px; background: #fff; color: inherit; text-align: left; cursor: pointer; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
+.tutorial-catalog-item { min-height: 128px; padding: 16px; display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; grid-template-rows: 1fr auto; gap: 7px 12px; border: 1px solid rgb(var(--v-theme-outline)); border-radius: 11px; background: #fff; color: inherit; text-align: left; cursor: pointer; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
 .tutorial-catalog-item:hover:not(:disabled) { border-color: #79b9b5; box-shadow: 0 9px 24px rgba(37, 91, 98, .12); transform: translateY(-1px); }
 .tutorial-catalog-item:disabled { cursor: wait; opacity: .72; }
 .tutorial-catalog-item__icon { grid-row: 1 / 3; width: 42px; height: 42px; display: grid; place-items: center; border-radius: 10px; background: #eaf5f4; font-size: 21px; }

@@ -24,7 +24,7 @@ const vuetify = createVuetify({
   },
   directives: { Ripple },
   theme: {
-    defaultTheme: resolveThemeName(loadThemePreference(), window.matchMedia('(prefers-color-scheme: dark)').matches),
+    defaultTheme: resolveThemeName(loadThemePreference()),
     themes: APP_THEMES,
   },
   defaults: {

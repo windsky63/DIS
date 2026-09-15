@@ -141,7 +141,7 @@ onBeforeUnmount(() => {
 .tutorial-tour footer { margin-top: 21px; display: flex; align-items: center; gap: 8px; }
 .tutorial-tour footer span { flex: 1; }
 .tutorial-tour footer button { min-height: 36px; padding: 0 14px; border-radius: 7px; font-size: 12px; font-weight: 700; cursor: pointer; }
-.tutorial-tour__previous { border: 1px solid #cbd9de; background: #fff; color: #496575; }
+.tutorial-tour__previous { border: 1px solid rgb(var(--v-theme-outline)); background: #fff; color: #496575; }
 .tutorial-tour__next { border: 1px solid #2d7778; background: linear-gradient(135deg, #347f83, #2d6f78); color: #fff; box-shadow: 0 5px 13px rgba(45, 111, 120, .22); }
 @keyframes tutorial-pulse { 50% { border-color: #a4eee8; } }
 @media (max-width: 600px) { .tutorial-tour__card { left: 16px !important; right: 16px; top: auto !important; bottom: 16px; width: auto !important; transform: none !important; } }
