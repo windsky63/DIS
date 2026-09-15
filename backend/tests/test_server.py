@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import io
 import json
+import base64
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
+from http.cookies import SimpleCookie
 
 import fitz
 
@@ -17,6 +19,9 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 import server
+import job_runner
+from assistant_agent import AssistantAgentEvent
+from job_store import JobStore
 
 
 class _Response:
@@ -34,6 +39,313 @@ class _Response:
 
 
 class ServerTests(unittest.TestCase):
+    def test_auth_store_bootstraps_the_default_admin_account(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            with patch.object(server, "DATA_ROOT", Path(folder_name) / "jobs"):
+                server.AUTH_STORES.clear()
+                user = server._auth_store().authenticate("admin", "123456")
+            self.assertEqual(user["username"], "admin")
+
+    def test_registration_creates_session_and_me_resolves_cookie(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            jobs_root = Path(folder_name) / "jobs"
+            responses = []
+            handler = object.__new__(server.ApiHandler)
+            handler.path = "/api/auth/register"
+            handler.headers = {}
+            handler._read_json = lambda *_args: {"username": "Reviewer01", "password": "correct-horse-battery"}
+            handler._json = lambda status, payload, headers=None: responses.append((status, payload, headers or {}))
+            with patch.object(server, "DATA_ROOT", jobs_root):
+                server.AUTH_STORES.clear()
+                handler.do_POST()
+                self.assertEqual(responses[0][0], 201)
+                self.assertIn("HttpOnly", responses[0][2]["Set-Cookie"])
+                self.assertIn("SameSite=Lax", responses[0][2]["Set-Cookie"])
+                cookie = SimpleCookie()
+                cookie.load(responses[0][2]["Set-Cookie"])
+                token = cookie[server.SESSION_COOKIE_NAME].value
+
+                handler.path = "/api/auth/me"
+                handler.headers = {"Cookie": f"{server.SESSION_COOKIE_NAME}={token}"}
+                handler._do_GET()
+
+            self.assertEqual(responses[1][0], 200)
+            self.assertEqual(responses[1][1]["user"]["username"], "Reviewer01")
+
+    def test_business_api_requires_authentication(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/jobs"
+        handler.headers = {}
+        responses = []
+        handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+        handler.do_POST()
+        self.assertEqual(responses, [(401, {"error": "请先登录"})])
+
+    def test_ai_status_reports_configuration_without_credentials(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/ai/status"
+        handler.headers = {}
+        handler._request_user = {"userId": "u1", "username": "张三"}
+        responses = []
+        handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+        with patch.object(server.ai_assistant, "configuration_status", return_value={"configured": True, "model": "guide-model"}):
+            handler.do_GET()
+        self.assertEqual(responses, [(200, {"configured": True, "model": "guide-model"})])
+
+    def test_ai_chat_returns_assistant_message(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/ai/chat"
+        handler.headers = {}
+        handler._request_user = {"userId": "u1", "username": "张三"}
+        handler._read_json = lambda *_args: {
+            "messages": [{"role": "user", "content": "如何开始？"}],
+            "context": {"currentPage": 1, "jobLoaded": False},
+        }
+        responses = []
+        handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+        with patch.object(server.ai_assistant, "chat_completion", return_value="请先上传图纸。"):
+            handler.do_POST()
+        self.assertEqual(responses, [(200, {"message": {"role": "assistant", "content": "请先上传图纸。"}})])
+
+    def test_ai_chat_stream_forwards_typed_agent_events(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/ai/chat/stream"
+        handler.headers = {}
+        handler._request_user = {"userId": "u1", "username": "张三"}
+        handler._read_json = lambda *_args: {
+            "messages": [{"role": "user", "content": "如何开始？"}],
+            "context": {"currentPage": 1, "jobLoaded": False},
+        }
+        statuses = []
+        headers = {}
+        handler.send_response = lambda status: statuses.append(status)
+        handler.send_header = lambda name, value: headers.__setitem__(name, value)
+        handler.end_headers = lambda: None
+        handler.wfile = io.BytesIO()
+
+        events = iter([
+            AssistantAgentEvent("status", {"message": "正在检索系统文档"}),
+            AssistantAgentEvent("source", {
+                "documentId": "usage-guide", "title": "使用指南", "path": "docs/usage.md",
+                "section": "保存并关闭", "startLine": 30,
+            }),
+            AssistantAgentEvent("delta", {"content": "第一段回答"}),
+        ])
+        with patch.object(server.ai_assistant, "stream_chat_completion", return_value=events):
+            handler.do_POST()
+
+        body = handler.wfile.getvalue().decode("utf-8")
+        self.assertEqual(statuses, [200])
+        self.assertEqual(headers["Content-Type"], "text/event-stream; charset=utf-8")
+        self.assertIn('event: status\ndata: {"message": "正在检索系统文档"}\n\n', body)
+        self.assertIn('event: source\ndata: {"documentId": "usage-guide"', body)
+        self.assertIn('event: delta\ndata: {"content": "第一段回答"}\n\n', body)
+        self.assertTrue(body.endswith("event: done\ndata: {}\n\n"))
+
+    def test_ai_chat_stream_converts_late_agent_failure_to_sse_error(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/ai/chat/stream"
+        handler.headers = {}
+        handler._request_user = {"userId": "u1", "username": "张三"}
+        handler._read_json = lambda *_args: {"messages": [{"role": "user", "content": "如何保存？"}]}
+        handler.send_response = lambda _status: None
+        handler.send_header = lambda _name, _value: None
+        handler.end_headers = lambda: None
+        handler.wfile = io.BytesIO()
+
+        def events():
+            yield AssistantAgentEvent("status", {"message": "正在分析问题"})
+            raise server.ai_assistant.AssistantRequestError("上游连接中断")
+
+        with patch.object(server.ai_assistant, "stream_chat_completion", return_value=events()):
+            handler.do_POST()
+
+        body = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn('event: status\ndata: {"message": "正在分析问题"}\n\n', body)
+        self.assertTrue(body.endswith('event: error\ndata: {"error": "上游连接中断"}\n\n'))
+
+    def test_ai_conversation_history_round_trips_for_only_the_current_user(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            jobs_root = Path(folder_name) / "jobs"
+            with patch.object(server, "DATA_ROOT", jobs_root):
+                server.AUTH_STORES.clear()
+                alice = server._auth_store().register("alice", "secret1")
+                bob = server._auth_store().register("bobby", "secret2")
+                responses = []
+                handler = object.__new__(server.ApiHandler)
+                handler.headers = {}
+                handler._request_user = alice
+                handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+                handler.path = "/api/ai/conversations"
+                handler._read_json = lambda *_args: {"conversations": [{
+                    "id": "conversation-1", "title": "识别流程", "updatedAt": 1234,
+                    "messages": [{"role": "assistant", "content": "先上传图纸。"}],
+                }]}
+                handler.do_PUT()
+                handler.do_GET()
+                handler._request_user = bob
+                handler.do_GET()
+
+            self.assertEqual(responses[0][0], 200)
+            self.assertEqual(responses[1][1]["conversations"][0]["title"], "识别流程")
+            self.assertEqual(responses[2], (200, {"conversations": []}))
+
+    def test_cross_origin_write_is_rejected(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/jobs"
+        handler.headers = {"Origin": "https://attacker.example", "Host": "drawings.example"}
+        responses = []
+        handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+        handler.do_POST()
+        self.assertEqual(responses[0][0], 403)
+        self.assertIn("跨站", responses[0][1]["error"])
+
+    def test_page_lock_api_returns_owner_on_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            jobs_root = Path(folder_name)
+            job_id = "1" * 32
+            job = jobs_root / job_id
+            job.mkdir()
+            (job / "result.json").write_text(json.dumps({
+                "status": "complete", "pages": [{"page": 1, "candidates": []}],
+            }), encoding="utf-8")
+            responses = []
+            handler = object.__new__(server.ApiHandler)
+            handler.path = f"/api/jobs/{job_id}/pages/1/lock"
+            handler.headers = {}
+            handler._read_json = lambda *_args: {"clientInstanceId": "tab-a"}
+            handler._request_user = {"userId": "u1", "username": "张三"}
+            handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+            with patch.object(server, "DATA_ROOT", jobs_root):
+                server.PAGE_LOCK_STORES.clear()
+                handler.do_POST()
+                handler._request_user = {"userId": "u2", "username": "李四"}
+                handler._read_json = lambda *_args: {"clientInstanceId": "tab-b"}
+                handler.do_POST()
+
+            self.assertEqual(responses[0][0], 200)
+            self.assertTrue(responses[0][1]["lock"]["lockToken"])
+            self.assertEqual(responses[1][0], 423)
+            self.assertEqual(responses[1][1]["lock"]["owner"]["username"], "张三")
+
+    def test_locked_task_cannot_be_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            jobs_root = Path(folder_name)
+            job_id = "4" * 32
+            job = jobs_root / job_id
+            job.mkdir()
+            (job / "job.json").write_text(json.dumps({
+                "analysisSignature": "locked-delete", "originalTargetName": "drawing.pdf",
+            }), encoding="utf-8")
+            (job / "result.json").write_text(json.dumps({
+                "status": "complete", "pages": [{"page": 1, "candidates": []}],
+            }), encoding="utf-8")
+            with patch.object(server, "DATA_ROOT", jobs_root):
+                server.JOB_STORES.clear(); server.PAGE_LOCK_STORES.clear()
+                server._job_store().import_existing(jobs_root, server.ANALYSIS_ALGORITHM_VERSION)
+                server._page_lock_store().acquire(job_id, 1, "u1", "张三", "tab-a")
+                with self.assertRaises(server.ApiError) as raised:
+                    server._delete_completed_job(job_id)
+            self.assertEqual(raised.exception.status, 423)
+            self.assertTrue(job.exists())
+
+    def test_two_reviewers_save_different_pages_with_independent_revisions(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            jobs_root = Path(folder_name)
+            job_id = "2" * 32
+            job = jobs_root / job_id
+            job.mkdir()
+            result_path = job / "result.json"
+            result_path.write_text(json.dumps({
+                "status": "complete",
+                "analyzedRange": [1, 2],
+                "pages": [
+                    {"page": 1, "candidates": [{"id": "a", "page": 1, "number": ""}]},
+                    {"page": 2, "candidates": [{"id": "b", "page": 2, "number": ""}]},
+                ],
+            }), encoding="utf-8")
+            with patch.object(server, "DATA_ROOT", jobs_root):
+                server.PAGE_LOCK_STORES.clear()
+                lock_store = server._page_lock_store()
+                alice_lock = lock_store.acquire(job_id, 1, "u1", "张三", "tab-a")
+                bob_lock = lock_store.acquire(job_id, 2, "u2", "李四", "tab-b")
+                cases = [
+                    (1, {"userId": "u1", "username": "张三"}, "tab-a", alice_lock["lockToken"], "A1"),
+                    (2, {"userId": "u2", "username": "李四"}, "tab-b", bob_lock["lockToken"], "B1"),
+                ]
+                responses = []
+                for page, user, client_id, token, number in cases:
+                    handler = object.__new__(server.ApiHandler)
+                    handler.path = f"/api/jobs/{job_id}/pages/{page}"
+                    handler.headers = {}
+                    handler._request_user = user
+                    handler._read_json = lambda *_args, p=page, c=client_id, t=token, n=number: {
+                        "page": {"page": p, "candidates": [{"id": "a" if p == 1 else "b", "page": p, "number": n}]},
+                        "basePageRevision": 0, "clientInstanceId": c, "lockToken": t,
+                    }
+                    handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+                    handler.do_PUT()
+
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual([response[0] for response in responses], [200, 200])
+            self.assertEqual([page["reviewRevision"] for page in saved["pages"]], [1, 1])
+            self.assertEqual([page["candidates"][0]["number"] for page in saved["pages"]], ["A1", "B1"])
+
+    def test_stale_page_revision_is_rejected_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            jobs_root = Path(folder_name)
+            job_id = "3" * 32
+            job = jobs_root / job_id
+            job.mkdir()
+            result_path = job / "result.json"
+            result_path.write_text(json.dumps({
+                "status": "complete", "pages": [{
+                    "page": 1, "reviewRevision": 1,
+                    "candidates": [{"id": "a", "page": 1, "number": "A1"}],
+                }],
+            }), encoding="utf-8")
+            with patch.object(server, "DATA_ROOT", jobs_root):
+                server.PAGE_LOCK_STORES.clear()
+                lock = server._page_lock_store().acquire(job_id, 1, "u1", "张三", "tab-a")
+                handler = object.__new__(server.ApiHandler)
+                handler.path = f"/api/jobs/{job_id}/pages/1"
+                handler.headers = {}
+                handler._request_user = {"userId": "u1", "username": "张三"}
+                handler._read_json = lambda *_args: {
+                    "page": {"page": 1, "candidates": [{"id": "a", "page": 1, "number": "STALE"}]},
+                    "basePageRevision": 0, "clientInstanceId": "tab-a", "lockToken": lock["lockToken"],
+                }
+                responses = []
+                handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+                handler.do_PUT()
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(responses[0][0], 409)
+            self.assertEqual(saved["pages"][0]["candidates"][0]["number"], "A1")
+
+    def test_binary_upload_streams_to_disk_and_is_consumed_by_job(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            uploads = root / "uploads"
+            job = root / "job"
+            job.mkdir()
+            content = b"%PDF-streamed-upload"
+            with patch.object(server, "UPLOAD_ROOT", uploads), patch.object(server, "MIN_FREE_DISK_BYTES", 0):
+                record = server._store_upload(io.BytesIO(content), len(content), "%E5%9B%BE%E7%BA%B8.pdf")
+                stored = uploads / record["uploadId"] / "payload.bin"
+                self.assertEqual(stored.read_bytes(), content)
+                self.assertEqual(record["name"], "图纸.pdf")
+                destination = server._consume_upload(record, job, "target.pdf")
+
+            self.assertEqual(destination, job / "target.pdf")
+            self.assertEqual(destination.read_bytes(), content)
+            self.assertFalse(stored.parent.exists())
+
+    def test_binary_upload_rejects_oversized_file_before_reading(self) -> None:
+        with patch.object(server, "MAX_UPLOAD_BYTES", 3):
+            with self.assertRaises(server.ApiError) as raised:
+                server._store_upload(io.BytesIO(b"four"), 4, "large.pdf")
+        self.assertEqual(raised.exception.status, 413)
+
     def test_client_disconnect_does_not_write_an_error_response(self) -> None:
         handler = object.__new__(server.ApiHandler)
         handler._json = lambda *_args, **_kwargs: self.fail("断开的客户端不应再次写入响应")
@@ -136,6 +448,19 @@ class ServerTests(unittest.TestCase):
             )
             self.assertEqual(len(result["ep3dReferenceInventory"]["documents"]), 1)
             self.assertFalse(jobs_root.exists())
+
+    def test_tutorial_workspace_defers_non_visible_page_obstacles(self) -> None:
+        tutorial = server._create_tutorial_session()
+        first_page = int(tutorial["pages"][0]["page"])
+        workspace = server._workspace_result(tutorial, first_page)
+
+        self.assertEqual(workspace["workspaceView"], "lazy-page-details")
+        self.assertTrue(workspace["pages"][0]["detailsLoaded"])
+        self.assertIn("layoutObstacles", workspace["pages"][0])
+        self.assertTrue(all(
+            not page["detailsLoaded"] and "layoutObstacles" not in page
+            for page in workspace["pages"][1:]
+        ))
 
     def test_job_reference_manifest_exposes_recoverable_files_without_server_paths(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -295,6 +620,7 @@ class ServerTests(unittest.TestCase):
     def test_workspace_result_defers_non_visible_page_obstacles(self) -> None:
         result = {
             "status": "complete",
+            "labelLayout": {"optimized": True},
             "pages": [
                 {"page": 2, "candidates": [], "layoutObstacles": {"textRects": [[1, 2, 3, 4]]}},
                 {"page": 3, "candidates": [], "layoutObstacles": {"textRects": [[5, 6, 7, 8]]}},
@@ -306,6 +632,7 @@ class ServerTests(unittest.TestCase):
         self.assertIn("layoutObstacles", workspace["pages"][1])
         self.assertTrue(workspace["pages"][1]["detailsLoaded"])
         self.assertIn("layoutObstacles", result["pages"][0])
+        self.assertNotIn("labelLayout", workspace)
 
     def test_lazy_workspace_save_preserves_deferred_page_fields(self) -> None:
         current = {
@@ -339,7 +666,42 @@ class ServerTests(unittest.TestCase):
         with patch.object(server, "ANALYSIS_ALGORITHM_VERSION", "next-version"):
             self.assertNotEqual(first, server._analysis_signature(payload))
 
-    def test_reconcile_marks_interrupted_jobs_failed(self) -> None:
+    def test_job_creation_rejects_disabled_comparison_mode(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler._read_json = lambda *_: {"symbolConfig": {"detectionMode": "comparison"}}
+        with self.assertRaisesRegex(server.ApiError, "对照模式暂未开放"):
+            handler._create_job()
+
+    def test_create_job_records_authenticated_creator(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            source = fitz.open()
+            source.new_page(width=100, height=100)
+            pdf_bytes = source.tobytes()
+            source.close()
+            handler = object.__new__(server.ApiHandler)
+            handler._request_user = {"userId": "user-1", "username": "Reviewer01"}
+            handler._read_json = lambda *_args: {
+                "targetPdf": {"name": "drawing.pdf", "dataBase64": base64.b64encode(pdf_bytes).decode("ascii")},
+                "symbolConfig": {"detectionMode": "placement"},
+            }
+            responses = []
+            handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+            with patch.object(server, "DATA_ROOT", root):
+                server.JOB_STORES.clear()
+                handler._create_job()
+            created = responses[0][1]
+            folder = root / created["jobId"]
+            meta = json.loads((folder / "job.json").read_text(encoding="utf-8"))
+            result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+            row = JobStore(root / ".queue" / "jobs.db").get(created["jobId"])
+            expected = {"userId": "user-1", "username": "Reviewer01"}
+            self.assertEqual(created["createdBy"], expected)
+            self.assertEqual(meta["createdBy"], expected)
+            self.assertEqual(result["createdBy"], expected)
+            self.assertEqual(row["createdBy"], expected)
+
+    def test_reconcile_imports_interrupted_jobs_back_into_queue(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             root = Path(folder_name)
             job = root / ("e" * 32)
@@ -347,12 +709,15 @@ class ServerTests(unittest.TestCase):
             (job / "result.json").write_text(json.dumps({
                 "jobId": job.name, "status": "processing", "pages": [],
             }), encoding="utf-8")
+            (job / "job.json").write_text(json.dumps({
+                "analysisSignature": "signature", "originalTargetName": "drawing.pdf",
+            }), encoding="utf-8")
             with patch.object(server, "DATA_ROOT", root):
                 reconciled = server._reconcile_interrupted_jobs()
             saved = json.loads((job / "result.json").read_text(encoding="utf-8"))
             self.assertEqual(reconciled, 1)
-            self.assertEqual(saved["status"], "failed")
-            self.assertIn("服务重启", saved["progressMessage"])
+            self.assertEqual(saved["status"], "processing")
+            self.assertEqual(JobStore(root / ".queue" / "jobs.db").get(job.name)["status"], "queued")
 
     def test_page_validation_rejects_out_of_range_and_mismatched_candidates(self) -> None:
         current = {"analyzedRange": [2, 3]}
@@ -361,51 +726,88 @@ class ServerTests(unittest.TestCase):
         with self.assertRaisesRegex(server.ApiError, "页码与所属页面不一致"):
             server._validated_pages([{"page": 2, "candidates": [{"page": 3, "id": "x"}]}], current)
 
-    def test_cancel_job_sets_event_and_cancelling_status(self) -> None:
+    def test_cancel_job_persists_cancellation_request(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             root = Path(folder_name)
             job_id = "a" * 32
             folder = root / job_id
             folder.mkdir()
             (folder / "result.json").write_text(json.dumps({"jobId": job_id, "status": "processing", "pages": []}), encoding="utf-8")
-            event = server.threading.Event()
+            (folder / "job.json").write_text(json.dumps({
+                "analysisSignature": "cancel-signature", "originalTargetName": "drawing.pdf",
+            }), encoding="utf-8")
             handler = object.__new__(server.ApiHandler)
             responses = []
             handler._json = lambda status, payload: responses.append((status, payload))
-            with patch.object(server, "DATA_ROOT", root), patch.dict(server.JOB_CANCEL_EVENTS, {job_id: event}, clear=True):
+            with patch.object(server, "DATA_ROOT", root):
+                store = server._job_store()
+                store.import_existing(root, server.ANALYSIS_ALGORITHM_VERSION)
+                claimed = store.claim_next("worker-test", 60)
+                self.assertIsNotNone(claimed)
                 handler._cancel_job(job_id)
             saved = json.loads((folder / "result.json").read_text(encoding="utf-8"))
-            self.assertTrue(event.is_set())
+            self.assertTrue(store.cancellation_requested(job_id))
             self.assertEqual(saved["status"], "cancelling")
             self.assertTrue(responses[0][1]["cancelled"])
 
     def test_analysis_queue_lists_status_and_reorders_only_waiting_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             root = Path(folder_name)
-            queued_first, queued_second, running = "1" * 32, "2" * 32, "3" * 32
-            for job_id, status in ((queued_first, "processing"), (queued_second, "processing"), (running, "processing")):
+            queued_first, queued_second, queued_last, running = "1" * 32, "2" * 32, "4" * 32, "3" * 32
+            for job_id, status in ((queued_first, "processing"), (queued_second, "processing"), (queued_last, "processing"), (running, "processing")):
                 folder = root / job_id
                 folder.mkdir()
                 (folder / "job.json").write_text(json.dumps({"originalTargetName": f"{job_id[0]}.pdf"}), encoding="utf-8")
                 (folder / "result.json").write_text(json.dumps({
                     "jobId": job_id, "status": status, "pages": [], "completedPages": 0, "totalPages": 4,
+                    "completedReferenceFiles": 1, "totalReferenceFiles": 2,
+                    "progressCompletedUnits": 1.5, "progressTotalUnits": 6,
+                    "progressPercent": 35,
                 }), encoding="utf-8")
 
-            with patch.object(server, "DATA_ROOT", root), \
-                    patch.object(server, "PENDING_ANALYSIS_JOBS", [queued_first, queued_second]), \
-                    patch.object(server, "RUNNING_ANALYSIS_JOBS", {running}):
+            with patch.object(server, "DATA_ROOT", root):
+                store = server._job_store()
+                store.import_existing(root, server.ANALYSIS_ALGORITHM_VERSION)
+                claimed = store.claim_next("worker-test", 60)
+                self.assertEqual(claimed["job_id"], queued_first)
+                store.move_queued(queued_first, "down") if False else None
+                # Import order is directory-dependent; explicitly rank the three waiting jobs.
+                waiting = [job_id for job_id in (queued_first, queued_second, queued_last, running) if job_id != queued_first]
+                for job_id in reversed(waiting):
+                    store.move_queued(job_id, "front")
                 snapshot = server._analysis_queue_snapshot()
                 moved = server._move_queued_job(queued_second, "up")
+                promoted = server._move_queued_job(queued_last, "front")
+                running_priority = server._move_queued_job(queued_first, "front")
                 reordered = server._analysis_queue_snapshot()
                 with self.assertRaisesRegex(server.ApiError, "正在解析"):
-                    server._move_queued_job(running, "up")
+                    server._move_queued_job(queued_first, "up")
 
             self.assertEqual(snapshot["runningCount"], 1)
-            self.assertEqual(snapshot["queuedCount"], 2)
+            self.assertEqual(snapshot["queuedCount"], 3)
             self.assertEqual(snapshot["jobs"][0]["queueState"], "running")
+            self.assertEqual(snapshot["jobs"][0]["progressCompletedUnits"], 1.5)
+            self.assertEqual(snapshot["jobs"][0]["progressTotalUnits"], 6)
+            self.assertEqual(snapshot["jobs"][0]["progressPercent"], 35)
             self.assertEqual(moved["queuePosition"], 1)
+            self.assertEqual(promoted["previousQueuePosition"], 2)
+            self.assertEqual(promoted["queuePosition"], 1)
+            self.assertEqual(running_priority["queueState"], "running")
             queued = [item["jobId"] for item in reordered["jobs"] if item["queueState"] == "queued"]
-            self.assertEqual(queued, [queued_second, queued_first])
+            self.assertEqual(queued[0], queued_last)
+
+    def test_reused_completed_analysis_exposes_canonical_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            folder = root / ("8" * 32)
+            folder.mkdir()
+            (folder / "job.json").write_text(json.dumps({"analysisSignature": "same"}), encoding="utf-8")
+            (folder / "result.json").write_text(json.dumps({
+                "jobId": folder.name, "status": "complete", "pages": [],
+            }), encoding="utf-8")
+            with patch.object(server, "DATA_ROOT", root):
+                existing = server._find_existing_analysis("same")
+        self.assertEqual(existing["result"]["progressPercent"], 100)
 
     def test_completed_job_can_be_archived_restored_and_deleted(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -433,12 +835,20 @@ class ServerTests(unittest.TestCase):
 
     def test_analysis_progress_combines_reference_files_and_design_pages(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
-            folder = Path(folder_name)
+            root = Path(folder_name)
+            folder = root / ("d" * 32)
+            folder.mkdir()
             (folder / "result.json").write_text(json.dumps({
-                "jobId": "job-progress", "status": "processing", "totalPages": 2, "pages": [],
+                "jobId": folder.name, "status": "processing", "totalPages": 2, "pages": [],
+            }), encoding="utf-8")
+            (folder / "job.json").write_text(json.dumps({
+                "targetFile": "target.pdf",
+                "referenceFiles": ["reference-1.pdf", "reference-2.pdf"],
+                "pcfSources": [], "startPage": 1, "endPage": 2,
             }), encoding="utf-8")
 
             def fake_analysis(*_args, progress_callback, page_callback, **_kwargs):
+                progress_callback("解析对照 PDF 1/2：页面 2/4")
                 progress_callback("对照 PDF 1/2 解析完成")
                 progress_callback("对照 PDF 2/2 解析完成")
                 progress_callback("研究设计图页面 1/2")
@@ -446,29 +856,88 @@ class ServerTests(unittest.TestCase):
                 page_callback({"page": 2, "candidates": []})
                 return {"pages": [{"page": 1, "candidates": []}, {"page": 2, "candidates": []}]}
 
+            training_stage_progress = []
+
             def fake_training(_job_id, job_folder, **_kwargs):
+                training_stage_progress.append(json.loads(
+                    (job_folder / "result.json").read_text(encoding="utf-8")
+                )["progressPercent"])
                 output = job_folder / "training-sample.zip"
                 output.write_bytes(b"training")
                 return output, 0
 
-            with patch.object(server, "analyze_documents", side_effect=fake_analysis), \
-                    patch.object(server, "_write_training_sample", side_effect=fake_training), \
-                    patch.object(server, "_update_job_result", wraps=server._update_job_result) as updates, \
-                    patch.dict(server.JOB_CANCEL_EVENTS, {}, clear=True):
-                server._run_analysis_job(
-                    "job-progress", folder, folder / "target.pdf",
-                    [folder / "reference-1.pdf", folder / "reference-2.pdf"], [],
-                    None, 1, 2, "signature",
+            store = JobStore(root / "jobs.db")
+            store.initialize()
+            store.create_job(
+                job_id=folder.name, analysis_signature="signature", job_folder=folder,
+                original_target_name="target.pdf", algorithm_version="test",
+            )
+            row = store.claim_next("worker-test", 60)
+            with patch.object(job_runner, "analyze_documents", side_effect=fake_analysis), \
+                    patch.object(job_runner, "write_training_sample", side_effect=fake_training), \
+                    patch.object(job_runner, "update_result", wraps=job_runner.update_result) as updates:
+                job_runner.run_job(
+                    store, row, "worker-test",
                 )
 
             progress_updates = [call.args[1] for call in updates.call_args_list]
+            self.assertIn(0.5, [item.get("progressCompletedUnits") for item in progress_updates])
             self.assertIn(1, [item.get("progressCompletedUnits") for item in progress_updates])
             self.assertIn(2, [item.get("progressCompletedUnits") for item in progress_updates])
+            self.assertIn(25, [item.get("progressPercent") for item in progress_updates])
+            self.assertEqual(training_stage_progress, [95])
             saved = json.loads((folder / "result.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["progressCompletedUnits"], 4)
             self.assertEqual(saved["progressTotalUnits"], 4)
             self.assertEqual(saved["completedReferenceFiles"], 2)
             self.assertEqual(saved["completedPages"], 2)
+            self.assertEqual(saved["progressPercent"], 100)
+
+    def test_worker_optimizes_all_pages_before_completing_job(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            folder = root / ("9" * 32)
+            folder.mkdir()
+            (folder / "result.json").write_text(json.dumps({
+                "jobId": folder.name, "status": "processing", "totalPages": 2, "pages": [],
+            }), encoding="utf-8")
+            (folder / "job.json").write_text(json.dumps({
+                "targetFile": "target.pdf", "referenceFiles": [], "pcfSources": [],
+                "startPage": 1, "endPage": 2,
+            }), encoding="utf-8")
+            parsed_pages = [{
+                "page": page, "width": 300, "height": 200,
+                "candidates": [{
+                    "id": f"w{page}", "number": str(page), "x": 100, "y": 100,
+                    "labelX": 250, "labelY": 180, "included": True,
+                }],
+                "layoutObstacles": {"textRects": [], "processSegments": []},
+            } for page in (1, 2)]
+
+            def fake_analysis(*_args, page_callback, **_kwargs):
+                for page in parsed_pages:
+                    page_callback(page)
+                return {"pages": parsed_pages}
+
+            def fake_training(_job_id, job_folder, **_kwargs):
+                output = job_folder / "training-sample.zip"
+                output.write_bytes(b"training")
+                return output, 2
+
+            store = JobStore(root / "jobs.db")
+            store.initialize()
+            store.create_job(
+                job_id=folder.name, analysis_signature="signature", job_folder=folder,
+                original_target_name="target.pdf", algorithm_version="test",
+            )
+            row = store.claim_next("worker-test", 60)
+            with patch.object(job_runner, "analyze_documents", side_effect=fake_analysis), \
+                    patch.object(job_runner, "write_training_sample", side_effect=fake_training):
+                job_runner.run_job(store, row, "worker-test")
+
+            saved = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+            self.assertTrue(all(page["candidates"][0]["labelX"] != 250 for page in saved["pages"]))
+            self.assertNotIn("labelLayout", saved)
 
     def test_export_embeds_independent_marker_styles(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -505,7 +974,7 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(captured["sourceFileName"], "target.pdf")
             self.assertTrue(responses)
 
-    def test_save_job_persists_numbers_and_marker_appearances_for_recovery(self) -> None:
+    def test_legacy_whole_job_save_is_disabled_without_changing_result(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             root = Path(folder_name)
             job_id = "c" * 32
@@ -516,6 +985,8 @@ class ServerTests(unittest.TestCase):
             }), encoding="utf-8")
             handler = object.__new__(server.ApiHandler)
             handler.path = f"/api/jobs/{job_id}"
+            handler.headers = {}
+            handler._request_user = {"userId": "u1", "username": "张三"}
             handler._read_json = lambda: {
                 "pages": [{"page": 1, "candidates": [{"id": "w1", "number": "F1"}]}],
                 "markerStyle": {"color": "#d4143c", "frameSize": 30},
@@ -532,11 +1003,9 @@ class ServerTests(unittest.TestCase):
                 handler.do_PUT()
 
             saved = json.loads((folder / "result.json").read_text(encoding="utf-8"))
-            self.assertEqual(saved["pages"][0]["candidates"][0]["number"], "F1")
-            self.assertEqual(saved["markerStyle"]["frameSize"], 30)
-            self.assertEqual(saved["componentMarkerStyles"]["support"]["color"], "#1769d2")
-            self.assertEqual(saved["revision"], 1)
-            self.assertTrue(responses[0][1]["saved"])
+            self.assertNotIn("number", saved["pages"][0]["candidates"][0])
+            self.assertEqual(responses[0][0], 409)
+            self.assertIn("逐页保存", responses[0][1]["error"])
 
     def test_save_job_rejects_stale_revision(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -550,13 +1019,15 @@ class ServerTests(unittest.TestCase):
             }), encoding="utf-8")
             handler = object.__new__(server.ApiHandler)
             handler.path = f"/api/jobs/{job_id}"
+            handler.headers = {}
+            handler._request_user = {"userId": "u1", "username": "张三"}
             handler._read_json = lambda: {"baseRevision": 1, "pages": [{"page": 1, "candidates": []}]}
             responses = []
             handler._json = lambda status, payload: responses.append((status, payload))
             with patch.object(server, "DATA_ROOT", root):
                 handler.do_PUT()
             self.assertEqual(responses[0][0], 409)
-            self.assertIn("其他窗口", responses[0][1]["error"])
+            self.assertIn("逐页保存", responses[0][1]["error"])
 
 
 if __name__ == "__main__":
