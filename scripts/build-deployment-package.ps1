@@ -62,13 +62,26 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $stagePath $relative) -PathType Leaf)) { throw "Required package file is missing: $relative" }
     }
 
+    Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [System.IO.Compression.ZipFile]::CreateFromDirectory(
-        $stagePath,
+    $archive = [System.IO.Compression.ZipFile]::Open(
         $archivePath,
-        [System.IO.Compression.CompressionLevel]::Optimal,
-        $false
+        [System.IO.Compression.ZipArchiveMode]::Create
     )
+    try {
+        Get-ChildItem -LiteralPath $stagePath -Recurse -File | ForEach-Object {
+            $entryName = $_.FullName.Substring($stagePath.Length).TrimStart('\', '/') -replace '\\', '/'
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $archive,
+                $_.FullName,
+                $entryName,
+                [System.IO.Compression.CompressionLevel]::Optimal
+            ) | Out-Null
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
 
     $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath $checksumPath -Value "$hash *$archiveName" -Encoding ASCII
