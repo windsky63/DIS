@@ -8,10 +8,12 @@ const props = defineProps({
   batchDeleting: { type: Boolean, default: false },
   deleteTarget: { type: Object, default: null },
   recoveryOptions: { type: Array, default: () => [] },
+  recoveryConflictInfo: { type: Object, default: null },
   currentTargetName: { type: String, default: '' },
 })
 
 const recoveryDialog = defineModel('recoveryDialog', { type: Boolean, required: true })
+const recoveryConflictDialog = defineModel('recoveryConflictDialog', { type: Boolean, default: false })
 const selectedRecoveryKey = defineModel('selectedRecoveryKey', { type: String, default: '' })
 const managerDialog = defineModel('managerDialog', { type: Boolean, required: true })
 const batchDeleteDialog = defineModel('batchDeleteDialog', { type: Boolean, required: true })
@@ -19,7 +21,7 @@ const batchDeleteDialog = defineModel('batchDeleteDialog', { type: Boolean, requ
 const emit = defineEmits([
   'select-recovery', 'discard-recovery', 'restore-recovery', 'toggle-selection-mode',
   'toggle-all', 'toggle-selection', 'open-draft', 'request-delete', 'delete-selected',
-  'clear-delete-target', 'delete-draft',
+  'clear-delete-target', 'delete-draft', 'resolve-recovery-conflict',
 ])
 
 function rawOption(item) { return item?.raw && typeof item.raw === 'object' ? item.raw : (item || {}) }
@@ -48,6 +50,18 @@ function canOpen(entry) { return hasStoredTarget(entry) || props.currentTargetNa
         </v-select>
       </v-card-text>
       <v-card-actions><v-btn variant="text" @click="$emit('discard-recovery')">忽略</v-btn><v-spacer /><v-btn color="primary" @click="$emit('restore-recovery')">恢复并继续编辑</v-btn></v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <v-dialog v-model="recoveryConflictDialog" persistent max-width="560">
+    <v-card>
+      <v-card-title>草稿与服务端结果存在冲突</v-card-title>
+      <v-card-text>
+        <div v-if="recoveryConflictInfo?.conflictPages?.length">服务端已更新的冲突页：第 {{ recoveryConflictInfo.conflictPages.join('、') }} 页。</div>
+        <div v-if="recoveryConflictInfo?.unavailablePages?.length" class="mt-2">无法读取服务端结果的页面：第 {{ recoveryConflictInfo.unavailablePages.join('、') }} 页。这些页面只能先恢复为本地待保存内容。</div>
+        <div class="mt-3 text-medium-emphasis">选择草稿将逐页获取编辑锁并覆盖当前可用的服务端结果；任一页失败都会保留恢复内容并提示重试。</div>
+      </v-card-text>
+      <v-card-actions><v-btn variant="text" @click="$emit('resolve-recovery-conflict', 'cancel')">取消恢复</v-btn><v-spacer /><v-btn variant="tonal" color="secondary" @click="$emit('resolve-recovery-conflict', 'server')">保留服务端冲突页</v-btn><v-btn color="error" @click="$emit('resolve-recovery-conflict', 'draft')">使用草稿并覆盖</v-btn></v-card-actions>
     </v-card>
   </v-dialog>
 

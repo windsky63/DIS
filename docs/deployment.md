@@ -74,6 +74,24 @@ docker compose up -d --scale drawing-mark-recognition-worker=2
 
 API 容器目前只能运行一个副本；Worker 可按负载扩展，并与 API 共用数据卷。
 
+## 发布归档
+
+仓库提供可重复执行的 PowerShell 打包脚本。普通发布默认不携带任何真实密钥：
+
+```powershell
+.\scripts\build-deployment-package.ps1
+```
+
+仅在明确需要把当前服务器配置交付给受信任部署人员时，才使用以下命令：
+
+```powershell
+.\scripts\build-deployment-package.ps1 -IncludeSecrets
+```
+
+`-IncludeSecrets` 会把项目根目录的 `.env` 原样写入 ZIP，并在打包前确认 `DEEPSEEK_API_KEY` 非空；脚本不会在终端输出密钥值。归档排除 Git 元数据、依赖目录、构建缓存、测试、运行数据、旧发布包和浏览器/服务器历史数据，并同时生成 `.sha256` 校验文件。
+
+包含 `.env` 的 ZIP 等同于持有明文密钥：只应通过受控渠道传输，限制下载和读取权限，部署后删除多余副本，并在交付范围扩大或文件失控时立即轮换密钥。不要把该 ZIP 提交到 Git、公共网盘或普通群聊。解压后可直接按本页 Docker 部署步骤启动；上线前应核对 `.env` 中端口、版本、构建编号及生产安全参数。
+
 ## 运行参数
 
 | 变量 | 默认值 | 作用 |
@@ -119,6 +137,8 @@ AI 回答使用 `/api/ai/chat/stream` 的 Server-Sent Events 流式传输。若�
 
 AI 助手的本地知识清单位于 `docs/assistant-knowledge.json`。部署镜像必须同时包含 README、`docs/` 目录以及清单中登记的全部 Markdown；缺失或路径不合法时，文档工具不可用。索引位于 API 进程内存，文档大小或修改时间变化后自动重建，不需要独立数据库或向量服务。
 
+后台管理的 AI 余额卡片使用同一份服务端密钥访问 DeepSeek 官方 `GET /user/balance`，只把币种、总余额、充值余额、赠金余额和可用状态返回管理员浏览器。自定义 OpenAI 兼容地址不会自动调用未知的账户接口。生产网络策略应同时允许 API 容器访问 DeepSeek 的对话和余额接口。
+
 API 服务需要访问 `DEEPSEEK_API_URL` 所指向的外部 HTTPS 地址。检索发生在本地，但命中的系统文档片段会作为工具结果发送给 DeepSeek。当前代码明确排除任务 PDF、PCF、结果 JSON、SQLite 数据库、审计日志、发布归档和 `.env`。如果组织策略禁止系统文档离开内网，应改用组织批准的兼容模型地址或关闭 AI 配置。
 
 建议在反向代理中对 `/api/ai/chat/stream` 设置不低于 90 秒的读取超时、关闭代理缓冲和压缩聚合，并保持 Cookie 转发。AI 路由在执行模型或文档工具前要求有效登录会话。
@@ -137,13 +157,13 @@ $env:IDF_REFERENCE_PARSER = 'D:\tools\idf-pipe-viewer\scripts\parse_idf_to_json.
 ## 数据、备份与安全
 
 - 任务文件位于 `data/jobs/<任务编号>`。
-- 队列、账号、会话和页锁位于 `data/jobs/.queue/jobs.db`。
+- 队列、账号、会话、页锁和逐页识别/核对结果位于 `data/jobs/.queue/jobs.db`。
 - 审计日志位于 `data/audit`。
 - 浏览器草稿包含工程 PDF/PCF 副本，敏感文件应及时清理。
 - 完成、失败或取消任务默认保留 90 天；审计日志默认达到 10 MB 后轮转并保留 5 份。
-- 备份时应同时备份整个共享数据卷，而不只是单个 `result.json`。
+- 备份时应同时备份整个共享数据卷，尤其是 `jobs.db`；`result.json` 不再包含完成任务的页面正文。
 
-系统允许开放注册，注册后的有效账号可以查看全部图纸任务，因此应部署在可信内网，或由反向代理增加组织级访问控制。公网部署必须使用 TLS、网络隔离并启用 `DRAWING_MARK_RECOGNITION_SESSION_SECURE=true`。密码使用独立随机盐的 scrypt 哈希；浏览器仅保存 HttpOnly、SameSite=Lax 会话 Cookie。
+系统允许开放注册，注册后的有效账号可以查看全部图纸任务，因此应部署在可信内网，或由反向代理增加组织级访问控制。公网部署必须使用 TLS、网络隔离并启用 `DRAWING_MARK_RECOGNITION_SESSION_SECURE=true`。密码使用独立随机盐的 scrypt 哈希，前端不会把用户名或密码写入 Web Storage。“记住密码”只控制 HttpOnly、SameSite=Lax 登录 Cookie 是否带 7 天 `Max-Age`；未勾选时使用无持久化期限的浏览器会话 Cookie，关闭浏览器后失效。注册后的自动登录同样使用会话 Cookie。
 
 ## 基础镜像拉取 403
 

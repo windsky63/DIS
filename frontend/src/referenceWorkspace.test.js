@@ -85,3 +85,24 @@ test('page matching resolves the registered reference slot', () => {
   assert.equal(match?.index, 0)
   assert.equal(match?.page, 7)
 })
+
+test('an unmatched design page clears the previously displayed reference page', async () => {
+  const { workspace, result, renders } = createWorkspace()
+  let destroyed = false
+  workspace.files.value = [{ name: 'line-a.pdf', index: 0 }]
+  workspace.researchReady.value = true
+  workspace.activeIndex.value = 0
+  workspace.activeFile.value = workspace.files.value[0]
+  workspace.activePage.value = 7
+  workspace.document.value = { destroy: () => { destroyed = true } }
+  result.value.pages = [{ page: 2, reference: {} }]
+
+  await workspace.syncForPage(2, false)
+
+  assert.equal(destroyed, true)
+  assert.equal(workspace.document.value, null)
+  assert.equal(workspace.activeFile.value, null)
+  assert.equal(workspace.activeIndex.value, -1)
+  assert.equal(workspace.activePage.value, 1)
+  assert.equal(renders.at(-1), false)
+})

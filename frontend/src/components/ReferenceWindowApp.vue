@@ -9,6 +9,7 @@ import {
 } from '../detachedReferenceProtocol.js'
 import { createReferenceViewerState } from '../composables/useReferenceWindowViewer.js'
 import { createDetachedReferenceFocus, resolveDetachedReferenceViewport } from '../detachedReferenceFocus.js'
+import { referenceHintClickDecision, sameReferenceHint } from '../referenceHintIdentity.js'
 import { loadPdfDocument } from '../services/pdfDocument.js'
 import { useCanvasViewport } from '../composables/useCanvasViewport.js'
 
@@ -92,10 +93,12 @@ function handleMessage(event) {
     viewer.accept(message.payload)
     if (message.payload?.hintsLocation === 'design' || previous?.fileKey !== message.payload?.fileKey || Number(previous?.page) !== Number(message.payload?.page)) {
       showAllHints.value = Boolean(message.payload?.showAll)
-      if (message.payload?.focus) void selectHint(message.payload.focus, { toggle: false })
+      if (message.payload?.focus) void selectHint(message.payload.focus, { locate: false })
       else hintFocus.value = null
     }
     document.body.classList.toggle('tooltips-disabled', message.payload?.tooltipsEnabled === false)
+  } else if (message.type === 'locate-hint') {
+    void selectHint(message.payload, { locate: true })
   } else if (message.type === 'parent-closing') {
     connected.value = false
     error.value = '主编辑窗口已关闭或退出，对照窗口已断开。'
@@ -175,19 +178,19 @@ function jumpToPage(page) {
   viewer.navigate(page, pageCount.value)
 }
 
-async function selectHint(item, { toggle = true } = {}) {
+async function selectHint(item, { locate } = {}) {
   const focus = createDetachedReferenceFocus(item, viewer.active.value)
   if (!focus) return
-  const selected = hintFocus.value?.file === focus.file && hintFocus.value?.page === focus.page
-    && hintFocus.value?.label === focus.label && hintFocus.value?.type === focus.type
-  if (toggle && selected) {
-    hintFocus.value = null
-    return
-  }
-  hintFocus.value = focus
+  const decision = referenceHintClickDecision(hintFocus.value, focus)
+  hintFocus.value = decision.focus
   showAllHints.value = false
+  if (!(locate ?? decision.locate)) return
   await nextTick()
   centerHint(focus)
+}
+
+function isHintFocused(item) {
+  return sameReferenceHint(hintFocus.value, createDetachedReferenceFocus(item, viewer.active.value))
 }
 
 function centerHint(focus) {
@@ -286,9 +289,9 @@ onBeforeUnmount(() => {
             <section v-for="group in hintGroups" :key="group.key" class="reference-hint-group">
               <div class="reference-hint-group__heading"><span><i :style="{ backgroundColor: group.color }" />{{ group.title }}</span><strong>{{ group.items.length }}</strong></div>
               <v-list v-if="group.items.length" density="compact" class="reference-hint-list" border>
-                <v-list-item v-for="item in group.items" :key="`${group.key}-${item.label}-${(item.point || []).join('-')}`" :active="hintFocus?.label === item.label && hintFocus?.type === item.type" color="secondary" @click="selectHint(item)">
+                <v-list-item v-for="item in group.items" :key="`${group.key}-${item.label}-${(item.point || []).join('-')}`" :active="isHintFocused(item)" color="secondary" @click="selectHint(item)">
                   <v-list-item-title>{{ item.label }}</v-list-item-title>
-                  <v-list-item-subtitle>{{ item.geometryVerified === false ? '引线定位 · 几何待确认' : '已识别 · 点击定位' }}</v-list-item-subtitle>
+                  <v-list-item-subtitle>{{ isHintFocused(item) ? '再次点击定位' : (item.geometryVerified === false ? '引线定位 · 点击显示' : '点击显示') }}</v-list-item-subtitle>
                   <template #append><span class="reference-hint-locate" aria-hidden="true">⌖</span></template>
                 </v-list-item>
               </v-list>

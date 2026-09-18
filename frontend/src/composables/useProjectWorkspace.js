@@ -1,7 +1,6 @@
 import { nextTick } from 'vue'
 
 import { api } from '../api.js'
-import { resultHasMissingNumbers } from '../numbering.js'
 import { readEditablePdfAttachments } from '../pdfWorkspace.js'
 import { loadPdfDocument } from '../services/pdfDocument.js'
 import { deleteDraft, fileFingerprint, loadDraft, loadDraftPage } from '../workspaceStorage.js'
@@ -20,7 +19,7 @@ export function useProjectWorkspace({ state, operations }) {
     selectedId, swapSourceId, previewPage, currentPage, tutorialSessionActive,
     tutorialSampleLoading, referenceMode, referenceProjectMode, referencePdfs,
     activeReferenceIndex, referencePdf, unavailableReferenceFiles, pcfFiles, selectedPcfFolder,
-    useReferenceNumber, startNumber, hydratingWorkspace, leftPanelTab,
+    useReferenceNumber, hydratingWorkspace, leftPanelTab,
     markerStyle, error,
   } = state
   let targetLoadToken = 0
@@ -63,7 +62,6 @@ export function useProjectWorkspace({ state, operations }) {
       referencePdfs.value = tutorialReferences; activeReferenceIndex.value = tutorialReferences.length ? 0 : -1; referencePdf.value = tutorialReferences[0] || null
       const tutorialStartPage = tutorialResult.pages?.[0]?.page || tutorialResult.analyzedRange?.[0] || 1
       result.value = operations.cloneValue(tutorialResult); operations.restoreMarkerAppearances({ result: tutorialResult })
-      if (resultHasMissingNumbers(result.value)) operations.numberResult(result.value, Math.max(1, Number(startNumber.value) || 1))
       currentPage.value = tutorialStartPage; previewPage.value = currentPage.value; projectResults.value[0] = result.value
       await nextTick()
       let targetLoaded = await loadTargetPdf(sample, true, false, tutorialStartPage)
@@ -143,10 +141,42 @@ export function useProjectWorkspace({ state, operations }) {
     const recovery = pendingDraft.value; const payload = recovery?.payload
     if (!payload?.result) return
     hydratingWorkspace.value = true; const loadedTargetFile = targetPdf.value
+    const needsReconciliation = recovery?.source === 'indexeddb' || recovery?.source === 'embedded'
+    let reconciliation = null
+    if (needsReconciliation && operations.reconcileRecovery) {
+      reconciliation = await operations.reconcileRecovery(recovery)
+      if (reconciliation?.choice === 'cancel') {
+        hydratingWorkspace.value = false
+        targetPreparation.value = { ...targetPreparation.value, active: false }
+        return false
+      }
+    }
     if (recovery?.sourceFile) { targetPdf.value = recovery.sourceFile; projectPdfs.value[activeProjectIndex.value] = recovery.sourceFile }
     targetPreparation.value = { ...targetPreparation.value, active: true, message: '正在恢复工作区并渲染页面' }
     if (Array.isArray(payload.projectResults)) { projectResults.value = operations.cloneValue(payload.projectResults); activeProjectIndex.value = Number(payload.activeProjectIndex) || 0; targetPdf.value = projectPdfs.value[activeProjectIndex.value] || targetPdf.value }
     result.value = operations.cloneValue(payload.result); if (payload.workspaceDraftSchema) result.value.workspaceDraftSchema = payload.workspaceDraftSchema
+    if (reconciliation?.localByPage) {
+      const keepLocal = new Set([
+        ...(reconciliation.safePages || []),
+        ...(reconciliation.unavailablePages || []),
+        ...(reconciliation.choice === 'draft' ? (reconciliation.conflictPages || []) : []),
+      ])
+      result.value.pages = (result.value.pages || []).map(page => keepLocal.has(Number(page.page))
+        ? operations.cloneValue(reconciliation.localByPage.get(Number(page.page)) || page)
+        : page)
+    }
+    if (reconciliation?.choice === 'server') {
+      const conflicts = new Set(reconciliation.conflictPages || [])
+      result.value.pages = (result.value.pages || []).map(page => conflicts.has(Number(page.page))
+        ? operations.cloneValue(reconciliation.serverByPage.get(Number(page.page)))
+        : page)
+    }
+    if (needsReconciliation) {
+      const dirtyPages = reconciliation
+        ? [...(reconciliation.safePages || []), ...(reconciliation.unavailablePages || []), ...(reconciliation.choice === 'draft' ? (reconciliation.conflictPages || []) : [])]
+        : (result.value.pages || []).map(page => Number(page.page)).filter(Number.isFinite)
+      operations.markRecoveredPagesDirty?.(dirtyPages)
+    }
     operations.restoreProjectSettings?.(payload)
     operations.restoreMarkerAppearances(payload)
     if (payload.referenceMode) referenceMode.value = payload.referenceMode; else if ((result.value.referenceFiles || []).length) referenceMode.value = 'pdf'
@@ -162,7 +192,6 @@ export function useProjectWorkspace({ state, operations }) {
     selectedPcfFolder.value = payload.selectedPcfFolder || selectedPcfFolder.value; useReferenceNumber.value = payload.useReferenceNumber ?? useReferenceNumber.value
     referenceResearchReady.value = payload.referenceResearchReady ?? true; activeReferenceIndex.value = Math.max(0, Math.min(Number(payload.activeReferenceIndex) || 0, Math.max(0, referencePdfs.value.length - 1)))
     operations.setActiveReferencePage(Math.max(1, Number(payload.activeReferencePage) || 1)); referencePdf.value = referencePdfs.value[activeReferenceIndex.value] || null
-    if (resultHasMissingNumbers(result.value)) operations.numberResult(result.value, Math.max(1, Number(startNumber.value) || 1))
     currentPage.value = Number(payload.currentPage) || result.value.analyzedRange?.[0] || 1; projectResults.value[activeProjectIndex.value] = result.value
     pendingDraft.value = null; recoveryOptions.value = []; selectedRecoveryKey.value = ''; draftRecoveryDialog.value = false; operations.clearHistory()
     operations.showNotice(unavailableReferenceFiles.value.length ? `已恢复标识数据；原对照 PDF 无法自动取回，请重新选择：${unavailableReferenceFiles.value.join('、')}` : expectedReferences.length ? '已恢复可编辑标识数据及对照 PDF，可继续校对、移动和导出。' : '已恢复可编辑标识数据，可继续校对、移动和导出。')
@@ -171,7 +200,14 @@ export function useProjectWorkspace({ state, operations }) {
       if (recovery?.source === 'recent-batch' || targetPdf.value !== loadedTargetFile) await loadTargetPdf(targetPdf.value, true, false)
       if (referenceMode.value === 'pdf' && referencePdfs.value.length) { if (referenceProjectMode.value === 'folder' || operations.matchedReference(currentPage.value)) await operations.syncReferenceForPage(currentPage.value, true); else await operations.loadReferencePdf(referencePdf.value, true); void operations.archiveLazyReferences() }
       else if (recovery?.source !== 'recent-batch' && targetPdf.value === loadedTargetFile) await operations.renderCanvas(true)
+      if (reconciliation?.choice === 'draft' && reconciliation.conflictPages?.length) {
+        await operations.overwriteRecoveredPages?.(reconciliation.conflictPages, reconciliation.unavailablePages || [])
+      }
+      if (needsReconciliation && !reconciliation?.unavailablePages?.includes(Number(currentPage.value))) {
+        await operations.activateRecoveredPage?.()
+      }
     } finally { await nextTick(); hydratingWorkspace.value = false; targetPreparation.value = { ...targetPreparation.value, active: false } }
+    return true
   }
 
   async function discardWorkspaceDraft() {
@@ -188,7 +224,7 @@ export function useProjectWorkspace({ state, operations }) {
     if (result.value && referenceMode.value === 'pdf') await operations.syncReferenceForPage(currentPage.value, true)
   }
 
-  async function changePage(pageNumber) {
+  async function changePage(pageNumber, { preserveLocal = false } = {}) {
     const previousHydration = hydratingWorkspace.value
     hydratingWorkspace.value = true
     try {
@@ -197,7 +233,7 @@ export function useProjectWorkspace({ state, operations }) {
       selectedId.value = ''
       if (result.value && referenceMode.value === 'pdf') await operations.syncReferenceForPage(currentPage.value, true); else await operations.renderCanvas(true)
       if (generation !== pageChangeGeneration) return
-      if (result.value?.jobId && requested && !requested.layoutObstacles) {
+      if (!preserveLocal && result.value?.jobId && requested && requested.detailsLoaded === false) {
         try {
           const isServerJob = result.value.jobId && result.value.jobId !== 'tutorial-000207'
           const localPage = !isServerJob && activeFileFingerprint.value ? await loadDraftPage(activeFileFingerprint.value, activeProjectIndex.value, pageNumber).catch(() => null) : null
@@ -212,6 +248,32 @@ export function useProjectWorkspace({ state, operations }) {
     }
   }
 
+  function releasePageDetails(keepPage, protectedPages = []) {
+    if (!result.value?.jobId || result.value.jobId === 'tutorial-000207') return
+    const protectedSet = new Set([Number(keepPage), ...protectedPages].map(Number))
+    for (const page of result.value.pages || []) {
+      if (page.detailsLoaded === false || protectedSet.has(Number(page.page))) continue
+      const included = (page.candidates || []).filter(candidate => candidate.included !== false
+        && candidate.componentKind !== 'design-component'
+        && candidate.componentKind !== 'special-marker'
+        && candidate.componentType !== 'special'
+        && candidate.specialMarker !== true)
+      const unmatched = included.filter(candidate => !candidate.referenceMatched || !String(candidate.referenceLabel || '').trim()).length
+      const unresolved = Math.max(0, Number(page.reference?.unresolvedCalloutGap) || 0)
+      page.candidateCount = (page.candidates || []).length
+      page.matchSummary = {
+        matched: included.length - unmatched,
+        unmatched,
+        unresolved,
+        complete: included.length > 0 && unmatched === 0 && unresolved === 0,
+      }
+      page.candidates = []
+      delete page.layoutObstacles
+      delete page.designComponents
+      page.detailsLoaded = false
+    }
+  }
+
   function dispose() { targetLoadToken += 1; pageChangeGeneration += 1 }
-  return { normalizeFiles, clearProject, changeProjectMode, setProjectFiles, loadTutorialSample, loadTargetPdf, restoreWorkspaceDraft, discardWorkspaceDraft, selectProject, changePage, dispose }
+  return { normalizeFiles, clearProject, changeProjectMode, setProjectFiles, loadTutorialSample, loadTargetPdf, restoreWorkspaceDraft, discardWorkspaceDraft, selectProject, changePage, releasePageDetails, dispose }
 }

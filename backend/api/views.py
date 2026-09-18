@@ -30,25 +30,29 @@ import fitz
 
 try:
     from .. import ai_assistant
+    from ..admin_store import AdminStore
     from ..assistant_conversation_store import AssistantConversationStore
     from ..engine import dump_result, render_page, write_annotated_pdf
+    from ..reference_rules import normalize_reference_rules
     from ..auth_store import AuthStore, InvalidCredentials, UsernameTaken
     from ..iso_weld_matcher.idf_topology import parser_availability
     from ..job_store import ActiveJobExists, JobStore
     from ..page_lock_store import PageLockConflict, PageLockStore
-    from ..page_reviews import PageRevisionConflict, merge_review_page
+    from ..page_reviews import PageRevisionConflict
     from ..progress import result_progress_percent
     from .exceptions import ApiError
     from .services import queue, uploads
 except ImportError:  # Direct ``python backend/server.py`` execution.
     import ai_assistant
+    from admin_store import AdminStore
     from assistant_conversation_store import AssistantConversationStore
     from engine import dump_result, render_page, write_annotated_pdf
+    from reference_rules import normalize_reference_rules
     from auth_store import AuthStore, InvalidCredentials, UsernameTaken
     from iso_weld_matcher.idf_topology import parser_availability
     from job_store import ActiveJobExists, JobStore
     from page_lock_store import PageLockConflict, PageLockStore
-    from page_reviews import PageRevisionConflict, merge_review_page
+    from page_reviews import PageRevisionConflict
     from progress import result_progress_percent
     from api.exceptions import ApiError
     from api.services import queue, uploads
@@ -62,7 +66,7 @@ PCF_LIBRARY_ROOT = ROOT / "backend" / "PCF"
 TUTORIAL_ROOT = ROOT / "backend" / "tutorial"
 TUTORIAL_EXPORT_ROOT = ROOT / "data" / "tutorial-exports"
 AUDIT_ROOT = ROOT / "data" / "audit"
-APP_VERSION = os.environ.get("DRAWING_MARK_RECOGNITION_VERSION", "2.0.10")
+APP_VERSION = os.environ.get("DRAWING_MARK_RECOGNITION_VERSION", "2.0.12")
 BUILD_ID = os.environ.get("DRAWING_MARK_RECOGNITION_BUILD_ID", "local")
 MAX_BODY_BYTES = int(os.environ.get("DRAWING_MARK_RECOGNITION_MAX_BODY_MB", "350")) * 1024 * 1024
 MAX_JOB_REQUEST_BYTES = 2 * 1024 * 1024
@@ -88,7 +92,7 @@ MINERU_BASE_URL = os.environ.get("MINERU_BASE_URL", "http://192.168.32.61:8081")
 # Increment whenever recognition semantics change so completed results from an
 # older engine are not silently reused for the same files and configuration.
 ANALYSIS_ALGORITHM_VERSION = os.environ.get(
-    "DRAWING_MARK_RECOGNITION_ALGORITHM_VERSION", "2026-09-08.1"
+    "DRAWING_MARK_RECOGNITION_ALGORITHM_VERSION", "2026-09-16.vector-layout.1"
 )
 
 
@@ -110,9 +114,17 @@ def _auth_store() -> AuthStore:
         if store is None:
             store = AuthStore(path)
             store.initialize()
-            store.ensure_default_user("admin", "123456")
+            store.ensure_default_user("admin", "123456", is_admin=True)
             AUTH_STORES[path] = store
         return store
+
+
+def _admin_store() -> AdminStore:
+    _job_store()
+    _auth_store()
+    _page_lock_store()
+    _assistant_conversation_store()
+    return AdminStore(DATA_ROOT / ".queue" / "jobs.db")
 
 
 def _assistant_conversation_store() -> AssistantConversationStore:
@@ -139,13 +151,10 @@ def _page_lock_store() -> PageLockStore:
 
 
 def _require_job_page(job_id: str, page_number: int) -> None:
-    result_path = _job_folder(job_id) / "result.json"
-    if not result_path.is_file():
-        raise ApiError("任务不存在", HTTPStatus.NOT_FOUND)
-    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result = _load_job_result(job_id, include_pages=False)
     if result.get("status") != "complete":
         raise ApiError("任务尚未完成，不能开始核对", HTTPStatus.CONFLICT)
-    if not any(int(page.get("page") or 0) == page_number for page in result.get("pages") or []):
+    if _job_store().get_job_page(job_id, page_number) is None:
         raise ApiError("页面结果不存在", HTTPStatus.NOT_FOUND)
 
 
@@ -177,9 +186,10 @@ def _job_status(folder: Path) -> str:
         return ""
 
 
-def _analysis_queue_snapshot() -> dict[str, Any]:
+def _analysis_queue_snapshot(*, scope: str = "current", page: int = 1, page_size: int = 20) -> dict[str, Any]:
     return queue.snapshot(
-        _job_store(), DATA_ROOT, ANALYSIS_ALGORITHM_VERSION, MAX_CONCURRENT_ANALYSES
+        _job_store(), DATA_ROOT, MAX_CONCURRENT_ANALYSES,
+        scope=scope, page=page, page_size=page_size,
     )
 
 
@@ -222,9 +232,10 @@ def _delete_completed_job(job_id: str) -> None:
 
 
 def _reconcile_interrupted_jobs() -> int:
-    """Import legacy folders; live Worker leases remain untouched."""
+    """Initialize the current queue without importing JSON-only legacy jobs."""
 
-    return _job_store().import_existing(DATA_ROOT, ANALYSIS_ALGORITHM_VERSION)
+    _job_store()
+    return 0
 
 
 def _cleanup_expired_jobs() -> int:
@@ -302,14 +313,6 @@ def _analysis_worker_health() -> dict[str, Any]:
 
 def _safe_name(value: str, fallback: str) -> str:
     return uploads.safe_name(value, fallback)
-
-
-def _decode_file(payload: dict[str, Any] | None, folder: Path, fallback: str) -> Path | None:
-    return uploads.decode_file(payload, folder, fallback)
-
-
-def _decode_files(payloads: Any, folder: Path, prefix: str, default_suffix: str = ".pdf") -> list[Path]:
-    return uploads.decode_files(payloads, folder, prefix, default_suffix)
 
 
 def _upload_record(upload_id: str) -> tuple[Path, dict[str, Any]]:
@@ -418,13 +421,7 @@ def _payload_file_signature(payload: Any) -> dict[str, Any] | None:
             "name": _safe_name(payload.get("name") or meta.get("name"), "file").casefold(),
             "content": str(meta.get("sha256") or ""),
         }
-    encoded = payload.get("dataBase64")
-    if not isinstance(encoded, str) or not encoded:
-        return None
-    return {
-        "name": _safe_name(payload.get("name"), "file").casefold(),
-        "content": hashlib.sha256(encoded.encode("ascii", errors="ignore")).hexdigest(),
-    }
+    return None
 
 
 def _analysis_signature(payload: dict[str, Any]) -> str:
@@ -434,11 +431,9 @@ def _analysis_signature(payload: dict[str, Any]) -> str:
         pcf_inventory.append([path.name.casefold(), stat.st_size, stat.st_mtime_ns])
     descriptor = {
         "algorithmVersion": ANALYSIS_ALGORITHM_VERSION,
-        "target": _payload_file_signature(payload.get("targetUpload") or payload.get("targetPdf")),
-        "referencePdfs": [_payload_file_signature(item) for item in (payload.get("referenceUploads") or payload.get("referencePdfs") or [])],
-        "referencePdf": _payload_file_signature(payload.get("referencePdf")),
-        "pcfFiles": [_payload_file_signature(item) for item in (payload.get("pcfUploads") or payload.get("pcfFiles") or [])],
-        "pcfFile": _payload_file_signature(payload.get("pcfFile")),
+        "target": _payload_file_signature(payload.get("targetUpload")),
+        "referencePdfs": [_payload_file_signature(item) for item in (payload.get("referenceUploads") or [])],
+        "pcfFiles": [_payload_file_signature(item) for item in (payload.get("pcfUploads") or [])],
         "pcfFolder": payload.get("pcfFolder") or None,
         "pcfInventory": pcf_inventory,
         "project": payload.get("project") or {},
@@ -462,11 +457,11 @@ def _find_existing_analysis(signature: str) -> dict[str, Any] | None:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             if meta.get("analysisSignature") != signature:
                 continue
-            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result = _load_job_result(meta_path.parent.name)
         except (OSError, json.JSONDecodeError):
             continue
         job_id = meta_path.parent.name
-        if result.get("status") != "complete":
+        if result.get("status") != "complete" or not result.get("pages"):
             continue
         result.pop("labelLayout", None)
         result["createdBy"] = meta.get("createdBy") or result.get("createdBy")
@@ -510,40 +505,27 @@ def _atomic_dump(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _recent_batch_results() -> dict[str, Any]:
-    records = []
-    if not DATA_ROOT.is_dir():
+    selected = _job_store().latest_completed_batch(ANALYSIS_ALGORITHM_VERSION)
+    if not selected:
         return {"batchId": None, "jobs": []}
-    for result_path in DATA_ROOT.glob("*/result.json"):
-        meta_path = result_path.parent / "job.json"
-        if not meta_path.is_file():
-            continue
-        try:
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if meta.get("tutorial") or meta.get("archivedAt") or meta.get("analysisAlgorithmVersion") != ANALYSIS_ALGORITHM_VERSION:
-            continue
-        if result.get("status") != "complete" or not result.get("pages"):
-            continue
-        records.append({"modified": result_path.stat().st_mtime, "result": result, "meta": meta})
-    if not records:
-        return {"batchId": None, "jobs": []}
-    latest = max(records, key=lambda item: item["modified"])
-    batch_id = latest["meta"].get("batchId")
-    selected = [item for item in records if batch_id and item["meta"].get("batchId") == batch_id] if batch_id else [latest]
-    selected.sort(key=lambda item: (int(item["meta"].get("batchIndex") or 0), item["modified"]))
+    batch_id = selected[0].get("batch_id")
     jobs = []
     for item in selected:
-        restored = _workspace_result(item["result"])
-        restored["originalTargetName"] = item["meta"].get("originalTargetName") or restored.get("originalTargetName")
-        restored["createdBy"] = item["meta"].get("createdBy") or restored.get("createdBy")
+        try:
+            job_id = str(item["job_id"])
+            result = _load_job_result(job_id, include_pages=False)
+            result["pages"] = _job_store().get_job_workspace_pages(job_id)
+        except (OSError, ValueError, ApiError, json.JSONDecodeError):
+            continue
+        restored = _workspace_result(result)
+        restored["originalTargetName"] = item.get("original_target_name") or restored.get("originalTargetName")
+        restored["createdBy"] = item.get("createdBy") or restored.get("createdBy")
         jobs.append(restored)
     return {"batchId": batch_id, "jobs": jobs}
 
 
 def _workspace_result(result: dict[str, Any], initial_page: int | None = None) -> dict[str, Any]:
-    """Return editable data while deferring geometry for non-visible pages."""
+    """Return one editable page and lightweight navigation data for other pages."""
 
     pages = list(result.get("pages") or [])
     if initial_page is None and pages:
@@ -552,7 +534,31 @@ def _workspace_result(result: dict[str, Any], initial_page: int | None = None) -
     for page in pages:
         item = dict(page)
         if int(item.get("page") or 0) != int(initial_page or 0):
+            candidates = item.get("candidates") if isinstance(item.get("candidates"), list) else []
+            item["candidateCount"] = int(item.get("candidateCount") or len(candidates))
+            if "matchSummary" not in item:
+                included = [
+                    candidate for candidate in candidates
+                    if candidate.get("included", True)
+                    and candidate.get("componentKind") != "design-component"
+                    and candidate.get("componentKind") != "special-marker"
+                    and candidate.get("componentType") != "special"
+                    and candidate.get("specialMarker") is not True
+                ]
+                unmatched = [
+                    candidate for candidate in included
+                    if not candidate.get("referenceMatched") or not str(candidate.get("referenceLabel") or "").strip()
+                ]
+                unresolved = max(0, int((item.get("reference") or {}).get("unresolvedCalloutGap") or 0))
+                item["matchSummary"] = {
+                    "matched": len(included) - len(unmatched),
+                    "unmatched": len(unmatched),
+                    "unresolved": unresolved,
+                    "complete": bool(included) and not unmatched and unresolved == 0,
+                }
+            item["candidates"] = []
             item.pop("layoutObstacles", None)
+            item.pop("designComponents", None)
             item["detailsLoaded"] = False
         else:
             item["detailsLoaded"] = True
@@ -560,14 +566,6 @@ def _workspace_result(result: dict[str, Any], initial_page: int | None = None) -
     workspace = dict(result) | {"pages": lightweight_pages, "workspaceView": "lazy-page-details"}
     workspace.pop("labelLayout", None)
     return workspace
-
-
-def _merge_saved_pages(payload: Any, current: dict[str, Any]) -> list[dict[str, Any]]:
-    """Preserve deferred immutable fields when a lazy workspace is saved."""
-
-    validated = _validated_pages(payload, current)
-    existing = {int(page.get("page") or 0): page for page in current.get("pages") or []}
-    return [dict(existing.get(int(page.get("page") or 0), {})) | page for page in validated]
 
 
 def _active_analysis(signature: str) -> dict[str, Any] | None:
@@ -639,13 +637,25 @@ def _validated_pages(payload: Any, current: dict[str, Any]) -> list[dict[str, An
     return payload
 
 
-def _require_complete_job(folder: Path) -> tuple[Path, dict[str, Any]]:
-    result_path = folder / "result.json"
+def _load_job_result(job_id: str, *, include_pages: bool = True) -> dict[str, Any]:
+    result_path = _job_folder(job_id) / "result.json"
     if not result_path.is_file():
         raise ApiError("任务不存在", HTTPStatus.NOT_FOUND)
-    current = json.loads(result_path.read_text(encoding="utf-8"))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if include_pages:
+        # Task metadata stays in result.json while Worker and review page bodies
+        # live in SQLite. Old JSON-only jobs are intentionally not migrated.
+        result["pages"] = _job_store().get_job_pages(job_id)
+    return result
+
+
+def _require_complete_job(folder: Path) -> tuple[Path, dict[str, Any]]:
+    result_path = folder / "result.json"
+    current = _load_job_result(folder.name)
     if current.get("status") != "complete":
         raise ApiError("任务尚未完成，不能保存或导出", HTTPStatus.CONFLICT)
+    if not current.get("pages"):
+        raise ApiError("该任务没有数据库页面结果，请重新解析", HTTPStatus.CONFLICT)
     return result_path, current
 
 
@@ -694,7 +704,7 @@ def _write_training_sample(
     result_path, meta_path = folder / "result.json", folder / "job.json"
     if not result_path.exists() or not meta_path.exists():
         raise ValueError("任务不存在")
-    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result = _load_job_result(job_id)
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     candidates = [
         {**candidate, "confirmedByHuman": confirmed_by_human}
@@ -903,6 +913,12 @@ class ApiHandler(SimpleHTTPRequestHandler):
             raise ApiError("请先登录", HTTPStatus.UNAUTHORIZED)
         return user
 
+    def _require_admin(self) -> dict[str, object]:
+        user = self._require_user()
+        if user.get("isAdmin") is not True:
+            raise ApiError("需要管理员权限", HTTPStatus.FORBIDDEN)
+        return user
+
     def _require_same_origin(self) -> None:
         headers = getattr(self, "headers", {})
         origin = str(headers.get("Origin") or "").rstrip("/")
@@ -914,11 +930,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
             raise ApiError("拒绝跨站修改请求", HTTPStatus.FORBIDDEN)
 
     @staticmethod
-    def _session_cookie(token: str, *, clear: bool = False) -> str:
+    def _session_cookie(token: str, *, persistent: bool = False, clear: bool = False) -> str:
         parts = [f"{SESSION_COOKIE_NAME}={'' if clear else token}", "Path=/", "HttpOnly", "SameSite=Lax"]
         if clear:
             parts.extend(("Max-Age=0", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"))
-        else:
+        elif persistent:
             parts.append(f"Max-Age={7 * 24 * 60 * 60}")
         if SESSION_COOKIE_SECURE:
             parts.append("Secure")
@@ -941,8 +957,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
         except InvalidCredentials as exc:
             raise ApiError(str(exc), HTTPStatus.UNAUTHORIZED) from exc
         token = _auth_store().create_session(str(user["userId"]))
+        _page_lock_store().release_user(str(user["userId"]))
         self._request_user = user
-        self._json(HTTPStatus.OK, {"user": user}, {"Set-Cookie": self._session_cookie(token)})
+        self._json(HTTPStatus.OK, {"user": user}, {
+            "Set-Cookie": self._session_cookie(token, persistent=payload.get("rememberPassword") is True),
+        })
 
     def _logout(self) -> None:
         _auth_store().delete_session(self._session_token())
@@ -998,6 +1017,28 @@ class ApiHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/auth/me":
             self._json(HTTPStatus.OK, {"user": self._require_user()})
+            return
+        if path == "/api/admin/overview":
+            self._require_admin()
+            overview = _admin_store().overview()
+            overview["workers"] = _analysis_worker_health()
+            self._json(HTTPStatus.OK, overview)
+            return
+        if path == "/api/admin/users":
+            self._require_admin()
+            query = parse_qs(parsed.query)
+            try:
+                page = max(1, int(query.get("page", ["1"])[0]))
+                page_size = max(1, min(100, int(query.get("pageSize", ["20"])[0])))
+            except (TypeError, ValueError):
+                page, page_size = 1, 20
+            self._json(HTTPStatus.OK, _admin_store().users(
+                search=query.get("search", [""])[0], page=page, page_size=page_size,
+            ))
+            return
+        if path == "/api/admin/ai-balance":
+            self._require_admin()
+            self._json(HTTPStatus.OK, ai_assistant.account_balance())
             return
         if path == "/api/ai/status":
             self._json(HTTPStatus.OK, ai_assistant.configuration_status())
@@ -1057,7 +1098,20 @@ class ApiHandler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.OK, _recent_batch_results())
             return
         if path == "/api/analysis-queue":
-            self._json(HTTPStatus.OK, _analysis_queue_snapshot())
+            query = parse_qs(parsed.query)
+            scope = query.get("scope", ["current"])[0]
+            scope = "archived" if scope == "archived" else "current"
+            try:
+                page = max(1, int(query.get("page", ["1"])[0]))
+            except (TypeError, ValueError):
+                page = 1
+            try:
+                page_size = min(100, max(1, int(query.get("pageSize", ["20"])[0])))
+            except (TypeError, ValueError):
+                page_size = 20
+            self._json(HTTPStatus.OK, _analysis_queue_snapshot(
+                scope=scope, page=page, page_size=page_size,
+            ))
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/locks", path)
         if match:
@@ -1081,18 +1135,21 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     return
                 self._json(HTTPStatus.NOT_FOUND, {"error": "任务不存在"})
                 return
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            record = _job_store().get(job_id)
-            result["createdBy"] = result.get("createdBy") or (record or {}).get("createdBy")
-            result.pop("labelLayout", None)
-            result["progressPercent"] = result_progress_percent(result)
             query = parse_qs(parsed.query)
-            if query.get("view") == ["workspace"]:
+            workspace_view = query.get("view") == ["workspace"]
+            result = _load_job_result(job_id, include_pages=not workspace_view)
+            if workspace_view:
                 requested_page = query.get("page", [None])[0]
                 try:
                     initial_page = int(requested_page) if requested_page is not None else None
                 except (TypeError, ValueError):
                     initial_page = None
+                result["pages"] = _job_store().get_job_workspace_pages(job_id, initial_page)
+            record = _job_store().get(job_id)
+            result["createdBy"] = result.get("createdBy") or (record or {}).get("createdBy")
+            result.pop("labelLayout", None)
+            result["progressPercent"] = result_progress_percent(result)
+            if workspace_view:
                 result = _workspace_result(result, initial_page)
             self._json(HTTPStatus.OK, result)
             return
@@ -1123,21 +1180,6 @@ class ApiHandler(SimpleHTTPRequestHandler):
             stored_name = Path(str((meta.get("referenceFiles") or [])[requested_index])).name
             self._file(_job_folder(job_id) / stored_name, entry["name"])
             return
-        match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/page-details", path)
-        if match:
-            result_path = _job_folder(match.group(1)) / "result.json"
-            if not result_path.is_file():
-                self._json(HTTPStatus.NOT_FOUND, {"error": "任务不存在"})
-                return
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            self._json(HTTPStatus.OK, {"pages": [
-                {
-                    "page": int(page.get("page") or 0),
-                    "layoutObstacles": page.get("layoutObstacles") or {"textRects": [], "processSegments": []},
-                }
-                for page in result.get("pages") or []
-            ]})
-            return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/pages/(\d+)\.png", path)
         if match:
             folder = _job_folder(match.group(1))
@@ -1154,13 +1196,13 @@ class ApiHandler(SimpleHTTPRequestHandler):
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/pages/(\d+)", path)
         if match:
-            result_path = _job_folder(match.group(1)) / "result.json"
+            job_id = match.group(1)
+            result_path = _job_folder(job_id) / "result.json"
             if not result_path.is_file():
                 self._json(HTTPStatus.NOT_FOUND, {"error": "任务不存在"})
                 return
             page_number = int(match.group(2))
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            page = next((item for item in result.get("pages", []) if int(item.get("page") or 0) == page_number), None)
+            page = _job_store().get_job_page(job_id, page_number)
             if page is None:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "页面结果不存在"})
                 return
@@ -1226,18 +1268,6 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     with (AUDIT_ROOT / "events.jsonl").open("a", encoding="utf-8") as target:
                         target.write(json.dumps(event, ensure_ascii=False) + "\n")
                 self._json(HTTPStatus.OK, {"logged": True})
-                return
-            if parsed.path == "/api/ai/chat":
-                payload = self._read_json(MAX_JOB_REQUEST_BYTES)
-                try:
-                    content = ai_assistant.chat_completion(payload.get("messages"), context=payload.get("context"))
-                except ai_assistant.AssistantInputError as exc:
-                    raise ApiError(str(exc), HTTPStatus.BAD_REQUEST) from exc
-                except ai_assistant.AssistantConfigurationError as exc:
-                    raise ApiError(str(exc), HTTPStatus.SERVICE_UNAVAILABLE) from exc
-                except ai_assistant.AssistantRequestError as exc:
-                    raise ApiError(str(exc), HTTPStatus.BAD_GATEWAY) from exc
-                self._json(HTTPStatus.OK, {"message": {"role": "assistant", "content": content}})
                 return
             if parsed.path == "/api/ai/chat/stream":
                 self._stream_ai_chat(self._read_json(MAX_JOB_REQUEST_BYTES))
@@ -1362,25 +1392,18 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 lock_token = str(payload.get("lockToken") or "")
                 lock_store = _page_lock_store()
                 lock_store.assert_owner(job_id, page_number, str(user["userId"]), client_id, lock_token)
-                with LOCK:
-                    lock_store.assert_owner(job_id, page_number, str(user["userId"]), client_id, lock_token)
-                    result_path, current = _require_complete_job(_job_folder(job_id))
-                    incoming_page = payload.get("page")
-                    if not isinstance(incoming_page, dict):
-                        raise ApiError("缺少页面保存内容")
-                    validated = _validated_pages([incoming_page], current)[0]
-                    updated_page = merge_review_page(
-                        current, page_number, validated, int(payload.get("basePageRevision") or 0), user,
-                    )
-                    current.pop("labelLayout", None)
-                    _atomic_dump(result_path, current)
-                    _job_store().record_page_review(
-                        job_id,
-                        page_number,
-                        int(updated_page["reviewRevision"]),
-                        user,
-                        str(updated_page["reviewedAt"]),
-                    )
+                current = _load_job_result(job_id, include_pages=False)
+                if current.get("status") != "complete":
+                    raise ApiError("任务尚未完成，不能保存或导出", HTTPStatus.CONFLICT)
+                incoming_page = payload.get("page")
+                if not isinstance(incoming_page, dict):
+                    raise ApiError("缺少页面保存内容")
+                validated = _validated_pages([incoming_page], current)[0]
+                updated_page = _job_store().save_job_page(
+                    job_id, page_number, validated,
+                    int(payload.get("basePageRevision") or 0), user,
+                    client_instance_id=client_id, lock_token=lock_token,
+                )
                 self._json(HTTPStatus.OK, {
                     "saved": True,
                     "page": page_number,
@@ -1391,26 +1414,20 @@ class ApiHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._handle_exception(exc)
             return
-        match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})", path)
-        if not match:
-            self._json(HTTPStatus.NOT_FOUND, {"error": "接口不存在"})
-            return
-        try:
-            self._require_same_origin()
-            self._require_user()
-            raise ApiError("整图保存已停用，请逐页保存核对结果", HTTPStatus.CONFLICT)
-        except Exception as exc:
-            self._handle_exception(exc)
+        self._json(HTTPStatus.NOT_FOUND, {"error": "接口不存在"})
 
     def _create_job(self) -> None:
-        # Files use /api/uploads. Keeping job creation metadata small prevents
-        # legacy Base64 JSON requests from recreating the previous memory spike.
+        # Files use /api/uploads, keeping job creation metadata bounded.
         payload = self._read_json(MAX_JOB_REQUEST_BYTES)
         symbol_config = payload.get("symbolConfig") if isinstance(payload.get("symbolConfig"), dict) else {}
         detection_mode = str(symbol_config.get("detectionMode") or "placement").casefold()
         if detection_mode != "placement":
             raise ApiError("对照模式暂未开放，请使用落图模式", HTTPStatus.BAD_REQUEST)
         payload["symbolConfig"] = {**symbol_config, "detectionMode": "placement"}
+        try:
+            payload["symbolConfig"].update(normalize_reference_rules(symbol_config))
+        except (ValueError, TypeError) as exc:
+            raise ApiError(str(exc), HTTPStatus.BAD_REQUEST) from exc
         request_user = getattr(self, "_request_user", None)
         created_by = (
             {"userId": str(request_user["userId"]), "username": str(request_user["username"])}
@@ -1445,31 +1462,13 @@ class ApiHandler(SimpleHTTPRequestHandler):
         _console(f"[智能编号] 收到任务 {job_id}")
         registered = False
         try:
-            target = (
-                _consume_upload(payload.get("targetUpload"), folder, "target.pdf")
-                if payload.get("targetUpload")
-                else _decode_file(payload.get("targetPdf"), folder, "target.pdf")
-            )
+            target = _consume_upload(payload.get("targetUpload"), folder, "target.pdf")
             if target is None or target.suffix.lower() != ".pdf":
                 raise ValueError("必须上传待标识 PDF")
-            references = (
-                _consume_uploads(payload.get("referenceUploads"), folder, "reference")
-                if payload.get("referenceUploads") is not None
-                else _decode_files(payload.get("referencePdfs"), folder, "reference")
-            )
-            legacy_reference = _decode_file(payload.get("referencePdf"), folder, "reference-legacy.pdf")
-            if legacy_reference:
-                references.append(legacy_reference)
+            references = _consume_uploads(payload.get("referenceUploads"), folder, "reference")
             if any(reference.suffix.lower() != ".pdf" for reference in references):
                 raise ValueError("对照图必须全部是 PDF")
-            job_pcfs = (
-                _consume_uploads(payload.get("pcfUploads"), folder, "source", ".pcf")
-                if payload.get("pcfUploads") is not None
-                else _decode_files(payload.get("pcfFiles"), folder, "source", ".pcf")
-            )
-            legacy_pcf = _decode_file(payload.get("pcfFile"), folder, "source-legacy.pcf")
-            if legacy_pcf:
-                job_pcfs.append(legacy_pcf)
+            job_pcfs = _consume_uploads(payload.get("pcfUploads"), folder, "source", ".pcf")
             library_pcfs = _resolve_pcf_library_folder(payload.get("pcfFolder"))
             pcfs = [*job_pcfs, *library_pcfs]
             if any(pcf.suffix.lower() != ".pcf" for pcf in pcfs):
@@ -1481,8 +1480,6 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 resolved_end = min(target_document.page_count, requested_end or target_document.page_count)
                 total_pages = max(0, resolved_end - resolved_start + 1)
             target_payload = payload.get("targetUpload") if isinstance(payload.get("targetUpload"), dict) else {}
-            if not target_payload:
-                target_payload = payload.get("targetPdf") if isinstance(payload.get("targetPdf"), dict) else {}
             original_target_name = _safe_name(payload.get("originalTargetName") or target_payload.get("name"), target.name)
             _atomic_dump(folder / "job.json", {
                 "targetFile": target.name,
@@ -1535,6 +1532,13 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 algorithm_version=ANALYSIS_ALGORITHM_VERSION,
                 creator_user_id=str(request_user["userId"]) if request_user else None,
                 creator_username=str(request_user["username"]) if request_user else None,
+                batch_id=str(payload.get("batchId") or "").strip() or None,
+                batch_index=int(payload.get("batchIndex") or 0) if payload.get("batchId") else None,
+                queue_summary={
+                    **initial_result,
+                    "referenceFileCount": len(references),
+                    "createdAt": datetime.now().isoformat(timespec="seconds"),
+                },
             )
             registered = True
         except ActiveJobExists as exc:
@@ -1558,7 +1562,6 @@ class ApiHandler(SimpleHTTPRequestHandler):
         folder = _job_folder(job_id)
         result_path = folder / "result.json"
         store = _job_store()
-        store.import_existing(DATA_ROOT, ANALYSIS_ALGORITHM_VERSION)
         record = store.get(job_id)
         if not result_path.is_file() or not record:
             raise ApiError("任务不存在", HTTPStatus.NOT_FOUND)
@@ -1579,6 +1582,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
             else:
                 current.update({"status": "cancelled", "progressMessage": "解析任务已取消"})
             _atomic_dump(result_path, current)
+            store.update_queue_summary(job_id, current)
         self._json(HTTPStatus.OK, {"cancelled": True, "status": current["status"]})
 
     def _export_job(self, job_id: str) -> None:
@@ -1603,9 +1607,9 @@ class ApiHandler(SimpleHTTPRequestHandler):
         )
         for page in embedded_result.get("pages", []):
             page_number = int(page.get("page") or 0)
-            if page_number in grouped:
-                page["candidates"] = grouped[page_number]
-                page["candidateCount"] = len(grouped[page_number])
+            page_candidates = grouped.get(page_number, [])
+            page["candidates"] = page_candidates
+            page["candidateCount"] = len(page_candidates)
         weld_style: dict[str, Any] = {}
         component_styles: dict[str, dict[str, Any]] = {}
         for candidate in candidates:
@@ -1646,9 +1650,9 @@ class ApiHandler(SimpleHTTPRequestHandler):
         )
         for page in embedded_result.get("pages", []):
             page_number = int(page.get("page") or 0)
-            if page_number in grouped:
-                page["candidates"] = grouped[page_number]
-                page["candidateCount"] = len(grouped[page_number])
+            page_candidates = grouped.get(page_number, [])
+            page["candidates"] = page_candidates
+            page["candidateCount"] = len(page_candidates)
         weld_style: dict[str, Any] = {}
         component_styles: dict[str, dict[str, Any]] = {}
         for candidate in candidates:

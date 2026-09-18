@@ -1,7 +1,6 @@
 const DB_NAME = 'weld-marker-workspace'
 const DB_VERSION = 2
 const storedFileKeyCache = new WeakMap()
-const knownStoredFileKeys = new Set()
 
 function openDatabase() {
   return new Promise((resolve, reject) => {
@@ -110,7 +109,7 @@ export async function sha256Hex(bytes, cryptoProvider = globalThis.crypto) {
 
 async function storedFileReference(saved) {
   if (!saved) return null
-  if (saved.storedFileKey) return { ...saved, blob: undefined }
+  if (saved.storedFileKey) return { ...saved, blob: saved.blob instanceof Blob ? saved.blob : undefined }
   if (!saved.blob || !(saved.blob instanceof Blob)) return null
   const sliceSize = 64 * 1024
   const first = await saved.blob.slice(0, sliceSize).arrayBuffer()
@@ -130,7 +129,7 @@ async function storedFileReference(saved) {
     lastModified: Number(saved.lastModified) || Date.now(),
     relativePath: saved.relativePath || '',
     referenceIndex: Number.isInteger(saved.referenceIndex) ? saved.referenceIndex : null,
-    blob: knownStoredFileKeys.has(storedFileKey) ? undefined : saved.blob,
+    blob: saved.blob,
   }
 }
 
@@ -138,6 +137,8 @@ function lightPage(page) {
   if (!page) return page
   const item = { ...page, detailsLoaded: false }
   delete item.layoutObstacles
+  delete item.designComponents
+  item.candidates = []
   return item
 }
 
@@ -175,7 +176,7 @@ export async function prepareDraftV2(key, payload) {
   const serializedBasePayload = serializableClone(basePayload)
   const savedAt = new Date().toISOString()
   const candidateCount = sourceResults.reduce((total, result) => total + (result?.pages || [])
-    .reduce((pageTotal, page) => pageTotal + (page.candidates || []).length, 0), 0)
+    .reduce((pageTotal, page) => pageTotal + (Number(page.candidateCount) || (page.candidates || []).length), 0), 0)
   const expectedReferenceCount = Math.max(
     fileGroups.referenceFiles.length,
     Number(payload.result?.referenceFiles?.length) || 0,
@@ -221,16 +222,19 @@ export async function saveDraft(key, payload) {
     )
     tx.onerror = () => reject(tx.error)
     tx.onabort = () => reject(tx.error || new Error('草稿事务已中止'))
-    tx.oncomplete = () => {
-      Object.values(prepared.fileGroups).flat().forEach(file => knownStoredFileKeys.add(file.storedFileKey))
-      database.close()
-      resolve({ key, savedAt: prepared.metadata.savedAt })
-    }
+    tx.oncomplete = () => { database.close(); resolve({ key, savedAt: prepared.metadata.savedAt }) }
     tx.objectStore('workspaceManifests').put(prepared.manifest)
     tx.objectStore('draftMetadata').put(prepared.metadata)
     prepared.resultEntries.filter(Boolean).flatMap(entry => entry.pages).forEach(page => tx.objectStore('workspacePages').put(page))
-    Object.values(prepared.fileGroups).flat().forEach(file => {
-      if (file.blob) tx.objectStore('workspaceFiles').put({ key: file.storedFileKey, blob: file.blob, size: file.size })
+    const fileStore = tx.objectStore('workspaceFiles')
+    const uniqueFiles = new Map(Object.values(prepared.fileGroups).flat()
+      .filter(file => file.blob)
+      .map(file => [file.storedFileKey, file]))
+    uniqueFiles.forEach(file => {
+      const existing = fileStore.getKey(file.storedFileKey)
+      existing.onsuccess = () => {
+        if (existing.result === undefined) fileStore.put({ key: file.storedFileKey, blob: file.blob, size: file.size })
+      }
     })
   })
 }
@@ -275,17 +279,75 @@ export function loadDraftPage(workspaceKey, projectIndex, page) {
     .then(record => record?.value || null)
 }
 
+export async function saveDraftPage(workspaceKey, projectIndex, page) {
+  if (!workspaceKey || !page || !Number.isInteger(Number(page.page))) return false
+  const database = await openDatabase()
+  return new Promise((resolve, reject) => {
+    const tx = database.transaction('workspacePages', 'readwrite')
+    tx.onerror = () => reject(tx.error)
+    tx.onabort = () => reject(tx.error || new Error('草稿页面归档已中止'))
+    tx.oncomplete = () => { database.close(); resolve(true) }
+    tx.objectStore('workspacePages').put({
+      key: `${workspaceKey}:${Number(projectIndex) || 0}:${Number(page.page)}`,
+      workspaceKey,
+      projectIndex: Number(projectIndex) || 0,
+      page: Number(page.page),
+      value: serializableClone(page),
+    })
+  })
+}
+
 export function loadStoredFile(reference) {
   if (!reference?.storedFileKey) return Promise.resolve(null)
   return transaction('workspaceFiles', 'readonly', store => store.get(reference.storedFileKey))
     .then(record => {
       if (!record?.blob) return null
-      knownStoredFileKeys.add(reference.storedFileKey)
       return { ...reference, blob: record.blob }
     })
 }
 
+export function orphanStoredFileKeys(manifests, storedFileKeys) {
+  const referenced = new Set()
+  for (const manifest of manifests || []) {
+    for (const files of Object.values(manifest?.fileGroups || {})) {
+      if (!Array.isArray(files)) continue
+      for (const file of files) {
+        if (file?.storedFileKey) referenced.add(file.storedFileKey)
+      }
+    }
+  }
+  return (storedFileKeys || []).filter(key => !referenced.has(key))
+}
+
+export async function cleanupOrphanWorkspaceFiles() {
+  const database = await openDatabase()
+  return new Promise((resolve, reject) => {
+    const tx = database.transaction(['workspaceManifests', 'workspaceFiles'], 'readwrite')
+    const manifestRequest = tx.objectStore('workspaceManifests').getAll()
+    const fileKeyRequest = tx.objectStore('workspaceFiles').getAllKeys()
+    let manifests
+    let fileKeys
+    let removed = 0
+
+    function removeOrphansWhenReady() {
+      if (!manifests || !fileKeys) return
+      const fileStore = tx.objectStore('workspaceFiles')
+      for (const key of orphanStoredFileKeys(manifests, fileKeys)) {
+        fileStore.delete(key)
+        removed += 1
+      }
+    }
+
+    manifestRequest.onsuccess = () => { manifests = manifestRequest.result; removeOrphansWhenReady() }
+    fileKeyRequest.onsuccess = () => { fileKeys = fileKeyRequest.result; removeOrphansWhenReady() }
+    tx.onerror = () => reject(tx.error)
+    tx.onabort = () => reject(tx.error || new Error('草稿文件清理事务已中止'))
+    tx.oncomplete = () => { database.close(); resolve(removed) }
+  })
+}
+
 export async function listDrafts() {
+  await cleanupOrphanWorkspaceFiles()
   const metadata = await transaction('draftMetadata', 'readonly', store => store.getAll())
   const modern = metadata.map(item => ({
     key: item.key,
@@ -305,7 +367,7 @@ export async function listDrafts() {
 
 export async function deleteDraft(key) {
   const database = await openDatabase()
-  return new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     const tx = database.transaction(['draftMetadata', 'workspaceManifests', 'workspacePages'], 'readwrite')
     tx.onerror = () => reject(tx.error)
     tx.oncomplete = () => { database.close(); resolve() }
@@ -319,6 +381,7 @@ export async function deleteDraft(key) {
       value.continue()
     }
   })
+  return cleanupOrphanWorkspaceFiles()
 }
 
 export function loadSnapshot(key) {

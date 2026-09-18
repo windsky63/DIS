@@ -18,6 +18,7 @@ defineEmits([
   'openTutorial',
   'openSettings',
   'switchProject',
+  'openProjectRules',
   'logout',
 ])
 </script>
@@ -42,7 +43,7 @@ defineEmits([
       <v-menu location="bottom end">
           <template #activator="{ props }"><v-btn v-bind="props" data-tour="project-switch-button" class="header-icon-button project-switch-button" icon size="small" aria-label="切换项目"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h6l1.8 2h9.2v8.8a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7Z" /><path d="M7 4h10m0 0-2-2m2 2-2 2" /></svg><v-tooltip activator="parent" location="bottom">切换项目 · {{ activeProject.name }}</v-tooltip></v-btn></template>
         <v-card class="project-switch-card" min-width="320">
-          <div class="project-switch-card__header"><small>当前识别项目</small><strong>{{ activeProject.name }}</strong></div>
+          <div class="project-switch-card__header"><div class="project-switch-card__copy"><small>当前识别项目</small><strong>{{ activeProject.name }}</strong></div><button type="button" class="project-rules-icon" aria-label="查看项目识别规则" @click="$emit('openProjectRules')"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /><circle cx="9" cy="6" r="2" /><circle cx="15" cy="12" r="2" /><circle cx="9" cy="18" r="2" /></svg><v-tooltip activator="parent" location="bottom">查看项目识别规则</v-tooltip></button></div>
           <v-list density="compact"><v-list-item v-for="project in projects" :key="project.id" :title="project.name" :subtitle="project.description" :active="project.id === activeProject.id" color="secondary" @click="$emit('switchProject', project.id)"><template #append><v-chip v-if="project.id === activeProject.id" size="x-small" color="secondary" variant="tonal">当前</v-chip></template></v-list-item></v-list>
         </v-card>
       </v-menu>
@@ -100,7 +101,10 @@ defineEmits([
               <div><span>创建时间</span><strong>{{ user.createdAt || '—' }}</strong></div>
             </div>
             <v-divider />
-            <v-card-actions class="user-menu-actions"><v-btn block color="error" variant="tonal" @click="$emit('logout')">退出登录</v-btn></v-card-actions>
+            <v-card-actions class="user-menu-actions">
+              <v-btn v-if="user.isAdmin" block to="/admin" color="primary" variant="tonal">后台管理</v-btn>
+              <v-btn block color="error" variant="tonal" @click="$emit('logout')">退出登录</v-btn>
+            </v-card-actions>
           </v-card>
         </v-menu>
       </div>

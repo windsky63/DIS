@@ -24,7 +24,7 @@ backend/
 │     ├─ uploads.py          # 上传暂存、校验和消费
 │     └─ queue.py            # 队列查询与排序命令
 ├─ auth_store.py             # 账号与会话
-├─ job_store.py              # SQLite 队列持久化
+├─ job_store.py              # SQLite 队列及逐页结果持久化
 ├─ page_lock_store.py        # 页面独占锁
 ├─ page_reviews.py           # 页面 revision 合并
 ├─ job_runner.py             # 单任务执行服务
@@ -35,6 +35,8 @@ backend/
 ## 前端模块边界
 
 前端遵循“页面负责组合、组件负责展示、composable 负责状态、service 负责 I/O、纯模块负责算法”的边界。
+
+Vuetify 组件由 `vite-plugin-vuetify` 在 Vite 构建时按模板用量自动导入；`main.js` 只保留主题、默认值和需要显式启用的指令。新增 `v-*` 组件无需再维护全局组件清单，但必须执行生产构建，确保插件能解析该组件并保持按需打包。
 
 - `components/AppHeader.vue`：服务状态、快捷键和系统入口。
 - `components/AnalysisProgressPanel.vue`、`AnalysisQueueDialog.vue`：解析进度与任务队列。
@@ -67,9 +69,9 @@ backend/
 针对性测试：
 
 ```powershell
-python -m unittest backend.tests.test_document_knowledge backend.tests.test_assistant_tools backend.tests.test_assistant_agent backend.tests.test_assistant_documentation -v
+python -m unittest backend.tests.test_ai_assistant backend.tests.test_assistant_tools backend.tests.test_assistant_agent -v
 cd frontend
-node --test tests/api.test.js tests/assistantConversations.test.js tests/assistantPanel.test.js
+node --test tests/api.test.js tests/assistantMarkdown.test.js
 ```
 
 完整技术说明和 SSE 示例见 [AI 助手与本地文档检索](ai-assistant.md)。
@@ -93,6 +95,8 @@ npm test
 
 前端测试使用 Node.js 内置测试运行器，包含纯模块测试、composable 测试和 Vue SSR 组件测试。
 
+测试集只保留高风险公共契约：识别与布局算法、认证和 API 边界、任务队列与页面锁、协同保存与恢复、文件上传和浏览器草稿。不要为静态文案、CSS 选择器、按钮位置、简单常量或仅供测试调用的内部实现新增测试；这类行为应由生产构建和人工验收覆盖。修复线上缺陷时，优先在最接近现有公共边界的套件中增加一个回归用例，避免为单个分支新建测试文件。
+
 ## 生产构建
 
 ```powershell
@@ -109,3 +113,5 @@ npm run build
 3. 检查 `/api/health` 的版本、构建编号和 Worker 状态。
 4. 使用代表性矢量 PDF 验证任务提交、恢复、页面保存和导出。
 5. 确认发布归档不包含 `data/jobs`、`data/audit`、浏览器草稿或本地备份。
+6. 执行 `.\scripts\build-deployment-package.ps1` 生成不含密钥的常规归档；只有经明确授权的受信任交付才增加 `-IncludeSecrets`。
+7. 使用生成的 `.sha256` 校验归档，并检查 ZIP 不包含 `.git`、`node_modules`、`frontend/dist`、测试目录、运行数据或旧发布包。

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from itertools import combinations
 import math
 from pathlib import Path
 import re
@@ -14,8 +13,10 @@ import fitz
 try:
     from .ep3d_components import extract_ep3d_component_callouts
     from .design_components import extract_design_component_symbols
+    from .reference_rules import normalize_reference_rules, reference_rule_for_slot, extract_contractor_callouts
     from .iso_weld_matcher.dual_pdf_topology import (
         PdfWeldCallout,
+        Ep3dCalloutProfile,
         extract_isometric_drawing_number,
         extract_design_weld_callouts,
         extract_ep3d_weld_callouts,
@@ -28,8 +29,10 @@ try:
 except ImportError:  # Direct ``python backend/server.py`` execution.
     from ep3d_components import extract_ep3d_component_callouts
     from design_components import extract_design_component_symbols
+    from reference_rules import normalize_reference_rules, reference_rule_for_slot, extract_contractor_callouts
     from iso_weld_matcher.dual_pdf_topology import (
         PdfWeldCallout,
+        Ep3dCalloutProfile,
         extract_isometric_drawing_number,
         extract_design_weld_callouts,
         extract_ep3d_weld_callouts,
@@ -85,6 +88,7 @@ def _effective_symbol_config(value: dict[str, Any] | None) -> dict[str, Any]:
     }
     mode = str(result.get("detectionMode") or "placement").casefold()
     result["detectionMode"] = mode if mode in {"placement", "comparison"} else "placement"
+    result.update(normalize_reference_rules(result))
     return result
 
 
@@ -145,6 +149,7 @@ def _display_bbox(page: fitz.Page, value: fitz.Rect) -> tuple[float, float, floa
 def _layout_obstacles(page: fitz.Page, features: dict[str, Any]) -> dict[str, Any]:
     """Expose compact research geometry for collision-aware label layout."""
     text_rects = []
+    ignored_watermarks = []
     for word in page.get_text("words"):
         if len(word) < 5 or not str(word[4]).strip():
             continue
@@ -152,7 +157,14 @@ def _layout_obstacles(page: fitz.Page, features: dict[str, Any]) -> dict[str, An
             page,
             fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3])),
         )
-        text_rects.append([round(value, 3) for value in box])
+        width, height = box[2] - box[0], box[3] - box[1]
+        target = [round(value, 3) for value in box]
+        # Rotated approval watermarks expose enormous axis-aligned text boxes.
+        # They remain visible but are not hard body-text obstacles.
+        if max(width, height) >= 100 and width * height >= 6000:
+            ignored_watermarks.append(target)
+        else:
+            text_rects.append(target)
 
     process_segments = []
     for segment in features.get("strong_process_segments", []):
@@ -166,7 +178,59 @@ def _layout_obstacles(page: fitz.Page, features: dict[str, Any]) -> dict[str, An
             "end": [round(float(end[0]), 3), round(float(end[1]), 3)],
             "width": round(float(segment.get("stroke_width") or 1.0), 3),
         })
-    return {"textRects": text_rects, "processSegments": process_segments}
+    width, height = float(page.rect.width), float(page.rect.height)
+    horizontal, vertical = [], []
+    raw_graphic_segments = []
+    for drawing in page.get_drawings():
+        for item in drawing.get("items", []):
+            if not item:
+                continue
+            pairs = []
+            if item[0] == "l":
+                pairs = [(item[1], item[2])]
+            elif item[0] == "re":
+                rectangle = item[1]
+                corners = (
+                    fitz.Point(rectangle.x0, rectangle.y0), fitz.Point(rectangle.x1, rectangle.y0),
+                    fitz.Point(rectangle.x1, rectangle.y1), fitz.Point(rectangle.x0, rectangle.y1),
+                )
+                pairs = [(corners[index], corners[(index + 1) % 4]) for index in range(4)]
+            for native_start, native_end in pairs:
+                start, end = _display_point(page, native_start), _display_point(page, native_end)
+                length = math.hypot(end[0] - start[0], end[1] - start[1])
+                if length < 2:
+                    continue
+                raw_graphic_segments.append((start, end))
+                if abs(start[1] - end[1]) <= 1:
+                    horizontal.append((min(start[0], end[0]), max(start[0], end[0]), (start[1] + end[1]) / 2))
+                if abs(start[0] - end[0]) <= 1:
+                    vertical.append((min(start[1], end[1]), max(start[1], end[1]), (start[0] + end[0]) / 2))
+    left, top, right, bottom = .035 * width, .035 * height, .965 * width, .955 * height
+    dividers_x = [x for y0, y1, x in vertical if y1-y0 >= .72*height and left+.45*(right-left) < x < right-.12*(right-left)]
+    dividers_y = [y for x0, x1, y in horizontal if x1-x0 >= .62*width and top+.55*(bottom-top) < y < bottom-.06*(bottom-top)]
+    if dividers_x:
+        right = min(dividers_x)
+    if dividers_y:
+        bottom = min(dividers_y)
+    region = {"left": round(left+7, 3), "top": round(top+7, 3), "right": round(right-7, 3),
+              "bottom": round(bottom-7, 3), "source": "drawing-frame-and-title-divider"}
+    seen_graphics = set()
+    graphic_segments = []
+    for start, end in raw_graphic_segments:
+        if max(start[0], end[0]) < region["left"] or min(start[0], end[0]) > region["right"]:
+            continue
+        if max(start[1], end[1]) < region["top"] or min(start[1], end[1]) > region["bottom"]:
+            continue
+        first = (round(start[0], 2), round(start[1], 2))
+        second = (round(end[0], 2), round(end[1], 2))
+        key = tuple(sorted((first, second)))
+        if key in seen_graphics:
+            continue
+        seen_graphics.add(key)
+        graphic_segments.append({"start": list(first), "end": list(second)})
+    return {"textRects": text_rects, "ignoredWatermarkTextRects": ignored_watermarks,
+            "processSegments": process_segments, "graphicSegments": graphic_segments,
+            "mainGraphicRegion": region}
 
 
 def _dark_color(value: Any, threshold: float) -> bool:
@@ -1131,22 +1195,36 @@ def _as_callouts(candidates: list[dict[str, Any]]) -> list[PdfWeldCallout]:
 def _reference_pages(
     path: Path,
     progress_callback: Callable[[int, int], None] | None = None,
+    rule: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    rule = rule or {"id": "ep3d", "name": "EP3D 出图", "kind": "ep3d", "options": {}}
     result = []
     with fitz.open(path) as document:
         for index, page in enumerate(document):
             if progress_callback:
                 progress_callback(index + 1, document.page_count)
             title_identity = extract_isometric_drawing_number(page)
-            callouts = extract_ep3d_weld_callouts(page)
-            component_callouts = extract_ep3d_component_callouts(page)
+            if rule["kind"] == "contractor":
+                callouts = extract_contractor_callouts(page, rule["options"])
+                component_callouts = []
+            else:
+                options = rule["options"]
+                callouts = extract_ep3d_weld_callouts(page, profile=Ep3dCalloutProfile(
+                    label_pattern=options.get("labelPattern", r"(?:F|FS|T)\d+"),
+                    root_strategy=options.get("rootStrategy", "solid-dot-required"),
+                ))
+                component_callouts = extract_ep3d_component_callouts(page)
             # Page identity and object extraction are separate concerns.  A
             # continuation/blank sheet can still be the authoritative page for
             # an ISO even when it contains no recognized callouts.
-            if not callouts and not component_callouts and not title_identity:
+            if not callouts and not component_callouts and not title_identity and rule['kind'] != 'contractor':
                 continue
             result.append({
                 "file": _reference_display_name(path),
+                "referenceRule": rule,
+                "extractionWarnings": [] if callouts or rule['kind'] != 'contractor' else [
+                    '施工出图未识别到红色圆框编号及引线，请检查来源规则、编号表达式及间隙参数。扫描图片或转曲编号需要 OCR，当前适配器读取 PDF 矢量及原生文字。'
+                ],
                 "page": index + 1,
                 "isometric_drawing_no": _normalize_isometric_identity(
                     title_identity or _reference_filename_identity(path)
@@ -1231,6 +1309,7 @@ def _ep3d_reference_inventory(references: list[dict[str, Any]]) -> dict[str, Any
                 "support": sum(item["type"] == "support" for item in components),
             },
             "items": welds + components,
+            "referenceRule": _json_safe(reference.get("referenceRule")),
         })
     return {
         "schema": "drawing-topology.ep3d-reference-hints.v1",
@@ -1301,233 +1380,166 @@ def _design_component_inventory(pages: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _linear_chain_order(
-    points: list[tuple[float, float]],
-    anchor: tuple[float, float],
-) -> tuple[list[int], float] | None:
-    """Order a nearly straight component chain away from a weld anchor."""
+def _component_reference_callout(callout: Any, component_type: str = "weld") -> PdfWeldCallout:
+    """Adapt recognized roots to the shared pipeline without using numbers as identity."""
 
-    if len(points) < 2:
-        return None
-    endpoint_pair = max(
-        combinations(range(len(points)), 2),
-        key=lambda pair: math.dist(points[pair[0]], points[pair[1]]),
+    point = tuple(float(value) for value in (
+        callout.weld_point if component_type == "weld" else callout.component_point
+    ))
+    return PdfWeldCallout(
+        label=str(callout.label),
+        label_bbox=tuple(getattr(callout, "label_bbox", (*point, *point))),
+        label_center=tuple(getattr(callout, "label_center", point)),
+        weld_point=point,
+        leader_start=tuple(getattr(callout, "leader_start", point)),
+        leader_end=tuple(getattr(callout, "leader_end", point)),
+        extraction_method=str(getattr(callout, "extraction_method", "recognized-component-root")),
+        extraction_confidence=float(getattr(callout, "extraction_confidence", 0.0)),
+        node_type=component_type,
     )
-    start, end = points[endpoint_pair[0]], points[endpoint_pair[1]]
-    span = math.dist(start, end)
-    if span <= 1e-6:
-        return None
-    axis = ((end[0] - start[0]) / span, (end[1] - start[1]) / span)
-    projections = [
-        (point[0] - start[0]) * axis[0] + (point[1] - start[1]) * axis[1]
-        for point in points
+
+
+def _component_topology_attempts(
+    components: list[dict[str, Any]],
+    weld_candidates: list[dict[str, Any]],
+    references: list[dict[str, Any]],
+    *,
+    design_page: fitz.Page | None = None,
+    design_skeleton: dict[str, Any] | None = None,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Run the complete weld topology matcher on a typed weld/component graph.
+
+    Welds provide graph context, not preassigned identities or distance anchors.
+    Physical component candidates are never synthesized from reference counts.
+    """
+
+    design_nodes = _as_callouts(weld_candidates) + [
+        PdfWeldCallout(
+            label=f"CMP{index + 1}",
+            label_bbox=tuple(item.get("bbox") or (item["x"], item["y"], item["x"], item["y"])),
+            label_center=(float(item["x"]), float(item["y"])),
+            weld_point=(float(item["x"]), float(item["y"])),
+            leader_start=(float(item["x"]), float(item["y"])),
+            leader_end=(float(item["x"]), float(item["y"])),
+            extraction_method="pdf-vector-design-component",
+            extraction_confidence=float(item.get("confidence") or 0.0),
+            node_type=str(item["componentType"]),
+        )
+        for index, item in enumerate(components)
     ]
-    residuals = [
-        abs(-(point[0] - start[0]) * axis[1] + (point[1] - start[1]) * axis[0])
-        for point in points
-    ]
-    # Branching support groups must stay with the general topology matcher.
-    if max(residuals, default=0.0) > max(4.0, span * 0.12):
-        return None
-    low, high = min(projections), max(projections)
-    anchor_projection = (
-        (anchor[0] - start[0]) * axis[0] + (anchor[1] - start[1]) * axis[1]
-    )
-    if low < anchor_projection < high:
-        inside_endpoint_distance = min(anchor_projection - low, high - anchor_projection)
-        if inside_endpoint_distance > span * 0.25:
-            return None
-    from_low_end = abs(anchor_projection - low) <= abs(anchor_projection - high)
-    order = sorted(
-        range(len(points)),
-        key=lambda index: projections[index],
-        reverse=not from_low_end,
-    )
-    endpoint_score = min(
-        math.dist(anchor, points[order[0]]),
-        math.dist(anchor, points[order[-1]]),
-    ) / span
-    return order, endpoint_score
-
-
-def _weld_anchored_support_chain_pairs(
-    design_group: list[dict[str, Any]],
-    ep3d_group: list[Any],
-    design_welds: dict[str, tuple[float, float]],
-    reference_welds: dict[str, tuple[float, float]],
-    common_labels: list[str],
-) -> tuple[list[tuple[int, int, float]], str] | None:
-    """Match a straight support run monotonically from the same weld end."""
-
-    if len(design_group) != len(ep3d_group) or len(design_group) < 2 or not common_labels:
-        return None
-    design_points = [(float(item["x"]), float(item["y"])) for item in design_group]
-    reference_points = [tuple(float(value) for value in item.component_point) for item in ep3d_group]
-    anchors = []
-    for label in common_labels:
-        design_order = _linear_chain_order(design_points, design_welds[label])
-        reference_order = _linear_chain_order(reference_points, reference_welds[label])
-        if design_order is None or reference_order is None:
+    skeleton = design_skeleton
+    if skeleton is None and design_page is not None:
+        skeleton = extract_process_skeleton(design_page)
+    landmarks = extract_stable_landmarks(design_page) if design_page is not None else []
+    attempts = []
+    for reference in references:
+        reference_nodes = [
+            _component_reference_callout(callout)
+            for callout in reference.get("callouts") or []
+        ] + [
+            _component_reference_callout(callout, callout.component_type)
+            for callout in reference.get("component_callouts") or []
+        ]
+        if not reference_nodes or not reference.get("component_callouts"):
             continue
-        anchors.append((max(design_order[1], reference_order[1]), label, design_order[0], reference_order[0]))
-    if not anchors:
-        return None
-    _, anchor_label, design_order, reference_order = min(anchors, key=lambda item: (item[0], item[1]))
-    pairs = [
-        (design_index, reference_index, 0.0)
-        for design_index, reference_index in zip(design_order, reference_order)
-    ]
-    return pairs, anchor_label
+        try:
+            result = match_weld_callout_topology(
+                design_nodes,
+                reference_nodes,
+                design_skeleton=skeleton,
+                ep3d_skeleton=reference.get("skeleton"),
+                design_landmarks=landmarks,
+                ep3d_landmarks=reference.get("landmarks") or [],
+                design_page=design_page,
+            )
+        except Exception as exc:
+            # Match failures leave candidates unmatched and visible for review.
+            result = {"status": "match-error", "matches": [], "error": str(exc)}
+        attempts.append((reference, result))
+    return attempts
 
 
 def _match_design_components_to_reference(
     components: list[dict[str, Any]],
     weld_candidates: list[dict[str, Any]],
     reference: dict[str, Any] | None,
+    *,
+    design_page: fitz.Page | None = None,
+    design_skeleton: dict[str, Any] | None = None,
 ) -> int:
-    """Assign EP3D identities from weld-relative topology, never page order."""
-
-    if not components or not reference:
-        return 0
-    ep3d_components = list(reference.get("component_callouts") or [])
-    reference_welds = {
-        str(callout.label): tuple(float(value) for value in callout.weld_point)
-        for callout in reference.get("callouts") or []
-    }
-    design_welds = {
-        str(item.get("referenceLabel")): (float(item["x"]), float(item["y"]))
-        for item in weld_candidates
-        if item.get("referenceMatched")
-        and (
-            not item.get("referenceFile")
-            or (
-                str(item.get("referenceFile") or "") == str(reference.get("file") or "")
-                and int(item.get("referencePage") or 0) == int(reference.get("page") or 0)
-            )
-        )
-        and str(item.get("referenceLabel") or "") in reference_welds
-    }
-    common_labels = sorted(design_welds)
-    scale_samples = []
-    for left_index, left_label in enumerate(common_labels):
-        for right_label in common_labels[left_index + 1:]:
-            design_distance = math.dist(design_welds[left_label], design_welds[right_label])
-            if design_distance > 1e-6:
-                scale_samples.append(
-                    math.dist(reference_welds[left_label], reference_welds[right_label]) / design_distance
-                )
-    scale = sorted(scale_samples)[len(scale_samples) // 2] if scale_samples else 1.0
-    reference_diagonal = math.hypot(
-        max((point[0] for point in reference_welds.values()), default=1.0)
-        - min((point[0] for point in reference_welds.values()), default=0.0),
-        max((point[1] for point in reference_welds.values()), default=1.0)
-        - min((point[1] for point in reference_welds.values()), default=0.0),
-    ) or 1.0
-
-    matched_count = 0
-    for component_type in ("valve", "flange", "support"):
-        design_group = [
-            item for item in components
-            if item.get("componentType") == component_type and not item.get("referenceMatched")
-        ]
-        ep3d_group = [item for item in ep3d_components if item.component_type == component_type]
-        if not design_group or not ep3d_group:
-            continue
-        used_design: set[int] = set()
-        used_ep3d: set[int] = set()
-        if component_type == "support":
-            chain_match = _weld_anchored_support_chain_pairs(
-                design_group,
-                ep3d_group,
-                design_welds,
-                reference_welds,
-                common_labels,
-            )
-            if chain_match is not None:
-                chain_pairs, anchor_label = chain_match
-                for design_index, ep3d_index, cost in chain_pairs:
-                    design = design_group[design_index]
-                    callout = ep3d_group[ep3d_index]
-                    design.update({
-                        "referenceLabel": callout.label,
-                        "referenceMatched": True,
-                        "referenceFile": reference.get("file"),
-                        "referencePage": reference.get("page"),
-                        "matchConfidence": "high",
-                        "componentMatchMethod": "weld-anchored-support-chain-one-to-one",
-                        "componentMatchAnchor": anchor_label,
-                        "componentMatchCost": round(cost, 4),
-                    })
-                    used_design.add(design_index)
-                    used_ep3d.add(ep3d_index)
-                    matched_count += 1
-        ranked_pairs = []
-        for design_index, design in enumerate(design_group):
-            design_point = float(design["x"]), float(design["y"])
-            for ep3d_index, callout in enumerate(ep3d_group):
-                reference_point = tuple(float(value) for value in callout.component_point)
-                if common_labels:
-                    residuals = [
-                        abs(
-                            math.dist(reference_point, reference_welds[label])
-                            - scale * math.dist(design_point, design_welds[label])
-                        ) / reference_diagonal
-                        for label in common_labels
-                    ]
-                    distance_cost = sum(residuals) / len(residuals)
-                    design_order = sorted(common_labels, key=lambda label: math.dist(design_point, design_welds[label]))
-                    reference_order = sorted(common_labels, key=lambda label: math.dist(reference_point, reference_welds[label]))
-                    rank_cost = sum(
-                        abs(design_order.index(label) - reference_order.index(label))
-                        for label in common_labels
-                    ) / max(1, len(common_labels) ** 2)
-                    cost = distance_cost + rank_cost * 0.35
-                else:
-                    cost = 0.0 if len(design_group) == len(ep3d_group) == 1 else float("inf")
-                ranked_pairs.append((cost, design_index, ep3d_index))
-        for cost, design_index, ep3d_index in sorted(ranked_pairs):
-            if not math.isfinite(cost) or cost > 0.55:
-                continue
-            if design_index in used_design or ep3d_index in used_ep3d:
-                continue
-            design = design_group[design_index]
-            callout = ep3d_group[ep3d_index]
-            design.update({
-                "referenceLabel": callout.label,
-                "referenceMatched": True,
-                "referenceFile": reference.get("file"),
-                "referencePage": reference.get("page"),
-                "matchConfidence": "high" if cost <= 0.18 else "medium",
-                "componentMatchMethod": "weld-relative-topology-one-to-one",
-                "componentMatchCost": round(cost, 4),
-            })
-            used_design.add(design_index)
-            used_ep3d.add(ep3d_index)
-            matched_count += 1
-    return matched_count
+    return _match_design_components_to_references(
+        components, weld_candidates, [reference] if reference else [],
+        design_page=design_page, design_skeleton=design_skeleton,
+    )
 
 
 def _match_design_components_to_references(
     components: list[dict[str, Any]],
     weld_candidates: list[dict[str, Any]],
     references: list[dict[str, Any]],
+    *,
+    design_page: fitz.Page | None = None,
+    design_skeleton: dict[str, Any] | None = None,
 ) -> int:
-    """Map components only within the authoritative 1:N ISO page set."""
+    """Resolve shared-pipeline results across the authoritative ISO page set."""
 
-    ranked = sorted(
-        references,
-        key=lambda reference: sum(
-            bool(candidate.get("referenceMatched"))
-            and str(candidate.get("referenceFile") or "") == str(reference.get("file") or "")
-            and int(candidate.get("referencePage") or 0) == int(reference.get("page") or 0)
-            for candidate in weld_candidates
-        ),
-        reverse=True,
+    if not components or not references:
+        return 0
+    attempts = _component_topology_attempts(
+        components, weld_candidates, references,
+        design_page=design_page, design_skeleton=design_skeleton,
     )
-    return sum(
-        _match_design_components_to_reference(components, weld_candidates, reference)
-        for reference in ranked
-    )
+    confidence_rank = {"high": 3, "medium": 2}
+    offset = len(weld_candidates)
+    proposals = []
+    for reference, result in attempts:
+        reference_weld_count = len(reference.get("callouts") or [])
+        reference_components = list(reference.get("component_callouts") or [])
+        for match in result.get("matches") or []:
+            design_index = int(match.get("design_index", -1)) - offset
+            reference_index = int(match.get("ep3d_index", -1)) - reference_weld_count
+            if not (0 <= design_index < len(components) and 0 <= reference_index < len(reference_components)):
+                continue
+            design = components[design_index]
+            callout = reference_components[reference_index]
+            if design.get("componentType") != callout.component_type or design.get("referenceMatched"):
+                continue
+            confidence = str(match.get("confidence") or "")
+            if confidence not in confidence_rank or int((match.get("semantic_gate") or {}).get("hard_violation_count", 0)):
+                continue
+            rank = (
+                confidence_rank[confidence],
+                float(match.get("forced_uniqueness_margin") or 0.0),
+                -float(match.get("assignment_cost") or 0.0),
+            )
+            proposals.append((rank, design_index, reference, callout, match))
+    used_design = set()
+    used_reference = set()
+    for _, design_index, reference, callout, match in sorted(proposals, key=lambda item: item[0], reverse=True):
+        identity = (reference.get("file"), reference.get("page"), callout.component_type, callout.label)
+        if design_index in used_design or identity in used_reference:
+            continue
+        components[design_index].update({
+            "referenceLabel": callout.label,
+            "referenceMatched": True,
+            "referenceFile": reference.get("file"),
+            "referencePage": reference.get("page"),
+            "matchConfidence": match["confidence"],
+            "componentMatchMethod": "shared-weld-pipeline-topology-one-to-one",
+            "componentMatchCost": match.get("assignment_cost"),
+            "componentMatchEvidence": _json_safe(match),
+        })
+        used_design.add(design_index)
+        used_reference.add(identity)
+    for component in components:
+        if not component.get("referenceMatched"):
+            component["componentMatchDiagnostics"] = [
+                {"file": reference.get("file"), "page": reference.get("page"),
+                 "status": result.get("status"), "error": result.get("error"),
+                 "summary": _json_safe(result.get("summary") or {})}
+                for reference, result in attempts
+            ]
+    return len(used_design)
 
 
 def _page_reference_pairing(
@@ -1573,6 +1585,7 @@ def _page_reference_pairing(
                 "page": int(reference.get("page") or 0),
                 "isometricDrawingNo": reference.get("isometric_drawing_no"),
                 "identitySource": reference.get("identity_source"),
+                "referenceRule": _json_safe(reference.get("referenceRule")),
             }
             for reference in eligible
         ],
@@ -1683,7 +1696,7 @@ def _reference_constrained_candidates(
         (candidate for candidate in physical if id(candidate) not in selected_ids),
         key=lambda candidate: float(candidate.get("confidence") or 0.0),
         reverse=True,
-    )[:residual]
+    )[:residual if unfiltered_expected else len(physical)]
     selected.extend(physical_fallback)
 
     # A plain pipe boundary is not a weld signature.  In these drawings flow
@@ -1821,16 +1834,21 @@ def analyze_documents(
             progress_callback(message)
 
     reference_paths = list(reference_pdfs or [])
+    effective_config = _effective_symbol_config(symbol_config)
     if reference_pdf and reference_pdf not in reference_paths:
         reference_paths.append(reference_pdf)
     references = []
     for index, path in enumerate(reference_paths, start=1):
+        stored_slot = re.match(r"reference-(\d+)__", path.name)
+        slot = int(stored_slot.group(1)) - 1 if stored_slot else index - 1
+        rule = reference_rule_for_slot(effective_config, slot)
         progress(f"解析对照 PDF {index}/{len(reference_paths)}：{_reference_display_name(path)}")
         reference_pages = _reference_pages(
             path,
             lambda page, total, current=index: progress(
                 f"解析对照 PDF {current}/{len(reference_paths)}：页面 {page}/{total}"
             ),
+            rule=rule,
         )
         references.extend(reference_pages)
         component_count = sum(len(page.get("component_callouts") or []) for page in reference_pages)
@@ -1843,7 +1861,6 @@ def analyze_documents(
     pcf_paths = list(pcf_files or [])
     if pcf_file and pcf_file not in pcf_paths:
         pcf_paths.append(pcf_file)
-    effective_config = _effective_symbol_config(symbol_config)
     detection_mode = str(effective_config["detectionMode"])
     progress(
         f"PDF 图元研究配置：模式={'落图' if detection_mode == 'placement' else '对照'}，"
@@ -1906,6 +1923,7 @@ def analyze_documents(
             width, height = (float(value) for value in features["display_size"])
             page_pcf = None
             page_references: list[dict[str, Any]] = []
+            design_skeleton: dict[str, Any] | None = None
             pairing_audit: dict[str, Any] = {
                 "designIsometricDrawingNo": None,
                 "referencePairingStatus": "not-applicable",
@@ -2034,7 +2052,8 @@ def analyze_documents(
                 if detection_mode == "placement" else []
             )
             component_match_count = _match_design_components_to_references(
-                design_components, weld_candidates, page_references
+                design_components, weld_candidates, page_references,
+                design_page=page, design_skeleton=design_skeleton,
             )
             candidates = weld_candidates + design_components
             progress(
@@ -2056,7 +2075,9 @@ def analyze_documents(
                 "strongProcessSegmentCount": len(features.get("strong_process_segments") or []),
                 "anchorSourceStrategy": features.get("anchor_source_strategy"),
                 "pcfResearchFile": _reference_display_name(page_pcf["path"]) if page_pcf else None,
-                "warnings": _json_safe(features.get("warnings") or []),
+                "warnings": _json_safe(list(features.get("warnings") or []) + [
+                    warning for source in page_references for warning in source.get('extractionWarnings') or []
+                ]),
                 "layoutObstacles": _layout_obstacles(page, features),
                 "reference": reference,
                 "designComponents": design_components,

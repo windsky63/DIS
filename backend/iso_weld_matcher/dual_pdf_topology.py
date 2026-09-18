@@ -27,7 +27,8 @@ from .geometry_scale import estimate_vector_scale
 #   design F / FS / RP = red manual weld identifiers
 #   EP3D F / FS / T = framed construction weld identifiers
 #   SP = support, FL = flange-management identifier, V = valve identifier
-# Non-weld identifiers are intentionally excluded before topology matching.
+# Non-weld identifiers are excluded from weld extraction. Separate component
+# recognizers can supply typed roots to this same topology matching pipeline.
 WELD_LABEL = re.compile(r"(?:F|FS|RP)\d+", re.IGNORECASE)
 # The 301800 formal ISO uses red ``S`` callouts for shop welds while EP3D
 # renders the corresponding construction identifier as ``FS``.  Keep this
@@ -54,6 +55,8 @@ class PdfWeldCallout:
     leader_end: tuple[float, float]
     extraction_method: str
     extraction_confidence: float
+    # Object kind is physical evidence; the displayed number is not identity.
+    node_type: str = "weld"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1260,6 +1263,7 @@ def extract_local_port_signatures(
         signatures.append(
             {
                 "label": callout.label,
+                "node_type": callout.node_type,
                 "paper_coordinate": list(point),
                 "ray_count": ray_count,
                 "rays": rays,
@@ -1593,6 +1597,8 @@ def _semantic_pair_evidence(
     left_shape, right_shape = design_signature.get("shape_class"), ep3d_signature.get("shape_class")
     left_rays, right_rays = int(design_signature.get("ray_count", 0)), int(ep3d_signature.get("ray_count", 0))
     hard_reasons = []
+    if design_signature.get("node_type", "weld") != ep3d_signature.get("node_type", "weld"):
+        hard_reasons.append("physical-object-type-mismatch")
     left_confident = float(design_signature.get("signature_confidence", 0.0)) >= 0.70
     right_confident = float(ep3d_signature.get("signature_confidence", 0.0)) >= 0.70
     if left_confident and right_confident:
@@ -4098,6 +4104,17 @@ def match_weld_callout_topology(
 
     design = list(design_callouts)
     ep3d = list(ep3d_callouts)
+    # Keep explicit types even when a caller supplies precomputed signatures.
+    if design_port_signatures is not None:
+        if len(design_port_signatures) != len(design):
+            raise ValueError("design port signature count does not match callout count")
+        design_port_signatures = [dict(signature, node_type=callout.node_type)
+                                  for signature, callout in zip(design_port_signatures, design)]
+    if ep3d_port_signatures is not None:
+        if len(ep3d_port_signatures) != len(ep3d):
+            raise ValueError("reference port signature count does not match callout count")
+        ep3d_port_signatures = [dict(signature, node_type=callout.node_type)
+                                for signature, callout in zip(ep3d_port_signatures, ep3d)]
     low_cardinality = _match_low_cardinality_callouts(
         design, ep3d,
         design_skeleton=design_skeleton,
@@ -4506,6 +4523,16 @@ def match_weld_callout_topology(
         and right not in set(all_continuation_constraints.values())
     }
     component_constraints.update(all_continuation_constraints)
+    # Geometry-specific reservations cannot override physical object kinds.
+    component_constraints = {
+        left: right for left, right in component_constraints.items()
+        if design[left].node_type == ep3d[right].node_type
+    }
+    equivalent_component_constraints = {
+        left: {right for right in rights if design[left].node_type == ep3d[right].node_type}
+        for left, rights in equivalent_component_constraints.items()
+        if any(design[left].node_type == ep3d[right].node_type for right in rights)
+    }
 
     def apply_component_constraints() -> None:
         for design_index, ep3d_index in component_constraints.items():
@@ -4569,6 +4596,12 @@ def match_weld_callout_topology(
                 pair_evidence[(design_index, ep3d_index)][
                     "secondary_component_annotation"
                 ] = True
+
+        # Reapply the type gate after every cost rebuild/reservation pass.
+        for left in range(len(design)):
+            for right in range(len(ep3d)):
+                if design[left].node_type != ep3d[right].node_type:
+                    real_cost[left, right] = 100.0
 
     apply_component_constraints()
     preliminary_pairs, _ = _augmented_assignment(real_cost, gap_cost)
@@ -4643,6 +4676,8 @@ def match_weld_callout_topology(
 
     def apply_same_point_joint_constraints() -> None:
         for design_index, ep3d_index in same_point_joint_constraints.items():
+            if design[design_index].node_type != ep3d[ep3d_index].node_type:
+                continue
             for other_ep3d in range(len(ep3d)):
                 if other_ep3d != ep3d_index:
                     real_cost[design_index, other_ep3d] = 100.0
@@ -4813,6 +4848,7 @@ def match_weld_callout_topology(
         ) <= 0.32
         and all(
             component_constraints.get(left, right) == right
+            and design[left].node_type == ep3d[right].node_type
             and all_continuation_constraints.get(left, right) == right
             and same_point_joint_constraints.get(left, right) == right
             for left, right in dominant_chain_pairs
@@ -4872,6 +4908,8 @@ def match_weld_callout_topology(
         )
     if short_mst_constraints:
         for design_index, ep3d_index in short_mst_constraints.items():
+            if design[design_index].node_type != ep3d[ep3d_index].node_type:
+                continue
             for other_ep3d in range(len(ep3d)):
                 if other_ep3d != ep3d_index:
                     real_cost[design_index, other_ep3d] = 100.0
@@ -4927,6 +4965,7 @@ def match_weld_callout_topology(
         for left, right in late_same_point_constraints.items()
         if left not in same_point_joint_constraints
         and right not in same_point_joint_constraints.values()
+        and design[left].node_type == ep3d[right].node_type
     }
     if late_same_point_constraints:
         same_point_joint_constraints.update(late_same_point_constraints)
@@ -5057,6 +5096,8 @@ def match_weld_callout_topology(
         | set(continuation_secondary_pairs)
         | set(all_continuation_constraints.items())
     )
+    accepted = [(left, right) for left, right in accepted
+                if design[left].node_type == ep3d[right].node_type]
     matches = []
     for left, right in accepted:
         residual = float(np.linalg.norm(local_projected[left] - target[right]))

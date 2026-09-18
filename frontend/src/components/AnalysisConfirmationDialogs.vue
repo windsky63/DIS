@@ -1,24 +1,13 @@
 <script setup>
 defineProps({
-  pendingCandidate: { type: Object, default: null },
-  pendingCount: { type: Number, default: 0 },
   duplicateInfo: { type: Object, default: null },
 })
 
-const renumber = defineModel('renumber', { type: Boolean, required: true })
 const duplicate = defineModel('duplicate', { type: Boolean, required: true })
-defineEmits(['renumber-from-selected', 'cancel-renumber', 'resolve-duplicate'])
+defineEmits(['resolve-duplicate'])
 </script>
 
 <template>
-  <v-dialog v-model="renumber" max-width="500" @click:outside="$emit('cancel-renumber')">
-    <v-card>
-      <v-card-title>确认重新智能编号</v-card-title>
-      <v-card-text>将以第 {{ pendingCandidate?.page || '-' }} 页对象“{{ pendingCandidate?.number || '?' }}”为起点，循环重新编号当前页 {{ pendingCount }} 个同类有效对象。此操作会覆盖这些对象现有编号，但可以撤销。</v-card-text>
-      <v-card-actions><v-btn variant="text" @click="$emit('cancel-renumber')">取消</v-btn><v-spacer /><v-btn color="secondary" @click="$emit('renumber-from-selected')">确认重新编号</v-btn></v-card-actions>
-    </v-card>
-  </v-dialog>
-
   <v-dialog v-model="duplicate" persistent max-width="540">
     <v-card>
       <v-card-title>发现已完成的相同解析任务</v-card-title>

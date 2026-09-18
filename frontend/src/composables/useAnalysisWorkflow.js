@@ -1,9 +1,9 @@
-import { nextTick, ref } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 
 import { api } from '../api.js'
-import { resultHasMissingNumbers } from '../numbering.js'
 import { ANALYSIS_POLL_INTERVAL_MS } from '../polling.js'
 import { uploadJobInputs } from '../services/jobUpload.js'
+import { recognitionConfigForFiles, validateRecognitionRules } from '../projectProfiles.js'
 
 const initialProgress = () => ({
   fileIndex: 0,
@@ -20,8 +20,16 @@ const initialProgress = () => ({
   progressCompletedUnits: 0,
   progressTotalUnits: 1,
   progressPercent: 0,
+  progressStage: 'preparing',
+  layoutCompletedPages: 0,
+  layoutTotalPages: 0,
   message: '准备图元研究',
 })
+
+export function shouldInitializeAnalysisNumbers(createdJob) {
+  const preserveExistingResult = createdJob?.reusedExisting && createdJob?.status === 'complete'
+  return !preserveExistingResult
+}
 
 const wait = milliseconds => new Promise(resolve => window.setTimeout(resolve, milliseconds))
 
@@ -43,6 +51,7 @@ export function useAnalysisWorkflow({ workspace, operations }) {
     numberSuffix, result, referenceResearchReady, currentPage, selectedId, swapSourceId,
     undoStack, redoStack, uploadCommitPending, error,
   } = workspace
+  const referenceInputMissing = computed(() => referenceMode.value === 'pdf' && referencePdfs.value.length === 0)
 
   function confirmDuplicate(job, fileName) {
     duplicateInfo.value = { ...job, fileName }
@@ -119,8 +128,10 @@ export function useAnalysisWorkflow({ workspace, operations }) {
       project: {
         id: activeRecognitionProject.value.id,
         name: activeRecognitionProject.value.name,
+        description: activeRecognitionProject.value.description,
+        recognitionRules: recognitionConfigForFiles(weldSymbolConfig.value, referencePdfs.value),
       },
-      symbolConfig: { ...weldSymbolConfig.value, detectionMode: 'placement' },
+      symbolConfig: recognitionConfigForFiles(weldSymbolConfig.value, referencePdfs.value),
       numberingConfig: {
         useReferenceNumber: useReferenceNumber.value,
         startNumber: Math.max(1, Number(startNumber.value) || 1),
@@ -132,6 +143,7 @@ export function useAnalysisWorkflow({ workspace, operations }) {
   }
 
   async function materializeInputs() {
+    validateRecognitionRules(weldSymbolConfig.value)
     const referenceFiles = referenceMode.value === 'pdf'
       ? await Promise.all(referencePdfs.value.map(file => operations.materializeReferenceFile(file)))
       : []
@@ -146,6 +158,7 @@ export function useAnalysisWorkflow({ workspace, operations }) {
       if (!targetPdf.value) error.value = '请先选择待解析的 ISO PDF 或工程文件夹。'
       return
     }
+    if (referenceInputMissing.value) return
     enqueueing.value = true
     enqueueProgress.value = { percent: 0, message: '正在读取待上传文件' }
     operations.dismissError()
@@ -189,6 +202,7 @@ export function useAnalysisWorkflow({ workspace, operations }) {
       error.value = '请先选择待标识 ISO PDF 或工程文件夹。'
       return
     }
+    if (referenceInputMissing.value) return
     loading.value = true
     operations.dismissError()
     operations.clearNotice()
@@ -250,7 +264,7 @@ export function useAnalysisWorkflow({ workspace, operations }) {
         }
         const interactivePriority = await prioritize(createdJob, files[index].name)
         activeJobId.value = createdJob.jobId
-        const preserveExistingResult = createdJob.reusedExisting && createdJob.status === 'complete'
+        const initializeNumbers = shouldInitializeAnalysisNumbers(createdJob)
         progress.value = {
           ...progress.value,
           phase: 'analysis',
@@ -260,6 +274,9 @@ export function useAnalysisWorkflow({ workspace, operations }) {
           progressCompletedUnits: createdJob.progressCompletedUnits || 0,
           progressTotalUnits: createdJob.progressTotalUnits || Math.max(1, referenceFiles.length + (createdJob.totalPages || 1)),
           progressPercent: createdJob.progressPercent ?? 15,
+          progressStage: createdJob.progressStage || 'queued',
+          layoutCompletedPages: createdJob.layoutCompletedPages || 0,
+          layoutTotalPages: createdJob.layoutTotalPages || 0,
           message: interactivePriority?.queueState === 'queued' && Number(interactivePriority.previousQueuePosition) > 1
             ? `已从等待队列第 ${interactivePriority.previousQueuePosition} 位提升到首位，正在执行的任务不受影响`
             : interactivePriority?.queueState === 'queued'
@@ -271,8 +288,7 @@ export function useAnalysisWorkflow({ workspace, operations }) {
         let publishedPageCount = 0
         analyzed[index] = await waitForJob(createdJob, async snapshot => {
           operations.mergeStagedManualCandidates(snapshot, stagedManualPages[index])
-          const missingNumbers = resultHasMissingNumbers(snapshot)
-          if (!preserveExistingResult || missingNumbers) {
+          if (initializeNumbers) {
             operations.numberResult(snapshot, pageStartNumber)
           }
           analyzed[index] = snapshot
@@ -288,6 +304,9 @@ export function useAnalysisWorkflow({ workspace, operations }) {
             progressCompletedUnits: snapshot.progressCompletedUnits ?? nextPageCount,
             progressTotalUnits: snapshot.progressTotalUnits || Math.max(1, referenceFiles.length + (snapshot.totalPages || createdJob.totalPages || Math.max(1, nextPageCount))),
             progressPercent: snapshot.progressPercent ?? 15,
+            progressStage: snapshot.progressStage || 'design',
+            layoutCompletedPages: snapshot.layoutCompletedPages || 0,
+            layoutTotalPages: snapshot.layoutTotalPages || 0,
             message: snapshot.progressMessage || '正在进行图元研究',
           }
           if (activeProjectIndex.value === index) {
@@ -341,7 +360,7 @@ export function useAnalysisWorkflow({ workspace, operations }) {
   }
 
   return {
-    loading, enqueueing, enqueueProgress, progress, activeJobId, cancelling,
+    loading, enqueueing, enqueueProgress, progress, activeJobId, cancelling, referenceInputMissing,
     duplicateDialog, duplicateInfo, enqueue, analyze, cancel, resolveDuplicate, dispose,
   }
 }

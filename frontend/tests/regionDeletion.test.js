@@ -19,6 +19,7 @@ function fixture() {
     const swapSourceId = ref('weld')
     const readOnly = ref(false)
     const manualAddMode = ref(true)
+    const manualAddType = ref('all')
     const audits = []
     let saves = 0
     const history = useWorkspaceHistory({
@@ -30,7 +31,7 @@ function fixture() {
     const canvasLayout = ref({ width: 1200, height: 700, target: { x: 100, y: 100, width: 1000, height: 500 } })
     const canvasSurface = ref({ getBoundingClientRect: () => ({ left: 30, top: 40, width: 600, height: 350 }) })
     const region = useRegionDeletion({
-      pageData, canvasLayout, canvasSurface, readOnly, manualAddMode, selectedId, swapSourceId, editingId: ref(''),
+      pageData, canvasLayout, canvasSurface, readOnly, manualAddMode, manualAddType, selectedId, swapSourceId, editingId: ref(''),
       operations: { beginHistory: history.begin, commitHistory: history.commit, showNotice: () => {}, logAudit: (...args) => audits.push(args) },
     })
     const element = { setPointerCapture: () => {}, hasPointerCapture: () => false }
@@ -38,7 +39,7 @@ function fixture() {
       button: 0, pointerId, clientX: 30 + (100 + x * 1000) / 2, clientY: 40 + (100 + y * 500) / 2,
       currentTarget: element, preventDefault() {}, stopPropagation() {},
     })
-    return { region, result, pageData, readOnly, manualAddMode, selectedId, swapSourceId, history, audits, pointer, scope, get saves() { return saves } }
+    return { region, result, pageData, readOnly, manualAddMode, manualAddType, selectedId, swapSourceId, history, audits, pointer, scope, get saves() { return saves } }
   })
 }
 
@@ -46,7 +47,7 @@ test('region deletion uses anchor points across marker types and records one und
   const f = fixture()
   try {
     f.region.toggle()
-    assert.equal(f.manualAddMode.value, false)
+    assert.equal(f.manualAddMode.value, true)
     f.region.start(f.pointer(.1, .1))
     f.region.finish(f.pointer(.5, .5))
     assert.deepEqual(f.pageData.value.candidates.map(item => item.id), ['outside'])
@@ -72,6 +73,47 @@ test('reverse drags normalize the rectangle with transformed canvas offsets', ()
     assert.deepEqual(f.region.rectangleStyle.value, { left: '200px', top: '150px', width: '400px', height: '200px' })
     f.region.finish(f.pointer(.1, .1))
     assert.equal(f.pageData.value.candidates.length, 1)
+  } finally { f.scope.stop() }
+})
+
+for (const [type, removedId] of [['weld', 'weld'], ['valve', 'valve'], ['flange', 'flange'], ['support', 'support']]) {
+  test(`region deletion in ${type} mode only deletes that type`, () => {
+    const f = fixture()
+    try {
+      f.pageData.value.candidates.push(
+        { id: 'flange', componentType: 'flange', xNorm: .3, yNorm: .3 },
+        { id: 'support', componentType: 'support', xNorm: .3, yNorm: .3 },
+      )
+      f.manualAddType.value = type
+      f.region.toggle()
+      assert.equal(f.manualAddMode.value, true)
+      f.region.start(f.pointer(.1, .1)); f.region.finish(f.pointer(.5, .5))
+      assert.deepEqual(f.audits[0][1].ids, [removedId])
+      assert.ok(f.pageData.value.candidates.some(item => item.id === 'special'))
+      f.history.undo()
+      assert.ok(f.pageData.value.candidates.some(item => item.id === removedId))
+    } finally { f.scope.stop() }
+  })
+}
+
+test('default mode deletes all types regardless of last selected modification type', () => {
+  const f = fixture()
+  try {
+    f.manualAddMode.value = false
+    f.manualAddType.value = 'valve'
+    f.region.toggle()
+    f.region.start(f.pointer(.1, .1)); f.region.finish(f.pointer(.5, .5))
+    assert.deepEqual(f.pageData.value.candidates.map(item => item.id), ['outside'])
+  } finally { f.scope.stop() }
+})
+
+test('switching modification type during a drag cancels the pending rectangle', () => {
+  const f = fixture()
+  try {
+    f.region.toggle(); f.region.start(f.pointer(.1, .1))
+    f.manualAddType.value = 'valve'
+    f.region.finish(f.pointer(.5, .5))
+    assert.equal(f.pageData.value.candidates.length, 4)
   } finally { f.scope.stop() }
 })
 

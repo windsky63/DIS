@@ -1,21 +1,5 @@
 import { normalizeAssistantSource } from './assistantSources.js'
 
-const readAsBase64 = (file, onProgress) => new Promise((resolve, reject) => {
-  const reader = new FileReader()
-  reader.onerror = () => reject(new Error(`无法读取文件：${file.name}`))
-  reader.onprogress = event => onProgress?.(event.loaded, event.lengthComputable ? event.total : file.size)
-  reader.onload = () => {
-    onProgress?.(file.size, file.size)
-    resolve(String(reader.result).split(',')[1] || '')
-  }
-  reader.readAsDataURL(file)
-})
-
-export async function encodeFile(file, onProgress) {
-  if (!file) return null
-  return { name: file.name, dataBase64: await readAsBase64(file, onProgress) }
-}
-
 async function request(url, options = {}) {
   const response = await fetch(url, {
     ...options,
@@ -143,20 +127,6 @@ function requestWithUploadProgress(url, options, onProgress) {
   })
 }
 
-async function getJobReferenceFiles(jobId) {
-  const manifest = await request(jobId === 'tutorial-000207' ? '/api/tutorial/references' : `/api/jobs/${jobId}/references`)
-  return Promise.all((manifest.files || []).map(async item => {
-    const response = await fetch(item.url)
-    if (!response.ok) throw new Error(`无法恢复对照 PDF：${item.name || `文件 ${item.index + 1}`}`)
-    const blob = await response.blob()
-    const file = new File([blob], item.name || `reference-${item.index + 1}.pdf`, {
-      type: blob.type || 'application/pdf', lastModified: Date.now()
-    })
-    Object.defineProperty(file, 'weldMarkerReferenceIndex', { configurable: true, value: Number(item.index) })
-    return file
-  }))
-}
-
 async function getJobReferenceManifest(jobId) {
   const manifest = await request(jobId === 'tutorial-000207' ? '/api/tutorial/references' : `/api/jobs/${jobId}/references`)
   return (manifest.files || []).map(item => ({
@@ -197,18 +167,24 @@ export const api = {
   register: payload => request('/api/auth/register', { method: 'POST', body: JSON.stringify(payload) }),
   login: payload => request('/api/auth/login', { method: 'POST', body: JSON.stringify(payload) }),
   logout: () => request('/api/auth/logout', { method: 'POST', body: '{}' }),
+  getAdminOverview: () => request('/api/admin/overview'),
+  getAdminAiBalance: () => request('/api/admin/ai-balance'),
+  getAdminUsers: ({ search = '', page = 1, pageSize = 20 } = {}) => {
+    const query = new URLSearchParams({ search, page: String(page), pageSize: String(pageSize) })
+    return request(`/api/admin/users?${query}`)
+  },
   getAiStatus: () => request('/api/ai/status'),
   getAiConversations: () => request('/api/ai/conversations'),
   saveAiConversations: conversations => request('/api/ai/conversations', {
     method: 'PUT', body: JSON.stringify({ conversations })
   }),
-  chat: (messages, context = {}) => request('/api/ai/chat', {
-    method: 'POST', body: JSON.stringify({ messages, context })
-  }),
   chatStream: (messages, context = {}, onDelta, options = {}) => streamAssistantChat(messages, context, onDelta, options),
   getPcfFolders: () => request('/api/pcf-folders'),
   getRecentBatch: () => request('/api/jobs/recent-batch'),
-  getAnalysisQueue: () => request('/api/analysis-queue'),
+  getAnalysisQueue: ({ scope = 'current', page = 1, pageSize = 20 } = {}) => {
+    const query = new URLSearchParams({ scope, page: String(page), pageSize: String(pageSize) })
+    return request(`/api/analysis-queue?${query}`)
+  },
   moveQueuedJob: (jobId, direction) => request('/api/jobs/' + jobId + '/queue-position', { method: 'POST', body: JSON.stringify({ direction }) }),
   prioritizeQueuedJob: jobId => request('/api/jobs/' + jobId + '/queue-position', { method: 'POST', body: JSON.stringify({ direction: 'front' }) }),
   archiveJob: (jobId, archived = true) => request('/api/jobs/' + jobId + '/archive', { method: 'POST', body: JSON.stringify({ archived }) }),
@@ -216,7 +192,6 @@ export const api = {
   getJobTargetFile,
   getTutorialSession: () => request('/api/tutorial/session?view=workspace'),
   getTutorialFile,
-  getJobReferenceFiles,
   getJobReferenceManifest,
   getJobReferenceFile,
   uploadFile: (file, onUploadProgress) => requestWithUploadProgress('/api/uploads', {
@@ -233,11 +208,6 @@ export const api = {
   getJobWorkspace: (jobId, page = null) => request(`/api/jobs/${jobId}?view=workspace${page == null ? '' : `&page=${Math.max(1, Number(page) || 1)}`}`),
   cancelJob: jobId => request(`/api/jobs/${jobId}/cancel`, { method: 'POST', body: '{}' }),
   getJobPage: (jobId, page) => request(jobId === 'tutorial-000207' ? `/api/tutorial/pages/${page}` : `/api/jobs/${jobId}/pages/${page}`),
-  getJobPageDetails: jobId => request(`/api/jobs/${jobId}/page-details`),
-  saveJob: (jobId, pages, markerAppearances = {}, baseRevision = null) => request(`/api/jobs/${jobId}`, {
-    method: 'PUT',
-    body: JSON.stringify({ pages, ...markerAppearances, baseRevision })
-  }),
   getPageLocks: jobId => request(`/api/jobs/${jobId}/locks`),
   acquirePageLock: (jobId, page, clientInstanceId) => request(`/api/jobs/${jobId}/pages/${page}/lock`, {
     method: 'POST', body: JSON.stringify({ clientInstanceId })

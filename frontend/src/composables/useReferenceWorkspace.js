@@ -1,6 +1,7 @@
 import { nextTick, ref, shallowRef } from 'vue'
 
 import { api } from '../api.js'
+import { sameReferenceHint } from '../referenceHintIdentity.js'
 import { referenceFileSlot, resolveMatchedReference, resolveReferenceFileIndex } from '../referenceIdentity.js'
 import { loadPdfDocument } from '../services/pdfDocument.js'
 
@@ -238,23 +239,22 @@ export function useReferenceWorkspace({ projectResults, result, currentPage, sel
     const documentInfo = operations.getHintDocument()
     const pageInfo = operations.getHintPage()
     if (!documentInfo || !pageInfo || !item?.point) return
-    if (focus.value?.file === documentInfo.file && focus.value?.page === pageInfo.page
-        && focus.value?.label === item.label && focus.value?.type === item.type) {
-      focus.value = null
-      return
-    }
+    const nextFocus = { file: documentInfo.file, page: pageInfo.page, point: item.point, label: item.label, type: item.type }
+    const alreadyFocused = sameReferenceHint(focus.value, nextFocus)
     showAll.value = false
     const index = resolveReferenceFileIndex(documentInfo.file, files.value)
     if (index < 0) { error.value = '对应的对照 PDF 当前未加载。'; return }
     activeIndex.value = index
     activePage.value = pageInfo.page
-    focus.value = { file: documentInfo.file, page: pageInfo.page, point: item.point, label: item.label, type: item.type }
+    if (!alreadyFocused) focus.value = nextFocus
     if (!sameSlot(activeFile.value, files.value[index], index) || !document.value) {
       activeFile.value = files.value[index]
       await loadPdf(activeFile.value, false)
     } else {
       await operations.renderCanvas(false)
     }
+    if (!alreadyFocused) return
+    operations.locateReferenceHint?.(nextFocus)
     await nextTick()
     const layout = operations.canvasLayout.value.reference
     const viewport = operations.canvasViewport.value
@@ -278,10 +278,13 @@ export function useReferenceWorkspace({ projectResults, result, currentPage, sel
 
   async function archiveLazyFiles() {
     const descriptors = [...files.value]
-    const workspaceResults = [...new Set([result.value, ...projectResults.value].filter(Boolean))]
-    const deferredGroups = workspaceResults.map(item => ({
+    const workspaceResults = [...projectResults.value]
+    const activeResultIndex = workspaceResults.indexOf(result.value)
+    if (activeResultIndex < 0 && result.value) workspaceResults.push(result.value)
+    const deferredGroups = workspaceResults.map((item, projectIndex) => ({
       jobId: item?.jobId,
-      pages: (item?.pages || []).filter(page => !page.layoutObstacles && item?.jobId && item?.workspaceDraftSchema !== 'weld-marker.draft.v2'),
+      projectIndex,
+      pages: (item?.pages || []).filter(page => page.detailsLoaded === false && item?.jobId && item?.jobId !== 'tutorial-000207'),
     })).filter(group => group.pages.length)
     if (!descriptors.some(item => item?.lazyReference) && !deferredGroups.length) return
     const generation = ++archiveGeneration
@@ -303,13 +306,17 @@ export function useReferenceWorkspace({ projectResults, result, currentPage, sel
     if (descriptors.length) files.value = restored
     for (const group of deferredGroups) {
       if (generation !== archiveGeneration) return
-      const details = await api.getJobPageDetails(group.jobId).catch(() => null)
-      const detailsByPage = new Map((details?.pages || []).map(page => [Number(page.page), page.layoutObstacles]))
-      group.pages.forEach(page => {
-        const layoutObstacles = detailsByPage.get(Number(page.page))
-        if (layoutObstacles) page.layoutObstacles = layoutObstacles
-        if (layoutObstacles) page.detailsLoaded = true
-      })
+      let pageCursor = 0
+      const archivePage = async () => {
+        while (pageCursor < group.pages.length && generation === archiveGeneration) {
+          const placeholder = group.pages[pageCursor++]
+          try {
+            const response = await api.getJobPage(group.jobId, Number(placeholder.page))
+            await operations.archiveWorkspacePage?.(group.projectIndex, response.page || response)
+          } catch { /* Keep the lightweight page; a later archive pass can retry it. */ }
+        }
+      }
+      await Promise.all([archivePage(), archivePage()])
     }
     if (generation !== archiveGeneration) return
     archiving.value = false

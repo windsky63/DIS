@@ -54,10 +54,9 @@ export const tutorialStepsById = Object.freeze({
       tips: ['特殊标识的样式不会影响其他标识。'],
       target: '[data-tour="canvas-toolbar"]',
     },
-    { stage: '右侧校对', icon: 'Σ', title: '核对当前页分类数量', description: '统计栏分别显示焊口、管件、特殊标识和已匹配参考身份的数量。', tips: ['特殊标识数量仅在当前页存在特殊标识时显示。'], target: '[data-tour="review-metrics"]' },
     { stage: '右侧校对', icon: '◫', title: '调整普通标识统一外观', description: '在分类标签间切换，分别设置焊口、阀门、法兰和支架的外形、框尺寸、字号、线宽、颜色和填充。', tips: ['这里的修改会影响所选分类的全部标识。'], target: '[data-tour="marker-appearance"]' },
     { stage: '右侧校对', icon: '◎', title: '手动执行位置优化', description: '点击此按钮才会重新排列当前页标签。除解析完成时的自动优化外，撤销和其他编辑不会触发位置优化。', tips: ['优化范围仅限当前页。'], target: '[data-tour="position-optimization"]' },
-    { stage: '右侧校对', icon: '▣', title: '查看选中对象并完成校对', description: '选中对象后可修改编号并查看证据、置信度和参考身份。普通标识可智能重编或排除，特殊标识在这里逐个设置独立外观。', tips: ['特殊标识默认框尺寸为 20、字号为 12。'], target: '[data-tour="selected-object"]', ensureSelection: true },
+    { stage: '右侧校对', icon: '▣', title: '查看选中对象并完成校对', description: '选中对象后可修改编号并查看证据、置信度和参考身份。普通标识可排除误识别对象，特殊标识在这里逐个设置独立外观。', tips: ['特殊标识默认框尺寸为 20、字号为 12。'], target: '[data-tour="selected-object"]', ensureSelection: true },
   ]),
   collaboration: Object.freeze([
     { ...welcome, stage: '准备开始' },

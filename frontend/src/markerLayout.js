@@ -5,7 +5,7 @@ const REOPTIMIZE_FRACTION = .2
 const LONG_PIPE_MIN_MARKERS = 4
 const LONG_PIPE_ANGLE_TOLERANCE = Math.PI / 24
 const REFERENCE_DIAMETER = 56.7
-const FIXED_LENGTH_FACTORS = [140, 180, 220, 270, 330, 400].map(value => value / REFERENCE_DIAMETER)
+const FIXED_LENGTH_FACTORS = [1.25, 1.55, 1.9, 2.35, 2.9, 3.6, 4.5]
 const PERIMETER_LENGTH_FACTORS = [120, 150, 180, 220, 270, 330, 400, 500, 620].map(value => value / REFERENCE_DIAMETER)
 
 const overlap = (a, b, padding = 0) => a.left < b.right + padding && a.right > b.left - padding && a.top < b.bottom + padding && a.bottom > b.top - padding
@@ -41,6 +41,32 @@ function pointToSegmentDistance(point, segment) {
   return Math.hypot(point.x - (segment.start.x + ratio * dx), point.y - (segment.start.y + ratio * dy))
 }
 
+function createSegmentIndex(segments, cellSize = 64) {
+  const cells = new Map()
+  segments.forEach((segment, index) => {
+    const left = Math.min(segment.start.x, segment.end.x); const right = Math.max(segment.start.x, segment.end.x)
+    const top = Math.min(segment.start.y, segment.end.y); const bottom = Math.max(segment.start.y, segment.end.y)
+    for (let column = Math.floor(left / cellSize); column <= Math.floor(right / cellSize); column += 1) {
+      for (let row = Math.floor(top / cellSize); row <= Math.floor(bottom / cellSize); row += 1) {
+        const key = `${column}:${row}`
+        if (!cells.has(key)) cells.set(key, [])
+        cells.get(key).push(index)
+      }
+    }
+  })
+  return {
+    query(left, top, right, bottom) {
+      const indexes = new Set()
+      for (let column = Math.floor(left / cellSize); column <= Math.floor(right / cellSize); column += 1) {
+        for (let row = Math.floor(top / cellSize); row <= Math.floor(bottom / cellSize); row += 1) {
+          ;(cells.get(`${column}:${row}`) || []).forEach(index => indexes.add(index))
+        }
+      }
+      return [...indexes].map(index => segments[index])
+    },
+  }
+}
+
 function dimensions(item, resolveStyle) {
   const style = resolveStyle(item) || {}
   const size = Number(style.frameSize) || 28
@@ -48,6 +74,7 @@ function dimensions(item, resolveStyle) {
   const width = style.shape === 'rectangle' ? Math.max(size * 1.35, 10 + String(item.number || '?').length * fontSize * .68) : size
   return { width, height: size, frame: Math.max(width, size) }
 }
+const layoutBounds = (item, page) => item._layoutBounds || { left: 0, top: 0, right: Number(page.width), bottom: Number(page.height) }
 
 const angleDifference = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)))
 const axisAngle = angle => {
@@ -181,8 +208,9 @@ function candidates(item, page, pipes, placed, resolveStyle, emergency, options 
       variants = [[Math.round(rawX / diagonalGrid) * diagonalGrid, Math.round(rawY / diagonalGrid) * diagonalGrid, 1], [rawX, rawY, 2]]
     }
     variants.forEach(([candidateX, candidateY, sourcePenalty]) => {
-      const x = Math.max(halfWidth + 5, Math.min(Number(page.width) - halfWidth - 5, candidateX))
-      const y = Math.max(halfHeight + 5, Math.min(Number(page.height) - halfHeight - 5, candidateY))
+      const bounds = layoutBounds(item, page)
+      const x = Math.max(Number(bounds.left) + halfWidth + 5, Math.min(Number(bounds.right) - halfWidth - 5, candidateX))
+      const y = Math.max(Number(bounds.top) + halfHeight + 5, Math.min(Number(bounds.bottom) - halfHeight - 5, candidateY))
       const distanceFromAnchor = Math.hypot(x - anchor.x, y - anchor.y)
       const key = `${Math.round(x * 10)}:${Math.round(y * 10)}`
       if (distanceFromAnchor > maximum + 1e-6 || seen.has(key)) return
@@ -196,8 +224,9 @@ function candidates(item, page, pipes, placed, resolveStyle, emergency, options 
 function specialCandidate(item, page, resolveStyle, x, y, source, meta = {}) {
   const size = dimensions(item, resolveStyle)
   const anchor = { x: Number(item.x) || 0, y: Number(item.y) || 0 }
-  x = Math.max(size.width / 2 + 5, Math.min(page.width - size.width / 2 - 5, x))
-  y = Math.max(size.height / 2 + 5, Math.min(page.height - size.height / 2 - 5, y))
+  const bounds = layoutBounds(item, page)
+  x = Math.max(Number(bounds.left) + size.width / 2 + 5, Math.min(Number(bounds.right) - size.width / 2 - 5, x))
+  y = Math.max(Number(bounds.top) + size.height / 2 + 5, Math.min(Number(bounds.bottom) - size.height / 2 - 5, y))
   const distance = Math.hypot(x - anchor.x, y - anchor.y)
   if (distance > size.frame * REGULAR_LEADER_MULTIPLIER + 1e-6) return null
   const angle = Math.atan2(y - anchor.y, x - anchor.x)
@@ -212,7 +241,7 @@ function localPipeBandCandidates(item, page, pipe, resolveStyle) {
   const normal = { x: -tangent.y, y: tangent.x }
   const result = []
   let rank = 0
-  ;[1.8, 2.2, 2.65, 3.2, 3.8, 4.6, 5.65].forEach(bandFactor => {
+  ;[1.35, 1.65, 2, 2.4, 2.9, 3.5, 4.25].forEach(bandFactor => {
     ;[0, -.56, .56, -1.13, 1.13, -1.7, 1.7, -2.25, 2.25, -3.1, 3.1, -3.95, 3.95].forEach(shiftFactor => {
       ;[-1, 1].forEach(side => {
         const candidate = specialCandidate(item, page, resolveStyle, anchor.x + normal.x * side * frame * bandFactor + tangent.x * frame * shiftFactor, anchor.y + normal.y * side * frame * bandFactor + tangent.y * frame * shiftFactor, 'local-pipe-band', { rank, bandDistance: frame * bandFactor, tangentShift: frame * shiftFactor, bandSide: side, pipeAngle, perpendicularDeviation: Math.atan2(Math.abs(shiftFactor), bandFactor) })
@@ -228,7 +257,7 @@ function longPipeCandidates(item, page, group, resolveStyle) {
   const frame = dimensions(item, resolveStyle).frame
   const anchor = { x: Number(item.x) || 0, y: Number(item.y) || 0 }
   const laneBase = 2.03 + group.lane * 1.13
-  const distances = [...new Set([laneBase, laneBase + .42, laneBase + .88, 4.23, 5.29, 6.7, 8.82])].sort((a, b) => a - b)
+  const distances = [...new Set([1.35, 1.65, laneBase, laneBase + .42, laneBase + .88, 3.5, 4.25])].sort((a, b) => a - b)
   const baseShift = group.tangentShift / Math.max(1, frame)
   const shifts = [...new Set([baseShift, 0, baseShift - .25, baseShift + .25, baseShift - .5, baseShift + .5])]
   const result = []
@@ -248,7 +277,7 @@ function perimeterCandidates(item, page, placed, focusBounds, resolveStyle) {
   return candidates(item, page, [], placed, resolveStyle, false, { angles: [radial, radial - Math.PI / 8, radial + Math.PI / 8, radial - Math.PI / 4, radial + Math.PI / 4], distanceFactors: PERIMETER_LENGTH_FACTORS, source: 'perimeter' })
 }
 
-function evaluate(candidate, item, entries, anchors, texts, pipes) {
+function evaluate(candidate, item, entries, anchors, texts, pipes, graphics) {
   let label = 0; let anchor = 0; let leaderLabel = 0; let leaderCross = 0; let leaderAnchor = 0
   const frame = candidate.rectangle.bottom - candidate.rectangle.top
   const leaderLabelGap = Math.max(2, frame * 8 / REFERENCE_DIAMETER)
@@ -269,63 +298,71 @@ function evaluate(candidate, item, entries, anchors, texts, pipes) {
   const text = texts.filter(rectangle => overlap(candidate.rectangle, rectangle, leaderLabelGap)).length
   const expanded = { left: candidate.rectangle.left - 2, right: candidate.rectangle.right + 2, top: candidate.rectangle.top - 2, bottom: candidate.rectangle.bottom + 2 }
   const pipe = pipes.filter(segment => segmentIntersectsRectangle(segment, expanded)).length
-  const hard = [label + anchor + text + pipe, leaderLabel + leaderCross]
+  const nearbyGraphics = graphics.query(Math.min(expanded.left, candidate.leader.start.x, candidate.leader.end.x) - 6, Math.min(expanded.top, candidate.leader.start.y, candidate.leader.end.y) - 6, Math.max(expanded.right, candidate.leader.start.x, candidate.leader.end.x) + 6, Math.max(expanded.bottom, candidate.leader.start.y, candidate.leader.end.y) + 6)
+  const graphic = nearbyGraphics.filter(segment => segmentIntersectsRectangle(segment, expanded)).length
+  const graphicClutter = nearbyGraphics.filter(segment => segmentRectangleDistance(segment, candidate.rectangle) < 7).length
+  const hard = [label + anchor + text + pipe + graphic, leaderLabel + leaderCross]
   const pipeClearance = pipes.filter(segment => pointToSegmentDistance({ x: candidate.x, y: candidate.y }, segment) < Math.max(8, (candidate.rectangle.bottom - candidate.rectangle.top) / 2 + 6)).length
   const leaderText = texts.filter(rectangle => segmentIntersectsRectangle(candidate.leader, rectangle)).length
   const leaderPipe = pipes.filter(segment => segmentDistance(trimmedLeader, segment) < Math.max(3, frame * 10 / REFERENCE_DIAMETER)).length
-  const sourcePenalty = { 'long-pipe-group': -35, 'local-pipe-band': -22, 'segment-normal': -15, perimeter: -8, 'relaxed-direction': 0, 'non-crossing-emergency': 40 }[candidate.source] || 0
-  const soft = candidate.distance + angleDifference(candidate.angle, candidate.currentAngle) * 5 + pipeClearance * 25 + leaderPipe * 12 + leaderAnchor * 12 + leaderText * 8 + candidate.sourcePenalty + Math.abs(candidate.trackOffset || 0) * 2.4 + (candidate.reusedTrack ? 0 : 3) + sourcePenalty + candidate.direction * .001
-  const hardCollisionSummary = { leaderIntersection: leaderCross, leaderLeader: leaderCross, leaderLabel, labelLabel: label + anchor, labelText: text, labelGraphic: pipe, pageBounds: 0, collisionViolationCount: label + anchor + leaderLabel + leaderCross, constraintViolationCount: text + pipe }
+  const leaderGraphic = nearbyGraphics.filter(segment => segmentsIntersect(trimmedLeader, segment)).length
+  const sourcePenalty = { 'long-pipe-group': -35, 'local-pipe-band': -22, 'segment-normal': -15, 'nearby-free-space': -5, perimeter: -8, 'relaxed-direction': 0, 'non-crossing-emergency': 40 }[candidate.source] || 0
+  const soft = candidate.distance + angleDifference(candidate.angle, candidate.currentAngle) * 5 + pipeClearance * 25 + leaderPipe * 12 + leaderAnchor * 12 + leaderText * 8 + leaderGraphic * 3 + graphicClutter * 10 + candidate.sourcePenalty + Math.abs(candidate.trackOffset || 0) * 2.4 + (candidate.reusedTrack ? 0 : 3) + sourcePenalty + candidate.direction * .001
+  const hardCollisionSummary = { leaderIntersection: leaderCross, leaderLeader: leaderCross, leaderLabel, labelLabel: label + anchor, labelText: text, labelGraphic: pipe + graphic, pageBounds: 0, collisionViolationCount: label + anchor + leaderLabel + leaderCross, constraintViolationCount: text + pipe + graphic }
   hardCollisionSummary.total = hardCollisionSummary.collisionViolationCount + hardCollisionSummary.constraintViolationCount
-  return { hard, hardCount: hard[0] + hard[1], soft, hardCollisionSummary, collisionViolationCount: hardCollisionSummary.collisionViolationCount, constraintViolationCount: hardCollisionSummary.constraintViolationCount }
+  return { hard, hardCount: hard[0] + hard[1], soft, visualClutter: graphicClutter, hardCollisionSummary, collisionViolationCount: hardCollisionSummary.collisionViolationCount, constraintViolationCount: hardCollisionSummary.constraintViolationCount }
 }
 
 const compare = (a, b) => a.hard[0] - b.hard[0] || a.hard[1] - b.hard[1] || a.soft - b.soft
-function evaluatedCandidates(pool, item, placed, anchors, texts, pipes) {
+function evaluatedCandidates(pool, item, placed, anchors, texts, pipes, graphics) {
   const seen = new Set()
   return pool.filter(candidate => {
     const key = `${candidate.x.toFixed(1)}:${candidate.y.toFixed(1)}`
     if (seen.has(key)) return false
     seen.add(key)
     return true
-  }).map(candidate => Object.assign(candidate, evaluate(candidate, item, placed, anchors, texts, pipes)))
+  }).map(candidate => Object.assign(candidate, evaluate(candidate, item, placed, anchors, texts, pipes, graphics)))
 }
-const chooseCollisionFree = pool => pool.filter(candidate => candidate.hardCount === 0).sort((a, b) => a.distance - b.distance || a.soft - b.soft || a.direction - b.direction)[0] || null
+const chooseCollisionFree = pool => pool.filter(candidate => candidate.hardCount === 0).sort((a, b) => (a.visualClutter || 0) - (b.visualClutter || 0) || a.distance - b.distance || a.soft - b.soft || a.direction - b.direction)[0] || null
 function chooseFallback(pool) {
   const key = candidate => { const summary = candidate.hardCollisionSummary; return [summary.pageBounds, summary.labelGraphic + summary.labelText + summary.labelLabel, summary.leaderLabel, summary.leaderLeader, candidate.soft, candidate.distance, candidate.direction] }
   const nonCrossing = pool.filter(candidate => !candidate.hardCollisionSummary.leaderIntersection)
   return (nonCrossing.length ? nonCrossing : pool).sort((a, b) => { const first = key(a); const second = key(b); for (let i = 0; i < first.length; i += 1) if (first[i] !== second[i]) return first[i] - second[i]; return 0 })[0] || null
 }
 const markSelection = (candidate, selectionStage, usedFallback = false) => candidate ? Object.assign(candidate, { selectionStage, usedFallback, isCollisionFree: candidate.hardCount === 0 }) : null
-function bestPosition(item, page, pipes, placed, anchors, texts, resolveStyle, group = null, usePerimeter = false, focusBounds = null) {
+function bestPosition(item, page, pipes, placed, anchors, texts, graphics, resolveStyle, group = null, usePerimeter = false, focusBounds = null) {
   const nearest = nearestPipe(item, pipes, resolveStyle)
   const all = []
   if (group) {
-    const pool = evaluatedCandidates(longPipeCandidates(item, page, group, resolveStyle), item, placed, anchors, texts, pipes); all.push(...pool)
+    const pool = evaluatedCandidates(longPipeCandidates(item, page, group, resolveStyle), item, placed, anchors, texts, pipes, graphics); all.push(...pool)
     const frame = dimensions(item, resolveStyle).frame
-    const best = chooseCollisionFree(pool.filter(candidate => candidate.bandDistance <= frame * 4.25 && candidate.distance <= frame * 5)) || chooseCollisionFree(pool)
+    const best = chooseCollisionFree(pool.filter(candidate => candidate.bandDistance <= frame * 3.2 && candidate.distance <= frame * 3.5))
     if (best) return markSelection(best, 'long-pipe-group')
   }
   if (usePerimeter && nearest) {
-    const local = evaluatedCandidates(localPipeBandCandidates(item, page, nearest.pipe, resolveStyle), item, placed, anchors, texts, pipes); all.push(...local)
+    const local = evaluatedCandidates(localPipeBandCandidates(item, page, nearest.pipe, resolveStyle), item, placed, anchors, texts, pipes, graphics); all.push(...local)
     const frame = dimensions(item, resolveStyle).frame
-    const stages = [['local-pipe-band-compact', local.filter(candidate => candidate.bandDistance <= frame * 3.2 && Math.abs(candidate.tangentShift) <= frame * 1.7)], ['local-pipe-band', local.filter(candidate => candidate.bandDistance <= frame * 4.25 && Math.abs(candidate.tangentShift) <= frame * 2.25)], ['local-pipe-band-extended', local]]
-    for (const [stage, pool] of stages) { const best = chooseCollisionFree(pool); if (best) return markSelection(best, stage) }
+    const compact = local.filter(candidate => candidate.bandDistance <= frame * 3.2 && Math.abs(candidate.tangentShift) <= frame * 1.7)
+    const compactBest = chooseCollisionFree(compact); if (compactBest) return markSelection(compactBest, 'local-pipe-band-compact')
+    const freeAngles = Array.from({ length: 24 }, (_, index) => -Math.PI + index * 2 * Math.PI / 24)
+    const nearby = evaluatedCandidates(candidates(item, page, [], placed, resolveStyle, false, { angles: freeAngles, source: 'nearby-free-space' }), item, placed, anchors, texts, pipes, graphics); all.push(...nearby)
+    const nearbyBest = chooseCollisionFree([...local, ...nearby])
+    if (nearbyBest) return markSelection(nearbyBest, nearbyBest.source === 'nearby-free-space' ? 'nearby-free-space' : 'local-pipe-band')
   }
   if (usePerimeter && focusBounds) {
-    const pool = evaluatedCandidates(perimeterCandidates(item, page, placed, focusBounds, resolveStyle), item, placed, anchors, texts, pipes); all.push(...pool)
+    const pool = evaluatedCandidates(perimeterCandidates(item, page, placed, focusBounds, resolveStyle), item, placed, anchors, texts, pipes, graphics); all.push(...pool)
     const best = chooseCollisionFree(pool); if (best) return markSelection(best, 'perimeter-distribution')
   }
   if (!usePerimeter) {
     if (nearest && nearest.distance < Math.max(24, dimensions(item, resolveStyle).frame * 1.5)) {
       const angle = Math.atan2(nearest.pipe.end.y - nearest.pipe.start.y, nearest.pipe.end.x - nearest.pipe.start.x)
-      const strict = evaluatedCandidates(candidates(item, page, pipes, placed, resolveStyle, false, { angles: [angle - Math.PI / 2, angle + Math.PI / 2], source: 'segment-normal' }), item, placed, anchors, texts, pipes); all.push(...strict)
+      const strict = evaluatedCandidates(candidates(item, page, pipes, placed, resolveStyle, false, { angles: [angle - Math.PI / 2, angle + Math.PI / 2], source: 'segment-normal' }), item, placed, anchors, texts, pipes, graphics); all.push(...strict)
       const best = chooseCollisionFree(strict); if (best) return markSelection(best, 'strict-perpendicular')
     }
-    const relaxed = evaluatedCandidates(candidates(item, page, [], placed, resolveStyle, false, { source: 'relaxed-direction' }), item, placed, anchors, texts, pipes); all.push(...relaxed)
+    const relaxed = evaluatedCandidates(candidates(item, page, [], placed, resolveStyle, false, { source: 'relaxed-direction' }), item, placed, anchors, texts, pipes, graphics); all.push(...relaxed)
     const best = chooseCollisionFree(relaxed); if (best) return markSelection(best, 'relaxed-direction')
   }
-  const emergency = evaluatedCandidates(candidates(item, page, pipes, placed, resolveStyle, true, { source: 'non-crossing-emergency' }), item, placed, anchors, texts, pipes); all.push(...emergency)
+  const emergency = evaluatedCandidates(candidates(item, page, pipes, placed, resolveStyle, true, { source: 'non-crossing-emergency' }), item, placed, anchors, texts, pipes, graphics); all.push(...emergency)
   const bestEmergency = chooseCollisionFree(emergency)
   return bestEmergency ? markSelection(bestEmergency, 'non-crossing-emergency') : markSelection(chooseFallback(all), 'fallback-best-effort', true)
 }
@@ -333,13 +370,15 @@ function bestPosition(item, page, pipes, placed, anchors, texts, resolveStyle, g
 function candidateAt(item, x, y, resolveStyle) {
   const size = dimensions(item, resolveStyle)
   const anchor = { x: Number(item.x) || 0, y: Number(item.y) || 0 }
+  const bounds = item._layoutBounds
+  if (bounds && !(Number(bounds.left) + size.width/2 + 5 <= x && x <= Number(bounds.right) - size.width/2 - 5 && Number(bounds.top) + size.height/2 + 5 <= y && y <= Number(bounds.bottom) - size.height/2 - 5)) return null
   const distance = Math.hypot(x - anchor.x, y - anchor.y)
   if (distance > size.frame * EMERGENCY_LEADER_MULTIPLIER + 1e-6) return null
   const angle = Math.atan2(y - anchor.y, x - anchor.x)
   return { x, y, rectangle: { left: x - size.width / 2, right: x + size.width / 2, top: y - size.height / 2, bottom: y + size.height / 2 }, leader: { start: anchor, end: leaderConnection(anchor, { x, y }, size.width, size.height) }, distance, angle, currentAngle: angle, sourcePenalty: 0, direction: 0, source: 'endpoint-swap', family: family(angle), reusedTrack: false, trackOffset: 0 }
 }
 
-function untangleCrossedLeaders(entries, anchors, texts, pipes, resolveStyle) {
+function untangleCrossedLeaders(entries, anchors, texts, pipes, graphics, resolveStyle) {
   let changed = false
   for (let firstIndex = 0; firstIndex < entries.length; firstIndex += 1) {
     for (let secondIndex = firstIndex + 1; secondIndex < entries.length; secondIndex += 1) {
@@ -352,8 +391,8 @@ function untangleCrossedLeaders(entries, anchors, texts, pipes, resolveStyle) {
       Object.assign(swappedFirst, { id: first.id, item: first.item })
       Object.assign(swappedSecond, { id: second.id, item: second.item })
       const others = entries.filter((_, index) => index !== firstIndex && index !== secondIndex)
-      const oldStates = [evaluate(first, first.item, entries, anchors, texts, pipes), evaluate(second, second.item, entries, anchors, texts, pipes)]
-      const newStates = [evaluate(swappedFirst, first.item, [...others, swappedSecond], anchors, texts, pipes), evaluate(swappedSecond, second.item, [...others, swappedFirst], anchors, texts, pipes)]
+      const oldStates = [evaluate(first, first.item, entries, anchors, texts, pipes, graphics), evaluate(second, second.item, entries, anchors, texts, pipes, graphics)]
+      const newStates = [evaluate(swappedFirst, first.item, [...others, swappedSecond], anchors, texts, pipes, graphics), evaluate(swappedSecond, second.item, [...others, swappedFirst], anchors, texts, pipes, graphics)]
       const key = states => [states.reduce((sum, state) => sum + state.hard[0], 0), states.reduce((sum, state) => sum + state.hard[1], 0), states.reduce((sum, state) => sum + state.soft, 0)]
       const oldKey = key(oldStates)
       const newKey = key(newStates)
@@ -376,6 +415,9 @@ export function reflowLabelPositions(pageList, resolveStyle) {
     const anchors = items.map(item => ({ x: Number(item.x) || 0, y: Number(item.y) || 0, id: item.id }))
     const texts = (page.layoutObstacles?.textRects || []).map(box => ({ left: Number(box[0]), top: Number(box[1]), right: Number(box[2]), bottom: Number(box[3]) }))
     const pipes = (page.layoutObstacles?.processSegments || []).map(segment => ({ start: { x: Number(segment.start?.[0]), y: Number(segment.start?.[1]) }, end: { x: Number(segment.end?.[0]), y: Number(segment.end?.[1]) } }))
+    const graphics = createSegmentIndex((page.layoutObstacles?.graphicSegments || []).map(segment => ({ start: { x: Number(segment.start?.[0]), y: Number(segment.start?.[1]) }, end: { x: Number(segment.end?.[0]), y: Number(segment.end?.[1]) } })))
+    const region = page.layoutObstacles?.mainGraphicRegion || { left: 0, top: 0, right: Number(page.width), bottom: Number(page.height) }
+    items.forEach(item => { item._layoutBounds = region })
     const focusBounds = anchors.length
       ? { left: Math.min(...anchors.map(point => point.x)), top: Math.min(...anchors.map(point => point.y)), right: Math.max(...anchors.map(point => point.x)), bottom: Math.max(...anchors.map(point => point.y)) }
       : { left: 0, top: 0, right: 0, bottom: 0 }
@@ -391,19 +433,19 @@ export function reflowLabelPositions(pageList, resolveStyle) {
     items.sort((a, b) => congestion(b) - congestion(a) || Number(a.y) - Number(b.y) || Number(a.x) - Number(b.x))
     const entries = []
     items.forEach(item => {
-      const best = bestPosition(item, page, pipes, entries, anchors, texts, resolveStyle, longPipeGroups.get(item), usePerimeter, focusBounds)
+      const best = bestPosition(item, page, pipes, entries, anchors, texts, graphics, resolveStyle, longPipeGroups.get(item), usePerimeter, focusBounds)
       if (best) entries.push(Object.assign(best, { id: item.id, item }))
     })
     for (let pass = 0; pass < MAX_REPAIR_PASSES; pass += 1) {
-      const untangled = untangleCrossedLeaders(entries, anchors, texts, pipes, resolveStyle)
-      const conflicted = entries.map(entry => ({ entry, state: evaluate(entry, entry.item, entries, anchors, texts, pipes) })).filter(value => value.state.hardCount).sort((a, b) => b.state.hardCount - a.state.hardCount)
+      const untangled = untangleCrossedLeaders(entries, anchors, texts, pipes, graphics, resolveStyle)
+      const conflicted = entries.map(entry => ({ entry, state: evaluate(entry, entry.item, entries, anchors, texts, pipes, graphics) })).filter(value => value.state.hardCount).sort((a, b) => b.state.hardCount - a.state.hardCount)
       if (!conflicted.length) break
       totals.repairPasses = Math.max(totals.repairPasses, pass + 1)
       let changed = untangled
       conflicted.slice(0, Math.max(1, Math.ceil(entries.length * REOPTIMIZE_FRACTION))).forEach(({ entry }) => {
         const others = entries.filter(other => other !== entry)
-        const replacement = bestPosition(entry.item, page, pipes, others, anchors, texts, resolveStyle, longPipeGroups.get(entry.item), usePerimeter, focusBounds)
-        const oldState = evaluate(entry, entry.item, others, anchors, texts, pipes)
+        const replacement = bestPosition(entry.item, page, pipes, others, anchors, texts, graphics, resolveStyle, longPipeGroups.get(entry.item), usePerimeter, focusBounds)
+        const oldState = evaluate(entry, entry.item, others, anchors, texts, pipes, graphics)
         if (replacement && compare(replacement, oldState) < 0) {
           Object.assign(replacement, { id: entry.id, item: entry.item })
           entries[entries.indexOf(entry)] = replacement
@@ -412,14 +454,33 @@ export function reflowLabelPositions(pageList, resolveStyle) {
       })
       if (!changed) break
     }
+    for (let pass = 0; pass < 2; pass += 1) {
+      let changed = false
+      ;[...entries].sort((a, b) => b.distance - a.distance).forEach(entry => {
+        const others = entries.filter(other => other !== entry)
+        const replacement = bestPosition(entry.item, page, pipes, others, anchors, texts, graphics, resolveStyle, longPipeGroups.get(entry.item), usePerimeter, focusBounds)
+        if (!replacement) return
+        const oldState = evaluate(entry, entry.item, others, anchors, texts, pipes, graphics)
+        const newKey = [replacement.hardCount, replacement.visualClutter || 0, Math.round(replacement.distance * 1e6), replacement.soft]
+        const oldKey = [oldState.hardCount, oldState.visualClutter || 0, Math.round(entry.distance * 1e6), oldState.soft]
+        const better = newKey.some((value, index) => value !== oldKey[index] && newKey.slice(0, index).every((prior, priorIndex) => prior === oldKey[priorIndex]) && value < oldKey[index])
+        if (better) {
+          Object.assign(replacement, { id: entry.id, item: entry.item, selectionStage: `neighbourhood-${replacement.selectionStage || 'compact'}` })
+          entries[entries.indexOf(entry)] = replacement
+          changed = true
+        }
+      })
+      if (!changed) break
+    }
     entries.forEach(entry => {
       const item = entry.item
-      const finalState = evaluate(entry, item, entries, anchors, texts, pipes)
+      const finalState = evaluate(entry, item, entries, anchors, texts, pipes, graphics)
       Object.assign(item, { labelX: entry.x, labelY: entry.y, labelXNorm: entry.x / page.width, labelYNorm: entry.y / page.height,
         layoutDiagnostics: { family: entry.family || '', source: entry.source || '', lineLength: entry.distance, selectionStage: entry.selectionStage || 'fallback-best-effort', usedFallback: entry.usedFallback === true, isCollisionFree: finalState.hardCount === 0, hardCollisionCount: finalState.hardCount, leaderIntersectionCount: finalState.hardCollisionSummary.leaderIntersection, collisionViolationCount: finalState.collisionViolationCount, constraintViolationCount: finalState.constraintViolationCount, hardCollisionSummary: finalState.hardCollisionSummary, penalty: finalState.soft, reusedTrack: entry.reusedTrack === true, trackOffset: entry.trackOffset || 0, longPipeGroupId: entry.longPipeGroupId || '', longPipeLane: entry.longPipeLane ?? -1, pipeAngleDegrees: Number.isFinite(entry.pipeAngle) ? Math.round(entry.pipeAngle * 1800 / Math.PI) / 10 : null, perpendicularDeviationDegrees: Number.isFinite(entry.perpendicularDeviation) ? Math.round(entry.perpendicularDeviation * 1800 / Math.PI) / 10 : null } })
       totals.placed += 1
       if (Math.hypot(entry.x - originals.get(item).x, entry.y - originals.get(item).y) > 2) totals.moved += 1
       totals.remainingCollisions += finalState.hardCount
+      delete item._layoutBounds
     })
   })
   return totals

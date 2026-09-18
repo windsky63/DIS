@@ -14,7 +14,7 @@ export function referenceChannelName(channelId) {
 }
 
 export function referenceWindowUrl(channelId) {
-  return `/?view=reference#channel=${encodeURIComponent(channelId)}`
+  return `/main?view=reference#channel=${encodeURIComponent(channelId)}`
 }
 
 export function referenceChannelFromLocation(locationLike = globalThis.location) {

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Callable
 
 REGULAR_LEADER_MULTIPLIER = 12.0
 EMERGENCY_LEADER_MULTIPLIER = 18.0
@@ -12,7 +12,7 @@ REOPTIMIZE_FRACTION = 0.2
 LONG_PIPE_MIN_MARKERS = 4
 LONG_PIPE_ANGLE_TOLERANCE = math.pi / 24
 REFERENCE_DIAMETER = 56.7
-FIXED_LENGTH_FACTORS = tuple(value / REFERENCE_DIAMETER for value in (140, 180, 220, 270, 330, 400))
+FIXED_LENGTH_FACTORS = (1.25, 1.55, 1.9, 2.35, 2.9, 3.6, 4.5)
 PERIMETER_LENGTH_FACTORS = tuple(value / REFERENCE_DIAMETER for value in (120, 150, 180, 220, 270, 330, 400, 500, 620))
 
 
@@ -128,7 +128,14 @@ def _leader_connection(anchor, center, width: float, height: float):
 
 
 def _style(item: dict[str, Any]) -> dict[str, Any]:
-    result = {"shape": "rectangle" if item.get("componentType") else "circle", "frameSize": 28, "fontSize": 15}
+    # Keep the server-side collision geometry identical to the actual defaults
+    # used by frontend/defaultMarkerAppearance.js.  Component labels are
+    # intentionally smaller than weld callouts.
+    result = (
+        {"shape": "rectangle", "frameSize": 20, "fontSize": 12}
+        if item.get("componentType")
+        else {"shape": "circle", "frameSize": 28, "fontSize": 15}
+    )
     result.update(item.get("defaultMarkerStyle") or {})
     result.update(item.get("markerStyle") or {})
     return result
@@ -158,8 +165,13 @@ def _parse_obstacles(page: dict[str, Any]):
     obstacles = page.get("layoutObstacles") or {}
     text = [{"left": float(box[0]), "top": float(box[1]), "right": float(box[2]), "bottom": float(box[3])} for box in obstacles.get("textRects") or [] if len(box) >= 4]
     pipes = [((float(segment.get("start", [0, 0])[0]), float(segment.get("start", [0, 0])[1])), (float(segment.get("end", [0, 0])[0]), float(segment.get("end", [0, 0])[1]))) for segment in obstacles.get("processSegments") or []]
+    graphics = [((float(segment.get("start", [0, 0])[0]), float(segment.get("start", [0, 0])[1])), (float(segment.get("end", [0, 0])[0]), float(segment.get("end", [0, 0])[1]))) for segment in obstacles.get("graphicSegments") or []]
     text_index = _SpatialIndex(text, lambda rectangle: (rectangle["left"], rectangle["top"], rectangle["right"], rectangle["bottom"]))
-    return text_index, pipes
+    graphic_index = _SpatialIndex(graphics, lambda segment: (
+        min(segment[0][0], segment[1][0]), min(segment[0][1], segment[1][1]),
+        max(segment[0][0], segment[1][0]), max(segment[0][1], segment[1][1]),
+    ), cell_size=64.0)
+    return text_index, pipes, graphic_index
 
 
 def _ray_distance_to_page(x: float, y: float, dx: float, dy: float, width: float, height: float) -> float:
@@ -283,8 +295,12 @@ def _candidate_positions(item, page_width, page_height, pipes, placed, emergency
                 diagonal_grid = track_grid / 2
                 variants = [(round(raw_x / diagonal_grid) * diagonal_grid, round(raw_y / diagonal_grid) * diagonal_grid, 1), (raw_x, raw_y, 2)]
             for candidate_x, candidate_y, source_penalty in variants:
-                x = max(half_width + 5, min(page_width - half_width - 5, candidate_x))
-                y = max(half_height + 5, min(page_height - half_height - 5, candidate_y))
+                bounds = item.get("_layoutBounds") or {"left": 0, "top": 0, "right": page_width, "bottom": page_height}
+                min_x, max_x = float(bounds["left"])+half_width+5, float(bounds["right"])-half_width-5
+                min_y, max_y = float(bounds["top"])+half_height+5, float(bounds["bottom"])-half_height-5
+                if min_x > max_x or min_y > max_y:
+                    continue
+                x, y = max(min_x, min(max_x, candidate_x)), max(min_y, min(max_y, candidate_y))
                 actual_distance = math.hypot(x - anchor[0], y - anchor[1])
                 if actual_distance > maximum + 1e-6:
                     continue
@@ -301,8 +317,12 @@ def _special_candidate(item, page_width, page_height, x, y, source, **meta):
     width, height, frame = _dimensions(item)
     anchor = (float(item.get("x") or 0), float(item.get("y") or 0))
     half_width, half_height = width / 2, height / 2
-    x = max(half_width + 5, min(page_width - half_width - 5, x))
-    y = max(half_height + 5, min(page_height - half_height - 5, y))
+    bounds = item.get("_layoutBounds") or {"left": 0, "top": 0, "right": page_width, "bottom": page_height}
+    min_x, max_x = float(bounds["left"])+half_width+5, float(bounds["right"])-half_width-5
+    min_y, max_y = float(bounds["top"])+half_height+5, float(bounds["bottom"])-half_height-5
+    if min_x > max_x or min_y > max_y:
+        return None
+    x, y = max(min_x, min(max_x, x)), max(min_y, min(max_y, y))
     distance = math.hypot(x - anchor[0], y - anchor[1])
     if distance > frame * REGULAR_LEADER_MULTIPLIER + 1e-6:
         return None
@@ -323,7 +343,7 @@ def _local_pipe_band_candidates(item, page_width, page_height, pipe):
     angle = math.atan2(pipe[1][1] - pipe[0][1], pipe[1][0] - pipe[0][0])
     tangent, normal = (math.cos(angle), math.sin(angle)), (-math.sin(angle), math.cos(angle))
     rank = 0
-    for band_factor in (1.8, 2.2, 2.65, 3.2, 3.8, 4.6, 5.65):
+    for band_factor in (1.35, 1.65, 2.0, 2.4, 2.9, 3.5, 4.25):
         for shift_factor in (0, -0.56, 0.56, -1.13, 1.13, -1.7, 1.7, -2.25, 2.25, -3.1, 3.1, -3.95, 3.95):
             for side in (-1, 1):
                 x = anchor[0] + normal[0] * side * frame * band_factor + tangent[0] * frame * shift_factor
@@ -338,7 +358,7 @@ def _long_pipe_candidates(item, page_width, page_height, group):
     _, _, frame = _dimensions(item)
     anchor = (float(item.get("x") or 0), float(item.get("y") or 0))
     lane_base = 2.03 + group["lane"] * 1.13
-    distances = sorted({lane_base, lane_base + 0.42, lane_base + 0.88, 4.23, 5.29, 6.70, 8.82})
+    distances = sorted({1.35, 1.65, lane_base, lane_base + 0.42, lane_base + 0.88, 3.5, 4.25})
     base_shift = group["tangentShift"] / max(1, frame)
     shifts = list(dict.fromkeys((base_shift, 0, base_shift - 0.25, base_shift + 0.25, base_shift - 0.5, base_shift + 0.5)))
     rank = 0
@@ -361,7 +381,7 @@ def _perimeter_candidates(item, page_width, page_height, placed, focus_bounds):
     yield from _candidate_positions(item, page_width, page_height, [], placed, angles=spoke_angles, distance_factors=PERIMETER_LENGTH_FACTORS, source="perimeter")
 
 
-def _evaluate(candidate, item, entries, anchors, text_rectangles, pipes):
+def _evaluate(candidate, item, entries, anchors, text_rectangles, pipes, graphics):
     rectangle, leader = candidate["rectangle"], candidate["leader"]
     label = anchor = leader_label = leader_cross = leader_anchor = 0
     _, _, frame = _dimensions(item)
@@ -391,32 +411,43 @@ def _evaluate(candidate, item, entries, anchors, text_rectangles, pipes):
     )
     text = sum(_overlap(rectangle, obstacle, leader_label_gap) for obstacle in nearby_text)
     pipe = sum(_segment_intersects_rectangle(segment, {"left": rectangle["left"] - 2, "right": rectangle["right"] + 2, "top": rectangle["top"] - 2, "bottom": rectangle["bottom"] + 2}) for segment in pipes)
-    hard_groups = (label + anchor + text + pipe, leader_label + leader_cross)
+    expanded_graphic = {"left": rectangle["left"] - 2, "right": rectangle["right"] + 2, "top": rectangle["top"] - 2, "bottom": rectangle["bottom"] + 2}
+    nearby_graphics = graphics.query(
+        min(expanded_graphic["left"], leader[0][0], leader[1][0]) - 6,
+        min(expanded_graphic["top"], leader[0][1], leader[1][1]) - 6,
+        max(expanded_graphic["right"], leader[0][0], leader[1][0]) + 6,
+        max(expanded_graphic["bottom"], leader[0][1], leader[1][1]) + 6,
+    )
+    graphic = sum(_segment_intersects_rectangle(segment, expanded_graphic) for segment in nearby_graphics)
+    graphic_clutter = sum(_segment_to_rectangle_distance(segment, rectangle) < 7 for segment in nearby_graphics)
+    hard_groups = (label + anchor + text + pipe + graphic, leader_label + leader_cross)
     pipe_clearance = sum(_point_to_segment_distance((candidate["x"], candidate["y"]), segment) < max(8, (rectangle["bottom"] - rectangle["top"]) / 2 + 6) for segment in pipes)
     leader_text = sum(_segment_intersects_rectangle(leader, obstacle) for obstacle in nearby_text)
     leader_pipe_proximity = sum(_segment_to_segment_distance(trimmed_leader, segment) < max(3, frame * 10 / REFERENCE_DIAMETER) for segment in pipes)
-    source_penalty = {"long-pipe-group": -35, "local-pipe-band": -22, "segment-normal": -15, "perimeter": -8, "relaxed-direction": 0, "non-crossing-emergency": 40}.get(candidate.get("source"), 0)
-    soft = candidate["distance"] + _angle_difference(candidate["angle"], candidate["currentAngle"]) * 5 + pipe_clearance * 25 + leader_pipe_proximity * 12 + leader_anchor * 12 + leader_text * 8 + candidate["sourcePenalty"] + abs(candidate.get("trackOffset", 0)) * 2.4 + (0 if candidate.get("reusedTrack") else 3) + source_penalty + candidate["direction"] * 0.001
+    leader_graphic = sum(_segments_intersect(trimmed_leader, segment) for segment in nearby_graphics)
+    source_penalty = {"long-pipe-group": -35, "local-pipe-band": -22, "segment-normal": -15, "nearby-free-space": -5, "perimeter": -8, "relaxed-direction": 0, "non-crossing-emergency": 40}.get(candidate.get("source"), 0)
+    soft = candidate["distance"] + _angle_difference(candidate["angle"], candidate["currentAngle"]) * 5 + pipe_clearance * 25 + leader_pipe_proximity * 12 + leader_anchor * 12 + leader_text * 8 + leader_graphic * 3 + graphic_clutter * 10 + candidate["sourcePenalty"] + abs(candidate.get("trackOffset", 0)) * 2.4 + (0 if candidate.get("reusedTrack") else 3) + source_penalty + candidate["direction"] * 0.001
     hard_summary = {
         "leaderIntersection": leader_cross, "leaderLeader": leader_cross,
         "leaderLabel": leader_label, "labelLabel": label + anchor,
-        "labelText": text, "labelGraphic": pipe, "pageBounds": 0,
+        "labelText": text, "labelGraphic": pipe + graphic, "pageBounds": 0,
         "collisionViolationCount": label + anchor + leader_label + leader_cross,
-        "constraintViolationCount": text + pipe,
+        "constraintViolationCount": text + pipe + graphic,
     }
     hard_summary["total"] = hard_summary["collisionViolationCount"] + hard_summary["constraintViolationCount"]
     return {
         "hard": hard_groups,
         "hardCount": sum(hard_groups),
-        "hardDetail": {"label": label, "anchor": anchor, "text": text, "pipe": pipe, "leaderLabel": leader_label, "leaderCross": leader_cross, "leaderAnchor": leader_anchor},
+        "hardDetail": {"label": label, "anchor": anchor, "text": text, "pipe": pipe, "graphic": graphic, "leaderLabel": leader_label, "leaderCross": leader_cross, "leaderAnchor": leader_anchor},
         "hardCollisionSummary": hard_summary,
         "collisionViolationCount": hard_summary["collisionViolationCount"],
         "constraintViolationCount": hard_summary["constraintViolationCount"],
+        "visualClutter": graphic_clutter,
         "soft": soft,
     }
 
 
-def _evaluate_candidates(candidates, item, placed, anchors, text_rectangles, pipes):
+def _evaluate_candidates(candidates, item, placed, anchors, text_rectangles, pipes, graphics):
     result = []
     seen = set()
     for candidate in candidates:
@@ -424,14 +455,14 @@ def _evaluate_candidates(candidates, item, placed, anchors, text_rectangles, pip
         if key in seen:
             continue
         seen.add(key)
-        candidate.update(_evaluate(candidate, item, placed, anchors, text_rectangles, pipes))
+        candidate.update(_evaluate(candidate, item, placed, anchors, text_rectangles, pipes, graphics))
         result.append(candidate)
     return result
 
 
 def _choose_collision_free(candidates):
     collision_free = [candidate for candidate in candidates if candidate["hardCount"] == 0]
-    return min(collision_free, key=lambda candidate: (round(candidate["distance"], 6), candidate["soft"], candidate["direction"]), default=None)
+    return min(collision_free, key=lambda candidate: (candidate.get("visualClutter", 0), round(candidate["distance"], 6), candidate["soft"], candidate["direction"]), default=None)
 
 
 def _choose_fallback(candidates):
@@ -449,45 +480,47 @@ def _mark_selection(candidate, stage: str, fallback: bool = False):
     return candidate
 
 
-def _best_position(item, page_width, page_height, pipes, placed, anchors, text_rectangles, group=None, use_perimeter=False, focus_bounds=None):
+def _best_position(item, page_width, page_height, pipes, placed, anchors, text_rectangles, graphics, group=None, use_perimeter=False, focus_bounds=None):
     nearest = _nearest_pipe(item, pipes)
     all_evaluated = []
     if group:
-        evaluated = _evaluate_candidates(_long_pipe_candidates(item, page_width, page_height, group), item, placed, anchors, text_rectangles, pipes)
+        evaluated = _evaluate_candidates(_long_pipe_candidates(item, page_width, page_height, group), item, placed, anchors, text_rectangles, pipes, graphics)
         all_evaluated.extend(evaluated)
-        compact = [candidate for candidate in evaluated if candidate.get("bandDistance", 0) <= _dimensions(item)[2] * 4.25 and candidate["distance"] <= _dimensions(item)[2] * 5]
-        best = _choose_collision_free(compact) or _choose_collision_free(evaluated)
+        compact = [candidate for candidate in evaluated if candidate.get("bandDistance", 0) <= _dimensions(item)[2] * 3.2 and candidate["distance"] <= _dimensions(item)[2] * 3.5]
+        best = _choose_collision_free(compact)
         if best:
             return _mark_selection(best, "long-pipe-group")
     if use_perimeter and nearest:
-        local = _evaluate_candidates(_local_pipe_band_candidates(item, page_width, page_height, nearest[1]), item, placed, anchors, text_rectangles, pipes)
+        local = _evaluate_candidates(_local_pipe_band_candidates(item, page_width, page_height, nearest[1]), item, placed, anchors, text_rectangles, pipes, graphics)
         all_evaluated.extend(local)
         frame = _dimensions(item)[2]
-        stages = [
-            ("local-pipe-band-compact", [candidate for candidate in local if candidate.get("bandDistance", 0) <= frame * 3.2 and abs(candidate.get("tangentShift", 0)) <= frame * 1.7]),
-            ("local-pipe-band", [candidate for candidate in local if candidate.get("bandDistance", 0) <= frame * 4.25 and abs(candidate.get("tangentShift", 0)) <= frame * 2.25]),
-            ("local-pipe-band-extended", local),
-        ]
-        for stage, pool in stages:
-            if best := _choose_collision_free(pool):
-                return _mark_selection(best, stage)
+        compact = [candidate for candidate in local if candidate.get("bandDistance", 0) <= frame * 3.2 and abs(candidate.get("tangentShift", 0)) <= frame * 1.7]
+        if best := _choose_collision_free(compact):
+            return _mark_selection(best, "local-pipe-band-compact")
+        # A normal-only band can miss a nearby diagonal pocket of whitespace.
+        # Sample a denser ring before accepting an extended / long leader.
+        free_angles = [-math.pi + index * 2 * math.pi / 24 for index in range(24)]
+        nearby = _evaluate_candidates(_candidate_positions(item, page_width, page_height, [], placed, angles=free_angles, source="nearby-free-space"), item, placed, anchors, text_rectangles, pipes, graphics)
+        all_evaluated.extend(nearby)
+        if best := _choose_collision_free([*local, *nearby]):
+            return _mark_selection(best, "nearby-free-space" if best.get("source") == "nearby-free-space" else "local-pipe-band")
     if use_perimeter and focus_bounds:
-        perimeter = _evaluate_candidates(_perimeter_candidates(item, page_width, page_height, placed, focus_bounds), item, placed, anchors, text_rectangles, pipes)
+        perimeter = _evaluate_candidates(_perimeter_candidates(item, page_width, page_height, placed, focus_bounds), item, placed, anchors, text_rectangles, pipes, graphics)
         all_evaluated.extend(perimeter)
         if best := _choose_collision_free(perimeter):
             return _mark_selection(best, "perimeter-distribution")
     if not use_perimeter:
         if nearest and nearest[2] < max(24, _dimensions(item)[2] * 1.5):
             pipe_angle = math.atan2(nearest[1][1][1] - nearest[1][0][1], nearest[1][1][0] - nearest[1][0][0])
-            strict = _evaluate_candidates(_candidate_positions(item, page_width, page_height, pipes, placed, angles=[pipe_angle - math.pi / 2, pipe_angle + math.pi / 2], source="segment-normal"), item, placed, anchors, text_rectangles, pipes)
+            strict = _evaluate_candidates(_candidate_positions(item, page_width, page_height, pipes, placed, angles=[pipe_angle - math.pi / 2, pipe_angle + math.pi / 2], source="segment-normal"), item, placed, anchors, text_rectangles, pipes, graphics)
             all_evaluated.extend(strict)
             if best := _choose_collision_free(strict):
                 return _mark_selection(best, "strict-perpendicular")
-        relaxed = _evaluate_candidates(_candidate_positions(item, page_width, page_height, [], placed, source="relaxed-direction"), item, placed, anchors, text_rectangles, pipes)
+        relaxed = _evaluate_candidates(_candidate_positions(item, page_width, page_height, [], placed, source="relaxed-direction"), item, placed, anchors, text_rectangles, pipes, graphics)
         all_evaluated.extend(relaxed)
         if best := _choose_collision_free(relaxed):
             return _mark_selection(best, "relaxed-direction")
-    emergency = _evaluate_candidates(_candidate_positions(item, page_width, page_height, pipes, placed, emergency=True, source="non-crossing-emergency"), item, placed, anchors, text_rectangles, pipes)
+    emergency = _evaluate_candidates(_candidate_positions(item, page_width, page_height, pipes, placed, emergency=True, source="non-crossing-emergency"), item, placed, anchors, text_rectangles, pipes, graphics)
     all_evaluated.extend(emergency)
     if best := _choose_collision_free(emergency):
         return _mark_selection(best, "non-crossing-emergency")
@@ -497,6 +530,9 @@ def _best_position(item, page_width, page_height, pipes, placed, anchors, text_r
 def _candidate_at(item, x: float, y: float):
     width, height, frame = _dimensions(item)
     anchor = (float(item.get("x") or 0), float(item.get("y") or 0))
+    bounds = item.get("_layoutBounds")
+    if bounds and not (float(bounds["left"])+width/2+5 <= x <= float(bounds["right"])-width/2-5 and float(bounds["top"])+height/2+5 <= y <= float(bounds["bottom"])-height/2-5):
+        return None
     distance = math.hypot(x - anchor[0], y - anchor[1])
     if distance > frame * EMERGENCY_LEADER_MULTIPLIER + 1e-6:
         return None
@@ -510,7 +546,7 @@ def _candidate_at(item, x: float, y: float):
     }
 
 
-def _untangle_crossed_leaders(entries, anchors, text_rectangles, pipes) -> bool:
+def _untangle_crossed_leaders(entries, anchors, text_rectangles, pipes, graphics) -> bool:
     """Swap compatible label endpoints when two straight leaders cross."""
     changed = False
     for first_index in range(len(entries)):
@@ -525,8 +561,8 @@ def _untangle_crossed_leaders(entries, anchors, text_rectangles, pipes) -> bool:
             swapped_first.update({"id": first["id"], "item": first["item"]})
             swapped_second.update({"id": second["id"], "item": second["item"]})
             others = [entry for index, entry in enumerate(entries) if index not in {first_index, second_index}]
-            old_states = [_evaluate(first, first["item"], entries, anchors, text_rectangles, pipes), _evaluate(second, second["item"], entries, anchors, text_rectangles, pipes)]
-            new_states = [_evaluate(swapped_first, first["item"], [*others, swapped_second], anchors, text_rectangles, pipes), _evaluate(swapped_second, second["item"], [*others, swapped_first], anchors, text_rectangles, pipes)]
+            old_states = [_evaluate(first, first["item"], entries, anchors, text_rectangles, pipes, graphics), _evaluate(second, second["item"], entries, anchors, text_rectangles, pipes, graphics)]
+            new_states = [_evaluate(swapped_first, first["item"], [*others, swapped_second], anchors, text_rectangles, pipes, graphics), _evaluate(swapped_second, second["item"], [*others, swapped_first], anchors, text_rectangles, pipes, graphics)]
             old_key = (sum(state["hard"][0] for state in old_states), sum(state["hard"][1] for state in old_states), sum(state["soft"] for state in old_states))
             new_key = (sum(state["hard"][0] for state in new_states), sum(state["hard"][1] for state in new_states), sum(state["soft"] for state in new_states))
             if new_key < old_key:
@@ -547,13 +583,22 @@ def _congestion(item, anchors, text_rectangles, pipes) -> float:
     return near_anchors * 8 + near_text * 3 + near_pipes
 
 
-def reflow_label_positions(pages: list[dict[str, Any]]) -> dict[str, int]:
+def reflow_label_positions(
+    pages: list[dict[str, Any]],
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> dict[str, int]:
     totals = {"moved": 0, "placed": 0, "remainingCollisions": 0, "repairPasses": 0}
-    for page in pages or []:
+    page_list = pages or []
+    for page_index, page in enumerate(page_list):
         items = [item for item in page.get("candidates") or [] if item.get("included", True) is not False]
         anchors = [(float(item.get("x") or 0), float(item.get("y") or 0), item.get("id")) for item in items]
-        text_rectangles, pipes = _parse_obstacles(page)
+        text_rectangles, pipes, graphics = _parse_obstacles(page)
         page_width, page_height = float(page.get("width") or 1), float(page.get("height") or 1)
+        raw_region = (page.get("layoutObstacles") or {}).get("mainGraphicRegion") or {}
+        layout_bounds = {"left": max(0.0, float(raw_region.get("left", 0))), "top": max(0.0, float(raw_region.get("top", 0))),
+                         "right": min(page_width, float(raw_region.get("right", page_width))), "bottom": min(page_height, float(raw_region.get("bottom", page_height)))}
+        for item in items:
+            item["_layoutBounds"] = layout_bounds
         focus_bounds = (
             min((point[0] for point in anchors), default=0), min((point[1] for point in anchors), default=0),
             max((point[0] for point in anchors), default=0), max((point[1] for point in anchors), default=0),
@@ -564,13 +609,13 @@ def reflow_label_positions(pages: list[dict[str, Any]]) -> dict[str, int]:
         items.sort(key=lambda item: (-_congestion(item, anchors, text_rectangles, pipes), float(item.get("y") or 0), float(item.get("x") or 0)))
         entries: list[dict[str, Any]] = []
         for item in items:
-            best = _best_position(item, page_width, page_height, pipes, entries, anchors, text_rectangles, long_pipe_groups.get(id(item)), use_perimeter, focus_bounds)
+            best = _best_position(item, page_width, page_height, pipes, entries, anchors, text_rectangles, graphics, long_pipe_groups.get(id(item)), use_perimeter, focus_bounds)
             if best:
                 best.update({"id": item.get("id"), "item": item})
                 entries.append(best)
         for repair_index in range(MAX_REPAIR_PASSES):
-            untangled = _untangle_crossed_leaders(entries, anchors, text_rectangles, pipes)
-            conflicted = [(state["hardCount"], entry) for entry in entries if (state := _evaluate(entry, entry["item"], entries, anchors, text_rectangles, pipes))["hardCount"]]
+            untangled = _untangle_crossed_leaders(entries, anchors, text_rectangles, pipes, graphics)
+            conflicted = [(state["hardCount"], entry) for entry in entries if (state := _evaluate(entry, entry["item"], entries, anchors, text_rectangles, pipes, graphics))["hardCount"]]
             if not conflicted:
                 break
             totals["repairPasses"] = max(totals["repairPasses"], repair_index + 1)
@@ -578,17 +623,34 @@ def reflow_label_positions(pages: list[dict[str, Any]]) -> dict[str, int]:
             repair_count = max(1, math.ceil(len(entries) * REOPTIMIZE_FRACTION))
             for _, entry in sorted(conflicted, key=lambda pair: (-pair[0], -pair[1].get("soft", 0)))[:repair_count]:
                 others = [other for other in entries if other is not entry]
-                replacement = _best_position(entry["item"], page_width, page_height, pipes, others, anchors, text_rectangles, long_pipe_groups.get(id(entry["item"])), use_perimeter, focus_bounds)
-                old_state = _evaluate(entry, entry["item"], others, anchors, text_rectangles, pipes)
+                replacement = _best_position(entry["item"], page_width, page_height, pipes, others, anchors, text_rectangles, graphics, long_pipe_groups.get(id(entry["item"])), use_perimeter, focus_bounds)
+                old_state = _evaluate(entry, entry["item"], others, anchors, text_rectangles, pipes, graphics)
                 if replacement and (replacement["hard"], replacement["soft"]) < (old_state["hard"], old_state["soft"]):
                     replacement.update({"id": entry["id"], "item": entry["item"]})
                     entries[entries.index(entry)] = replacement
                     changed = True
             if not changed:
                 break
+        # Joint neighbourhood compaction: after greedy placement, revisit long
+        # leaders with all neighbours present. Accept only lexicographically
+        # better hard-collision / length / soft-score states.
+        for _ in range(2):
+            changed = False
+            for entry in sorted(list(entries), key=lambda value: value["distance"], reverse=True):
+                others = [other for other in entries if other is not entry]
+                replacement = _best_position(entry["item"], page_width, page_height, pipes, others, anchors, text_rectangles, graphics, long_pipe_groups.get(id(entry["item"])), use_perimeter, focus_bounds)
+                if not replacement:
+                    continue
+                old_state = _evaluate(entry, entry["item"], others, anchors, text_rectangles, pipes, graphics)
+                if (replacement["hardCount"], replacement.get("visualClutter", 0), round(replacement["distance"], 6), replacement["soft"]) < (old_state["hardCount"], old_state.get("visualClutter", 0), round(entry["distance"], 6), old_state["soft"]):
+                    replacement.update({"id": entry["id"], "item": entry["item"], "selectionStage": f"neighbourhood-{replacement.get('selectionStage', 'compact')}"})
+                    entries[entries.index(entry)] = replacement
+                    changed = True
+            if not changed:
+                break
         for entry in entries:
             item = entry["item"]
-            final_state = _evaluate(entry, item, entries, anchors, text_rectangles, pipes)
+            final_state = _evaluate(entry, item, entries, anchors, text_rectangles, pipes, graphics)
             item.update({
                 "labelX": entry["x"], "labelY": entry["y"], "labelXNorm": entry["x"] / page_width, "labelYNorm": entry["y"] / page_height,
                 "layoutDiagnostics": {
@@ -608,12 +670,18 @@ def reflow_label_positions(pages: list[dict[str, Any]]) -> dict[str, int]:
             if math.hypot(entry["x"] - originals[id(item)][0], entry["y"] - originals[id(item)][1]) > 2:
                 totals["moved"] += 1
             totals["remainingCollisions"] += final_state["hardCount"]
+            item.pop("_layoutBounds", None)
+        if progress_callback:
+            progress_callback(page_index + 1, len(page_list))
     return totals
 
 
-def optimize_result_label_positions(result: dict[str, Any]) -> dict[str, int]:
+def optimize_result_label_positions(
+    result: dict[str, Any],
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> dict[str, int]:
     result.pop("labelLayout", None)
-    return reflow_label_positions(result.get("pages") or [])
+    return reflow_label_positions(result.get("pages") or [], progress_callback=progress_callback)
 
 
 def inspect_result_label_positions(result: dict[str, Any]) -> dict[str, Any]:
@@ -624,7 +692,7 @@ def inspect_result_label_positions(result: dict[str, Any]) -> dict[str, Any]:
     for page in result.get("pages") or []:
         items = [item for item in page.get("candidates") or [] if item.get("included", True) is not False]
         anchors = [(float(item.get("x") or 0), float(item.get("y") or 0), item.get("id")) for item in items]
-        text_rectangles, pipes = _parse_obstacles(page)
+        text_rectangles, pipes, graphics = _parse_obstacles(page)
         entries = []
         for item in items:
             width, height, frame = _dimensions(item)
@@ -640,7 +708,7 @@ def inspect_result_label_positions(result: dict[str, Any]) -> dict[str, Any]:
             })
         page_total = 0
         for entry in entries:
-            state = _evaluate(entry, entry["item"], entries, anchors, text_rectangles, pipes)
+            state = _evaluate(entry, entry["item"], entries, anchors, text_rectangles, pipes, graphics)
             page_total += state["hardCount"]
             if state["hardCount"]:
                 collision_details.append({"page": page.get("page"), "id": entry["id"], "hard": state["hard"], "detail": state["hardDetail"]})

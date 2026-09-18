@@ -131,7 +131,7 @@ class LabelLayoutTests(unittest.TestCase):
 
         item = page["candidates"][0]
         self.assertEqual(item["layoutDiagnostics"]["selectionStage"], "strict-perpendicular")
-        self.assertAlmostEqual(item["layoutDiagnostics"]["lineLength"], 20 * 140 / 56.7, delta=0.01)
+        self.assertAlmostEqual(item["layoutDiagnostics"]["lineLength"], math.hypot(10, 10) + 12, delta=0.01)
         self.assertAlmostEqual(item["labelX"], item["x"], delta=0.01)
 
     def test_perimeter_mode_uses_local_pipe_band_before_spokes(self) -> None:
@@ -161,6 +161,50 @@ class LabelLayoutTests(unittest.TestCase):
         totals = layout.reflow_label_positions([page])
 
         self.assertEqual(totals["remainingCollisions"], 0)
+
+    def test_main_graphic_region_is_a_hard_boundary_for_every_marker(self) -> None:
+        layout = importlib.import_module("label_layout")
+        page = {"page": 1, "width": 900, "height": 600, "candidates": [
+            {"id": f"bounded-{index}", "number": str(index + 1), "x": 300 + index * 15, "y": 250, "included": True,
+             "markerStyle": {"shape": "circle", "frameSize": 28, "fontSize": 15}} for index in range(9)
+        ], "layoutObstacles": {"textRects": [], "processSegments": [{"start": [220, 250], "end": [520, 250]}],
+             "mainGraphicRegion": {"left": 180, "top": 120, "right": 550, "bottom": 430}}}
+        layout.reflow_label_positions([page])
+        for item in page["candidates"]:
+            self.assertGreaterEqual(item["labelX"] - 14, 185)
+            self.assertLessEqual(item["labelX"] + 14, 545)
+            self.assertGreaterEqual(item["labelY"] - 14, 125)
+            self.assertLessEqual(item["labelY"] + 14, 425)
+            self.assertNotIn("_layoutBounds", item)
+
+    def test_marker_frame_avoids_non_pipe_vector_graphics(self) -> None:
+        layout = importlib.import_module("label_layout")
+        page = {"page": 1, "width": 400, "height": 300, "candidates": [
+            {"id": "graphic-safe", "number": "1", "x": 100, "y": 100, "included": True,
+             "markerStyle": {"shape": "circle", "frameSize": 20, "fontSize": 12}},
+        ], "layoutObstacles": {"textRects": [], "processSegments": [], "graphicSegments": [
+            {"start": [125, 55], "end": [125, 180]},
+            {"start": [55, 125], "end": [180, 125]},
+        ]}}
+
+        totals = layout.reflow_label_positions([page])
+
+        item = page["candidates"][0]
+        self.assertEqual(totals["remainingCollisions"], 0)
+        self.assertEqual(item["layoutDiagnostics"]["hardCollisionSummary"]["labelGraphic"], 0)
+        self.assertFalse(item["labelX"] - 12 <= 125 <= item["labelX"] + 12 and item["labelY"] - 12 <= 180 and item["labelY"] + 12 >= 55)
+        self.assertFalse(item["labelY"] - 12 <= 125 <= item["labelY"] + 12 and item["labelX"] - 12 <= 180 and item["labelX"] + 12 >= 55)
+
+    def test_layout_progress_callback_reports_each_completed_page(self) -> None:
+        layout = importlib.import_module("label_layout")
+        pages = [{"page": page_number, "width": 300, "height": 200, "candidates": [],
+                  "layoutObstacles": {"textRects": [], "processSegments": [], "graphicSegments": []}}
+                 for page_number in (1, 2, 3)]
+        reports = []
+
+        layout.reflow_label_positions(pages, progress_callback=lambda completed, total: reports.append((completed, total)))
+
+        self.assertEqual(reports, [(1, 3), (2, 3), (3, 3)])
 
 
 if __name__ == "__main__":

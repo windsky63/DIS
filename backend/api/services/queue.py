@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from http import HTTPStatus
-import json
 from pathlib import Path
 from typing import Any
 
@@ -111,72 +109,80 @@ def review_summary(events: list[dict[str, Any]], pages: list[dict[str, Any]]) ->
 def snapshot(
     store: JobStore,
     data_root: Path,
-    algorithm_version: str,
     max_concurrent: int,
+    *,
+    scope: str = "current",
+    page: int = 1,
+    page_size: int = 20,
 ) -> dict[str, Any]:
-    store.import_existing(data_root, algorithm_version)
-    records = store.list_jobs()
-    queued_ids = [str(item["job_id"]) for item in records if item["status"] == "queued"]
+    scope = "archived" if scope == "archived" else "current"
+    page = max(1, int(page))
+    page_size = min(100, max(1, int(page_size)))
+    queue_page = store.list_queue_page(scope, page, page_size)
+    records = queue_page["records"]
+    queued_ids = queue_page["queuedJobIds"]
     pending_positions = {job_id: index + 1 for index, job_id in enumerate(queued_ids)}
     running_statuses = {"leased", "processing", "cancelling"}
+    complete_job_ids = [str(record["job_id"]) for record in records if record["status"] == "complete"]
+    pages_by_job = store.get_job_page_summaries_many(complete_job_ids)
+    reviews_by_job = store.page_review_histories(complete_job_ids)
     jobs = []
     for record in records:
         job_id = str(record["job_id"])
-        folder = data_root / job_id
-        result_path, meta_path = folder / "result.json", folder / "job.json"
-        if not result_path.is_file() or not meta_path.is_file():
-            continue
-        try:
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        database_status = str(record.get("status") or result.get("status") or "unknown")
+        summary = record.get("queueSummary") if isinstance(record.get("queueSummary"), dict) else {}
+        database_status = str(record.get("status") or "unknown")
         queue_state = "running" if database_status in running_statuses else database_status
-        pages = result.get("pages") if isinstance(result.get("pages"), list) else []
-        review = review_summary(store.page_review_history(job_id), pages)
-        reference_count = len(meta.get("referenceFiles") or [])
+        pages = pages_by_job.get(job_id, [])
+        review = review_summary(reviews_by_job.get(job_id, []), pages)
+        reference_count = int(summary.get("referenceFileCount") or summary.get("totalReferenceFiles") or 0)
         jobs.append({
             "jobId": job_id,
-            "fileName": meta.get("originalTargetName") or result.get("originalTargetName") or "未命名图纸",
+            "fileName": record.get("original_target_name") or "未命名图纸",
             "status": "processing" if database_status in {"queued", *running_statuses} else database_status,
             "queueState": queue_state,
             "queuePosition": pending_positions.get(job_id),
-            "progressStage": result.get("progressStage"),
-            "progressMessage": result.get("progressMessage") or "",
-            "completedPages": int(result.get("completedPages") or 0),
-            "totalPages": int(result.get("totalPages") or 0),
-            "completedReferenceFiles": int(result.get("completedReferenceFiles") or 0),
-            "totalReferenceFiles": int(result.get("totalReferenceFiles") or 0),
+            "progressStage": summary.get("progressStage"),
+            "progressMessage": summary.get("progressMessage") or "",
+            "completedPages": int(summary.get("completedPages") or 0),
+            "totalPages": int(summary.get("totalPages") or 0),
+            "completedReferenceFiles": int(summary.get("completedReferenceFiles") or 0),
+            "totalReferenceFiles": int(summary.get("totalReferenceFiles") or 0),
+            "layoutCompletedPages": int(summary.get("layoutCompletedPages") or 0),
+            "layoutTotalPages": int(summary.get("layoutTotalPages") or 0),
             "drawingCount": 1 + reference_count,
             "designDrawingCount": 1,
             "referenceDrawingCount": reference_count,
-            "pageCount": int(result.get("totalPages") or len(pages)),
-            "project": meta.get("project") or result.get("project") or {},
+            "pageCount": int(summary.get("totalPages") or len(pages)),
+            "project": summary.get("project") or {},
             **review,
-            "progressCompletedUnits": float(result.get("progressCompletedUnits") or 0),
-            "progressTotalUnits": float(result.get("progressTotalUnits") or 0),
-            "progressPercent": result_progress_percent(result),
-            "createdAt": meta.get("createdAt") or result.get("createdAt"),
-            "createdBy": record.get("createdBy") or meta.get("createdBy") or result.get("createdBy"),
-            "updatedAt": result.get("updatedAt") or datetime.fromtimestamp(result_path.stat().st_mtime).isoformat(timespec="seconds"),
-            "archivedAt": record.get("archived_at") or meta.get("archivedAt"),
-            "isArchived": bool(record.get("archived_at") or meta.get("archivedAt")),
-            "canRestore": database_status == "complete" and bool(result.get("pages")),
+            "progressCompletedUnits": float(summary.get("progressCompletedUnits") or 0),
+            "progressTotalUnits": float(summary.get("progressTotalUnits") or 0),
+            "progressPercent": result_progress_percent({**summary, "status": database_status}),
+            "createdAt": summary.get("createdAt") or record.get("created_at"),
+            "createdBy": record.get("createdBy"),
+            "updatedAt": record.get("updated_at") or summary.get("updatedAt"),
+            "archivedAt": record.get("archived_at"),
+            "isArchived": bool(record.get("archived_at")),
+            "canRestore": database_status == "complete" and bool(pages),
             "canCancel": database_status in {"queued", *running_statuses},
             "canReorder": database_status == "queued",
             "canArchive": database_status == "complete",
             "canDelete": database_status == "complete",
         })
-    live = [item for item in jobs if item["queueState"] in {"running", "queued"}]
-    live.sort(key=lambda item: (0 if item["queueState"] == "running" else 1, item.get("queuePosition") or 0))
-    terminal = [item for item in jobs if item["queueState"] not in {"running", "queued"}]
-    terminal.sort(key=lambda item: str(item.get("updatedAt") or ""), reverse=True)
     return {
-        "jobs": live + terminal,
-        "runningCount": sum(item["status"] in running_statuses for item in records),
-        "queuedCount": len(pending_positions),
+        "jobs": jobs,
+        "runningCount": queue_page["runningCount"],
+        "queuedCount": queue_page["queuedCount"],
+        "archivedCount": queue_page["archivedCount"],
+        "currentCount": queue_page["currentCount"],
         "maxConcurrent": max_concurrent,
+        "pagination": {
+            "scope": scope,
+            "page": queue_page["page"],
+            "pageSize": queue_page["pageSize"],
+            "totalItems": queue_page["totalItems"],
+            "totalPages": queue_page["totalPages"],
+        },
     }
 
 

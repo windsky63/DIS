@@ -1,7 +1,10 @@
 import { computed, ref, watch } from 'vue'
+import { isSpecialMarker } from '../numbering.js'
 
-export function useRegionDeletion({ pageData, canvasSurface, canvasLayout, readOnly, manualAddMode, selectedId, swapSourceId, editingId, operations }) {
+export function useRegionDeletion({ pageData, canvasSurface, canvasLayout, readOnly, manualAddMode, manualAddType = ref('all'), selectedId, swapSourceId, editingId, operations }) {
   const active = ref(false)
+  const deletionType = computed(() => manualAddMode.value && manualAddType.value !== 'all' ? manualAddType.value : 'all')
+  const scopeLabel = computed(() => ({ weld: '焊口', valve: '阀门', flange: '法兰', support: '支架', all: '全部标识' })[deletionType.value] || '全部标识')
   const selection = ref(null)
   let capturedElement = null
   const rectangle = computed(() => {
@@ -31,10 +34,9 @@ export function useRegionDeletion({ pageData, canvasSurface, canvasLayout, readO
   function toggle() {
     if (active.value) { exit(); return }
     if (!pageData.value || readOnly.value) return
-    manualAddMode.value = false
     editingId.value = ''
     active.value = true
-    operations.showNotice('区域删除：按住左键拖框，删除定位点在框内的标识；Esc 退出，Ctrl+Z 撤销。')
+    operations.showNotice(`区域删除（${scopeLabel.value}）：按住左键拖框，删除定位点在框内的对应标识；Esc 退出，Ctrl+Z 撤销。`)
   }
   function point(event, clamp = false) {
     const bounds = canvasSurface.value?.getBoundingClientRect()
@@ -51,7 +53,7 @@ export function useRegionDeletion({ pageData, canvasSurface, canvasLayout, readO
     event.preventDefault(); event.stopPropagation()
     const start = point(event)
     if (!start) return
-    selection.value = { pointerId: event.pointerId, start, end: start, clientX: event.clientX, clientY: event.clientY, page: pageData.value }
+    selection.value = { pointerId: event.pointerId, start, end: start, clientX: event.clientX, clientY: event.clientY, page: pageData.value, type: deletionType.value }
     capturedElement = event.currentTarget
     capturedElement.setPointerCapture?.(event.pointerId)
   }
@@ -65,10 +67,12 @@ export function useRegionDeletion({ pageData, canvasSurface, canvasLayout, readO
     if (!value || value.pointerId !== event.pointerId) return
     move(event)
     const rect = rectangle.value
-    if (!readOnly.value && pageData.value === value.page &&
+    if (!readOnly.value && pageData.value === value.page && deletionType.value === value.type &&
       Math.abs(event.clientX - value.clientX) >= 4 && Math.abs(event.clientY - value.clientY) >= 4) {
       const page = value.page
       const removed = page.candidates.filter(item => {
+        const type = isSpecialMarker(item) ? 'special' : (item.componentType || 'weld')
+        if (value.type !== 'all' && type !== value.type) return false
         const x = item.xNorm ?? item.x / page.width
         const y = item.yNorm ?? item.y / page.height
         return x >= rect.left && x <= rect.left + rect.width && y >= rect.top && y <= rect.top + rect.height
@@ -83,12 +87,12 @@ export function useRegionDeletion({ pageData, canvasSurface, canvasLayout, readO
         operations.commitHistory()
         operations.logAudit('marker.region_deleted', { page: page.page, ids: [...ids], count: removed.length })
         operations.showNotice(`已删除 ${removed.length} 个标识，可使用 Ctrl+Z 撤销；Esc 退出区域删除。`)
-      } else operations.showNotice('区域内没有标识。')
+      } else operations.showNotice(`区域内没有${scopeLabel.value}。`)
     }
     cancelSelection()
   }
   watch(pageData, exit)
   watch(readOnly, value => { if (value) exit() })
-  watch(manualAddMode, value => { if (value) exit() })
-  return { active, rectangle, rectangleStyle, toggle, exit, start, move, finish, cancelSelection }
+  watch([manualAddMode, manualAddType], cancelSelection, { flush: 'sync' })
+  return { active, scopeLabel, rectangle, rectangleStyle, toggle, exit, start, move, finish, cancelSelection }
 }

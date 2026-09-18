@@ -27,7 +27,7 @@ test('failed restore and logout clear the current user', async () => {
   assert.equal(auth.status.value, 'anonymous')
 })
 
-test('register and login expose validation errors without storing tokens', async () => {
+test('register and login expose validation errors and login forwards cookie persistence choice', async () => {
   const calls = []
   const client = {
     register: async payload => { calls.push(['register', payload]); return { user: { username: payload.username } } },
@@ -36,8 +36,12 @@ test('register and login expose validation errors without storing tokens', async
   const auth = useAuthSession({ client })
   await assert.rejects(() => auth.register('ab', 'correct-horse-battery'), /3 到 40/)
   await auth.register('alice', 'correct-horse-battery')
+  await auth.login('alice', 'correct-horse-battery', true)
   assert.equal(auth.status.value, 'authenticated')
   assert.deepEqual(calls[0], ['register', { username: 'alice', password: 'correct-horse-battery' }])
+  assert.deepEqual(calls[1], ['login', {
+    username: 'alice', password: 'correct-horse-battery', rememberPassword: true,
+  }])
 })
 
 test('authentication errors can be cleared when switching forms', async () => {

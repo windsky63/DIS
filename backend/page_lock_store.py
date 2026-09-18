@@ -25,7 +25,7 @@ class PageLockStore:
         path: Path,
         *,
         now: Callable[[], float] = time.time,
-        lease_seconds: int = 90,
+        lease_seconds: int = 180,
     ) -> None:
         self.path = Path(path)
         self._now = now
@@ -229,3 +229,13 @@ class PageLockStore:
                 (job_id, int(page), user_id, client_instance_id, self._token_hash(token)),
             )
         return deleted.rowcount == 1
+
+    def release_user(self, user_id: str) -> int:
+        if not str(user_id).strip():
+            return 0
+        with self._connection() as connection:
+            deleted = connection.execute(
+                "DELETE FROM page_locks WHERE owner_user_id = ?",
+                (str(user_id),),
+            )
+        return deleted.rowcount

@@ -95,6 +95,10 @@ export function useDetachedReferenceWindow({
     if (detached.value) post('reference-state', payload)
   }
 
+  function locateHint(focus) {
+    if (detached.value) post('locate-hint', focus)
+  }
+
   function close({ restoreEmbedded = true } = {}) {
     if (!detached.value && !popup) return
     post('parent-closing')
@@ -109,5 +113,5 @@ export function useDetachedReferenceWindow({
     latestPayload = null
   }
 
-  return { detached, connected, open, publish, close, dispose }
+  return { detached, connected, open, publish, locateHint, close, dispose }
 }

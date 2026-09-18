@@ -28,11 +28,11 @@ export function useAuthSession({ client }) {
     }
   }
 
-  async function submit(method, username, password) {
+  async function submit(method, username, password, extra = {}) {
     error.value = ''
     submitting.value = true
     try {
-      const response = await client[method](validate(username, password))
+      const response = await client[method]({ ...validate(username, password), ...extra })
       user.value = response.user
       status.value = 'authenticated'
       return response.user
@@ -44,7 +44,9 @@ export function useAuthSession({ client }) {
     }
   }
 
-  const login = (username, password) => submit('login', username, password)
+  const login = (username, password, rememberPassword = false) => submit(
+    'login', username, password, { rememberPassword: Boolean(rememberPassword) },
+  )
   const register = (username, password) => submit('register', username, password)
 
   async function logout() {

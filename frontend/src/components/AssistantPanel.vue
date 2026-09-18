@@ -9,6 +9,7 @@ import {
 import { resizeComposerTextarea, shouldSubmitComposer } from '../assistantComposer'
 import { renderAssistantMarkdown } from '../assistantMarkdown'
 import { assistantConfigurationAlert, replaceQuickStart, selectQuickStarts, visibleAssistantError } from '../assistantPresentation'
+import { assistantQuickStartPool } from '../assistantQuickStarts'
 import { createStreamingAssistantMessage } from '../assistantStreamState'
 import AssistantRetrievalDetails from './AssistantRetrievalDetails.vue'
 
@@ -35,20 +36,7 @@ let persistenceChain = Promise.resolve()
 const activeConversation = computed(() => conversations.value.find(item => item.id === activeId.value) || conversations.value[0])
 const displayedError = computed(() => visibleAssistantError(configuration.value.configured, error.value))
 const configurationAlert = computed(() => assistantConfigurationAlert(configuration.value.configured))
-const quickStartPool = [
-  '如何开始识别？',
-  '怎样选择对照资料？',
-  '如何核对识别结果？',
-  '怎样保存和导出？',
-  '如何推入解析队列？',
-  '怎样恢复已完成的任务？',
-  '如何调整标识框和引线？',
-  '怎样新增遗漏的标识？',
-  '如何修改标识编号？',
-  '怎样撤销或重做操作？',
-  '如何调整各类标识外观？',
-  '怎样归档或删除解析任务？',
-]
+const quickStartPool = assistantQuickStartPool
 const quickStarts = ref(selectQuickStarts(quickStartPool))
 
 function persist() {

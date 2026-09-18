@@ -107,7 +107,7 @@ test('strict perpendicular stage selects the shortest reference length', () => {
   reflowLabelPositions([page], () => ({ shape: 'circle', frameSize: 20, fontSize: 12 }))
   const item = page.candidates[0]
   assert.equal(item.layoutDiagnostics.selectionStage, 'strict-perpendicular')
-  assert.ok(Math.abs(item.layoutDiagnostics.lineLength - 20 * 140 / 56.7) < .01)
+  assert.ok(Math.abs(item.layoutDiagnostics.lineLength - (Math.hypot(10, 10) + 12)) < .01)
   assert.ok(Math.abs(item.labelX - item.x) < .01)
 })
 
@@ -129,4 +129,32 @@ test('foreign source anchor proximity stays a soft penalty like the reference en
   ], layoutObstacles: { textRects: [], processSegments: [] } }
   const totals = reflowLabelPositions([page], () => ({ shape: 'circle', frameSize: 20, fontSize: 12 }))
   assert.equal(totals.remainingCollisions, 0)
+})
+
+test('all marker frames stay inside the identified main graphic region', () => {
+  const page = { width: 900, height: 600, candidates: Array.from({ length: 9 }, (_, index) => ({
+    id: `bounded-${index}`, number: String(index + 1), x: 300 + index * 15, y: 250, included: true,
+  })), layoutObstacles: { textRects: [], processSegments: [{ start: [220, 250], end: [520, 250] }],
+    mainGraphicRegion: { left: 180, top: 120, right: 550, bottom: 430 } } }
+  reflowLabelPositions([page], () => ({ shape: 'circle', frameSize: 28, fontSize: 15 }))
+  for (const item of page.candidates) {
+    assert.ok(item.labelX - 14 >= 185 && item.labelX + 14 <= 545)
+    assert.ok(item.labelY - 14 >= 125 && item.labelY + 14 <= 425)
+    assert.equal('_layoutBounds' in item, false)
+  }
+})
+
+test('marker frame avoids ordinary vector graphics as hard obstacles', () => {
+  const page = { width: 400, height: 300, candidates: [
+    { id: 'graphic-safe', number: '1', x: 100, y: 100, included: true },
+  ], layoutObstacles: { textRects: [], processSegments: [], graphicSegments: [
+    { start: [125, 55], end: [125, 180] },
+    { start: [55, 125], end: [180, 125] },
+  ] } }
+  const totals = reflowLabelPositions([page], () => ({ shape: 'circle', frameSize: 20, fontSize: 12 }))
+  const item = page.candidates[0]
+  assert.equal(totals.remainingCollisions, 0)
+  assert.equal(item.layoutDiagnostics.hardCollisionSummary.labelGraphic, 0)
+  assert.equal(item.labelX - 12 <= 125 && item.labelX + 12 >= 125 && item.labelY - 12 <= 180 && item.labelY + 12 >= 55, false)
+  assert.equal(item.labelY - 12 <= 125 && item.labelY + 12 >= 125 && item.labelX - 12 <= 180 && item.labelX + 12 >= 55, false)
 })

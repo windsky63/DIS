@@ -1,27 +1,14 @@
 import { createApp } from 'vue'
 import { createVuetify } from 'vuetify'
-import {
-  VAlert, VApp, VAppBar, VAppBarTitle, VBtn, VBtnToggle, VCard, VCardActions,
-  VCardText, VCardTitle, VChip, VContainer, VDialog, VDivider, VFileInput, VList,
-  VListItem, VListItemTitle, VMain, VMenu, VNavigationDrawer, VProgressCircular,
-  VForm, VProgressLinear, VSelect, VSlider, VSnackbar, VSpacer, VTab, VTabs,
-  VSwitch, VTextField, VToolbar, VTooltip
-} from 'vuetify/components'
 import { Ripple } from 'vuetify/directives'
 import 'vuetify/styles'
-import App from './App.vue'
 import ReferenceWindowApp from './components/ReferenceWindowApp.vue'
+import RouterRoot from './RouterRoot.vue'
+import { router } from './router.js'
 import './style.css'
 import { APP_THEMES, loadThemePreference, resolveThemeName } from './themePreferences.js'
 
 const vuetify = createVuetify({
-  components: {
-    VAlert, VApp, VAppBar, VAppBarTitle, VBtn, VBtnToggle, VCard, VCardActions,
-    VCardText, VCardTitle, VChip, VContainer, VDialog, VDivider, VFileInput, VList,
-    VListItem, VListItemTitle, VMain, VMenu, VNavigationDrawer, VProgressCircular,
-    VForm, VProgressLinear, VSelect, VSlider, VSnackbar, VSpacer, VTab, VTabs,
-    VSwitch, VTextField, VToolbar, VTooltip
-  },
   directives: { Ripple },
   theme: {
     defaultTheme: resolveThemeName(loadThemePreference()),
@@ -36,8 +23,9 @@ const vuetify = createVuetify({
   }
 })
 
-const rootComponent = new URLSearchParams(window.location.search).get('view') === 'reference'
-  ? ReferenceWindowApp
-  : App
+const referenceWindow = new URLSearchParams(window.location.search).get('view') === 'reference'
+const rootComponent = referenceWindow ? ReferenceWindowApp : RouterRoot
+const app = createApp(rootComponent).use(vuetify)
 
-createApp(rootComponent).use(vuetify).mount('#app')
+if (!referenceWindow) app.use(router)
+app.mount('#app')

@@ -9,6 +9,20 @@ from backend.page_lock_store import PageLockConflict, PageLockStore
 
 
 class PageLockStoreTests(unittest.TestCase):
+    def test_default_lease_is_180_seconds_and_heartbeat_extends_it(self) -> None:
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as folder_name:
+            store = PageLockStore(Path(folder_name) / 'jobs.db', now=lambda: now[0])
+            store.initialize()
+            lock = store.acquire('job', 1, 'user', 'tester', 'tab')
+            self.assertEqual(store.lease_seconds, 180)
+            now[0] += 179
+            store.refresh('job', 1, 'user', 'tab', lock['lockToken'])
+            now[0] += 179
+            self.assertIsNotNone(store.get('job', 1))
+            now[0] += 2
+            self.assertIsNone(store.get('job', 1))
+
     def test_second_browser_cannot_acquire_active_page_even_for_same_user(self) -> None:
         now = [1_000.0]
         with tempfile.TemporaryDirectory() as folder_name:
@@ -55,6 +69,19 @@ class PageLockStoreTests(unittest.TestCase):
             self.assertFalse(store.release("job", 7, "user-1", "tab-a", "wrong"))
             self.assertTrue(store.release("job", 7, "user-1", "tab-a", lock["lockToken"]))
             self.assertIsNone(store.get("job", 7))
+
+    def test_new_login_can_release_every_lock_owned_by_the_account(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            store = PageLockStore(Path(folder_name) / "jobs.db")
+            store.initialize()
+            store.acquire("job-a", 1, "user-1", "张三", "tab-a")
+            store.acquire("job-b", 2, "user-1", "张三", "tab-a")
+            store.acquire("job-a", 3, "user-2", "李四", "tab-b")
+
+            self.assertEqual(store.release_user("user-1"), 2)
+            self.assertIsNone(store.get("job-a", 1))
+            self.assertIsNone(store.get("job-b", 2))
+            self.assertIsNotNone(store.get("job-a", 3))
 
     def test_different_pages_are_listed_for_concurrent_reviewers(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:

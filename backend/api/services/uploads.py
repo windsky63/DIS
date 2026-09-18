@@ -1,8 +1,7 @@
-"""Upload staging, validation, and legacy Base64 compatibility services."""
+"""Upload staging, validation, and consumption services."""
 
 from __future__ import annotations
 
-import base64
 from datetime import datetime
 from http import HTTPStatus
 import hashlib
@@ -23,39 +22,6 @@ JOB_ID = re.compile(r"^[a-f0-9]{32}$")
 def safe_name(value: str, fallback: str) -> str:
     cleaned = Path(str(value or "")).name.strip()
     return cleaned or fallback
-
-
-def decode_file(payload: dict[str, Any] | None, folder: Path, fallback: str) -> Path | None:
-    if not payload:
-        return None
-    encoded = payload.get("dataBase64")
-    if not isinstance(encoded, str) or not encoded:
-        raise ValueError(f"{fallback} 缺少文件数据")
-    try:
-        data = base64.b64decode(encoded, validate=True)
-    except Exception as exc:
-        raise ValueError(f"{fallback} 不是有效的 Base64 文件") from exc
-    name = safe_name(payload.get("name"), fallback)
-    suffix = Path(name).suffix.lower() or Path(fallback).suffix
-    path = folder / f"{Path(fallback).stem}{suffix}"
-    path.write_bytes(data)
-    return path
-
-
-def decode_files(payloads: Any, folder: Path, prefix: str, default_suffix: str = ".pdf") -> list[Path]:
-    if payloads is None:
-        return []
-    if not isinstance(payloads, list):
-        raise ValueError(f"{prefix}文件列表格式无效")
-    result = []
-    for index, payload in enumerate(payloads, start=1):
-        path = decode_file(payload, folder, f"{prefix}-{index:03d}{default_suffix}")
-        if path:
-            original_name = safe_name(payload.get("name") if isinstance(payload, dict) else "", path.name)
-            destination = folder / f"{prefix}-{index:03d}__{original_name}"
-            path.replace(destination)
-            result.append(destination)
-    return result
 
 
 def upload_record(upload_root: Path, upload_id: str) -> tuple[Path, dict[str, Any]]:

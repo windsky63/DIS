@@ -7,12 +7,14 @@ import json
 from pathlib import Path
 import sys
 
+import fitz
+
 
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from engine import analyze_documents, dump_result  # noqa: E402
+from engine import analyze_documents, dump_result, _layout_obstacles  # noqa: E402
 from label_layout import optimize_result_label_positions  # noqa: E402
 
 
@@ -43,6 +45,40 @@ def number_result(result: dict) -> None:
                 counters["weld"] += 1
 
 
+def refresh_layout_obstacles(result: dict) -> None:
+    """Keep bundled tutorial layout boundaries in sync with the engine."""
+    by_page = {int(page.get("page") or 0): page for page in result.get("pages", [])}
+    with fitz.open(PDF_PATH) as document:
+        for page_number, target in by_page.items():
+            if not 1 <= page_number <= document.page_count:
+                continue
+            cached = (target.get("layoutObstacles") or {}).get("processSegments") or []
+            target["layoutObstacles"] = _layout_obstacles(
+                document[page_number - 1], {"strong_process_segments": cached}
+            )
+
+
+def reset_cached_label_positions(result: dict) -> None:
+    """Force bundled tutorial data to use the current layout algorithm.
+
+    Production reflow deliberately preserves most existing coordinates so a
+    user's manual adjustments do not jump.  A rebuilt tutorial cache is a
+    different case: its coordinates are generated data, so retaining them
+    would mix two algorithm versions.
+    """
+    layout_keys = (
+        "labelX",
+        "labelY",
+        "labelXNorm",
+        "labelYNorm",
+        "layoutDiagnostics",
+    )
+    for page in result.get("pages", []):
+        for candidate in page.get("candidates", []):
+            for key in layout_keys:
+                candidate.pop(key, None)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--number-only", action="store_true")
@@ -59,6 +95,8 @@ def main() -> None:
             progress_callback=print,
         )
     number_result(result)
+    refresh_layout_obstacles(result)
+    reset_cached_label_positions(result)
     result.update({
         "status": "complete",
         "completedPages": len(result.get("pages", [])),

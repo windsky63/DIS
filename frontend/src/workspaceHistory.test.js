@@ -67,3 +67,74 @@ test('workspace history ignores commits without changes', () => {
   history.commit()
   assert.equal(history.canUndo.value, false)
 })
+
+test('workspace history keeps only the 30 most recent page edits', () => {
+  const result = ref({ pages: [{ page: 1, candidates: [{ id: 'w1', number: '0' }] }] })
+  const pages = computed(() => result.value.pages)
+  const history = useWorkspaceHistory({
+    result,
+    pages,
+    pageData: computed(() => pages.value[0]),
+    markerStyle: ref({}),
+    componentMarkerStyles: ref({}),
+    projectResults: ref([result.value]),
+    activeProjectIndex: ref(0),
+    selectedId: ref(''),
+    cloneValue: value => JSON.parse(JSON.stringify(value)),
+    scheduleSave() {},
+    showNotice() {},
+    logAudit() {},
+  })
+
+  for (let edit = 1; edit <= 31; edit += 1) {
+    history.begin(`edit ${edit}`)
+    result.value.pages[0].candidates[0].number = String(edit)
+    history.commit()
+  }
+
+  assert.equal(history.undoStack.value.length, 30)
+  assert.equal(history.undoStack.value[0].value.candidates[0].number, '1')
+})
+
+test('workspace history caps snapshots across every page in the task', () => {
+  const currentPage = ref(1)
+  const result = ref({ jobId: 'large-task', pages: Array.from({ length: 5 }, (_, index) => ({
+    page: index + 1,
+    candidates: [{ id: `w${index + 1}`, number: '0' }],
+  })) })
+  const pages = computed(() => result.value.pages)
+  const pageData = computed(() => pages.value.find(page => page.page === currentPage.value))
+  const history = useWorkspaceHistory({
+    result,
+    pages,
+    pageData,
+    markerStyle: ref({}),
+    componentMarkerStyles: ref({}),
+    projectResults: ref([result.value]),
+    activeProjectIndex: ref(0),
+    selectedId: ref(''),
+    cloneValue: value => JSON.parse(JSON.stringify(value)),
+    scheduleSave() {},
+    showNotice() {},
+    logAudit() {},
+    taskLimit: 3,
+  })
+
+  for (let page = 1; page <= 5; page += 1) {
+    currentPage.value = page
+    history.begin(`edit page ${page}`)
+    pageData.value.candidates[0].number = String(page)
+    history.commit()
+  }
+
+  currentPage.value = 1
+  assert.equal(history.canUndo.value, false)
+  currentPage.value = 2
+  assert.equal(history.canUndo.value, false)
+  currentPage.value = 3
+  assert.equal(history.canUndo.value, true)
+  currentPage.value = 4
+  assert.equal(history.canUndo.value, true)
+  currentPage.value = 5
+  assert.equal(history.canUndo.value, true)
+})

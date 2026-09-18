@@ -5,6 +5,7 @@ releases/
 .env
 backend/PCF/
 data/jobs/
+data/legacy-jobs/
 data/uploads/
 data/audit/
 backups/

@@ -63,6 +63,7 @@ class AuthStore:
                     password_hash BLOB NOT NULL,
                     password_salt BLOB NOT NULL,
                     password_parameters TEXT NOT NULL,
+                    is_admin INTEGER NOT NULL DEFAULT 0,
                     disabled INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     last_login_at TEXT
@@ -78,6 +79,13 @@ class AuthStore:
                 CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
                 """
             )
+            connection.execute(
+                "DELETE FROM sessions WHERE rowid NOT IN (SELECT MAX(rowid) FROM sessions GROUP BY user_id)"
+            )
+            connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS sessions_user ON sessions(user_id)")
+            columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(users)")}
+            if "is_admin" not in columns:
+                connection.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
 
     @staticmethod
     def _public_user(row: sqlite3.Row) -> dict[str, object]:
@@ -85,6 +93,7 @@ class AuthStore:
             "userId": str(row["user_id"]),
             "username": str(row["username"]),
             "createdAt": str(row["created_at"]),
+            "isAdmin": bool(row["is_admin"]),
         }
 
     @staticmethod
@@ -104,7 +113,7 @@ class AuthStore:
     def _session_hash(token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    def register(self, username: str, password: str) -> dict[str, object]:
+    def register(self, username: str, password: str, *, is_admin: bool = False) -> dict[str, object]:
         clean_username, username_key = self._validate_registration(username, password)
         user_id = uuid.uuid4().hex
         salt = secrets.token_bytes(16)
@@ -116,8 +125,8 @@ class AuthStore:
                     """
                     INSERT INTO users(
                         user_id, username, username_key, password_hash,
-                        password_salt, password_parameters, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        password_salt, password_parameters, is_admin, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id,
@@ -126,12 +135,18 @@ class AuthStore:
                         password_hash,
                         salt,
                         json.dumps(SCRYPT_PARAMETERS, separators=(",", ":")),
+                        int(bool(is_admin)),
                         created_at,
                     ),
                 )
         except sqlite3.IntegrityError as error:
             raise UsernameTaken("用户名已被注册") from error
-        return {"userId": user_id, "username": clean_username, "createdAt": created_at}
+        return {
+            "userId": user_id,
+            "username": clean_username,
+            "createdAt": created_at,
+            "isAdmin": bool(is_admin),
+        }
 
     def _find_active_user(self, username: str) -> dict[str, object] | None:
         with self._connection() as connection:
@@ -141,12 +156,16 @@ class AuthStore:
             ).fetchone()
         return self._public_user(row) if row is not None else None
 
-    def ensure_default_user(self, username: str, password: str) -> dict[str, object]:
+    def ensure_default_user(self, username: str, password: str, *, is_admin: bool = False) -> dict[str, object]:
         existing = self._find_active_user(username)
         if existing is not None:
+            if is_admin and not existing.get("isAdmin"):
+                with self._connection() as connection:
+                    connection.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (existing["userId"],))
+                return self._find_active_user(username) or existing
             return existing
         try:
-            return self.register(username, password)
+            return self.register(username, password, is_admin=is_admin)
         except UsernameTaken:
             existing = self._find_active_user(username)
             if existing is None:
@@ -178,7 +197,13 @@ class AuthStore:
         with self._connection() as connection:
             connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
             connection.execute(
-                "INSERT INTO sessions(session_hash, user_id, created_at, last_seen_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                """INSERT INTO sessions(session_hash, user_id, created_at, last_seen_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       session_hash=excluded.session_hash,
+                       created_at=excluded.created_at,
+                       last_seen_at=excluded.last_seen_at,
+                       expires_at=excluded.expires_at""",
                 (self._session_hash(token), user_id, now, now, now + self.session_ttl_seconds),
             )
         return token

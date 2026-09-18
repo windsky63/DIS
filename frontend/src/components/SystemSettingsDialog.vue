@@ -1,4 +1,6 @@
 <script setup>
+import { ref } from 'vue'
+
 defineProps({
   themeOptions: { type: Array, default: () => [] },
   canvasPerformanceOptions: { type: Array, default: () => [] },
@@ -30,7 +32,13 @@ const referenceHintLocationOptions = [
   { title: '对照图窗口（默认）', value: 'reference' },
   { title: '设计图窗口', value: 'design' },
 ]
-defineEmits(['open-drafts', 'update-shortcut-modifier', 'capture-shortcut-key', 'restore-default-shortcuts', 'open-symbol-config', 'auto-reference-window-change', 'reference-hint-location-change'])
+const emit = defineEmits(['open-drafts', 'update-shortcut-modifier', 'capture-shortcut-key', 'restore-default-shortcuts', 'auto-reference-window-change', 'reference-hint-location-change', 'normalize-numbering-defaults', 'restore-system-defaults'])
+const restoreConfirmOpen = ref(false)
+
+function confirmRestoreDefaults() {
+  restoreConfirmOpen.value = false
+  emit('restore-system-defaults')
+}
 </script>
 
 <template>
@@ -45,24 +53,40 @@ defineEmits(['open-drafts', 'update-shortcut-modifier', 'capture-shortcut-key', 
         <div class="settings-section"><div class="section-label">画布性能</div><v-select v-model="performanceMode" :items="canvasPerformanceOptions" label="清晰度与内存档位" hide-details class="mb-3" /><div class="canvas-profile-summary"><v-chip size="small" color="secondary" variant="tonal">{{ canvasPerformanceProfile.label }}</v-chip><span>单画布最高 {{ Math.round(canvasPerformanceProfile.maxPixels / 1_000_000) }} 百万像素 · 位图缓存约 {{ Math.round(canvasPerformanceProfile.cacheBytes / 1024 / 1024) }} MB</span></div><div class="shortcut-settings__hint mt-2">自动模式依据设备内存、CPU 核心数和触控屏尺寸选择；也可手动固定档位，选择后立即生效。</div></div>
         <div class="settings-section">
           <div class="section-label">标识默认设置</div>
-          <v-text-field v-model.number="manualLeaderLength" type="number" min="20" max="240" step="4" label="新增标识引线长度" suffix="图纸单位" hint="仅影响之后通过 W、V、F、S 模式新增的标识；默认 72" persistent-hint />
-          <div class="marker-appearance-card settings-marker-appearance mt-4">
+          <div class="marker-appearance-card settings-marker-appearance">
             <div class="marker-appearance-tabs" role="tablist" aria-label="默认标识外观分类">
               <button v-for="group in markerAppearanceGroups" :key="group.key" type="button" role="tab" :aria-selected="appearanceTab === group.key" :class="{ active: appearanceTab === group.key }" @click="appearanceTab = group.key"><i :style="{ backgroundColor: group.style.color }" />{{ group.title.replace('标识', '') }}</button>
             </div>
             <div class="marker-appearance-panel" role="tabpanel">
               <div class="marker-appearance-heading"><span><i :style="{ backgroundColor: activeAppearanceGroup.style.color }" /><strong>{{ activeAppearanceGroup.title }}</strong></span><small>{{ activeAppearanceGroup.subtitle }}</small></div>
               <div class="marker-appearance-form">
+                <div class="section-label">分类标识外观</div>
                 <div class="parameter-grid"><v-select v-model="activeAppearanceGroup.style.shape" :items="shapeOptions" label="外形" /><v-text-field v-model.number="activeAppearanceGroup.style.frameSize" type="number" min="18" max="64" label="框尺寸" /></div>
                 <div class="parameter-grid mt-3"><v-text-field v-model.number="activeAppearanceGroup.style.fontSize" type="number" min="7" max="24" label="字号" /><v-text-field v-model="activeAppearanceGroup.style.color" type="color" label="颜色" /></div>
+                <v-text-field v-model.number="activeAppearanceGroup.style.lineWidth" class="mt-3" type="number" min="0.5" max="4" step="0.1" label="线宽" />
+                <v-slider v-model="activeAppearanceGroup.style.fillOpacity" min="0" max="1" step="0.05" color="accent" label="填充透明度" thumb-label class="mt-2" />
+                <v-divider class="my-4" />
+                <div class="section-label">新增编号规则</div>
+                <div class="parameter-grid"><v-text-field v-model="activeAppearanceGroup.numbering.prefix" maxlength="20" label="前缀" @blur="$emit('normalize-numbering-defaults')" /><v-text-field v-model="activeAppearanceGroup.numbering.suffix" maxlength="20" label="后缀" @blur="$emit('normalize-numbering-defaults')" /></div>
+                <v-text-field v-model.number="activeAppearanceGroup.numbering.start" class="mt-3" type="number" min="1" step="1" label="起始数字" @blur="$emit('normalize-numbering-defaults')" />
+                <v-divider class="my-4" />
+                <div class="section-label">新增标识引线</div>
+                <v-text-field v-model.number="manualLeaderLength" type="number" min="20" max="240" step="4" label="引线长度" suffix="图纸单位" hint="系统默认 72；修改后同时应用到当前任务" persistent-hint />
               </div>
             </div>
           </div>
         </div>
         <div class="settings-section shortcut-settings"><div class="section-label">快捷键</div><div class="shortcut-settings__hint">修饰键和主按键可分开设置。选中“按键”输入框后按下目标键，Backspace 可清空主按键。</div><div class="shortcut-editor-list mt-3"><div v-for="row in shortcutRows" :key="row.action" class="shortcut-editor-row"><span class="shortcut-editor-row__label">{{ row.label }}</span><v-select :model-value="shortcutEditors[row.action].modifier" :items="shortcutModifierOptions" label="修饰键" density="compact" hide-details @update:model-value="$emit('update-shortcut-modifier', row.action, $event)" /><v-text-field :model-value="shortcutEditors[row.action].key" label="按键" density="compact" hide-details readonly @keydown="$emit('capture-shortcut-key', $event, row.action)" /></div></div><v-alert v-if="shortcutConflict" type="warning" variant="tonal" density="compact" class="mt-3">{{ shortcutConflict }}</v-alert><v-btn block variant="outlined" class="mt-3" @click="$emit('restore-default-shortcuts')">恢复默认快捷键</v-btn></div>
-        <v-btn block color="primary" variant="tonal" class="settings-config-button" @click="open = false; $emit('open-symbol-config')">打开焊口符号研究配置</v-btn>
+        <div class="settings-section"><div class="section-label">恢复默认设置</div><div class="shortcut-settings__hint">恢复主题、界面布局、消息、分页、对照图、画布性能、标识默认外观与新增规则、引线及快捷键。不会删除任务、草稿、账号或审核数据。</div><v-btn block color="error" variant="outlined" class="mt-3" @click="restoreConfirmOpen = true">恢复系统默认设置</v-btn></div>
       </v-card-text>
       <v-card-actions class="settings-actions"><v-spacer /><v-btn color="primary" @click="open = false">完成</v-btn></v-card-actions>
+    </v-card>
+  </v-dialog>
+  <v-dialog v-model="restoreConfirmOpen" max-width="460">
+    <v-card>
+      <v-card-title>确认恢复系统默认设置？</v-card-title>
+      <v-card-text>所有常态化设置将恢复为系统默认值，标识默认设置也会立即同步到当前任务。任务、草稿和业务数据不会被删除。</v-card-text>
+      <v-card-actions><v-spacer /><v-btn variant="text" @click="restoreConfirmOpen = false">取消</v-btn><v-btn color="error" variant="flat" @click="confirmRestoreDefaults">确认恢复</v-btn></v-card-actions>
     </v-card>
   </v-dialog>
 </template>

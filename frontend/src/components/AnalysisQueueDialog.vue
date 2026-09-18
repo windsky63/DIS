@@ -1,11 +1,14 @@
 <script setup>
 import { onBeforeUnmount, ref } from 'vue'
 import { calculateAnalysisProgress } from '../analysisProgress.js'
-import { archiveActionLabel, queueSummaryChips } from '../analysisQueuePresentation.js'
+import { archiveActionLabel, isCancellationPending, queueSummaryChips } from '../analysisQueuePresentation.js'
+import { useTimedConfirmation } from '../composables/useTimedConfirmation.js'
 
-const pendingArchiveId = ref('')
 const expandedJobId = ref('')
-let archiveConfirmTimer
+const archiveConfirmation = useTimedConfirmation()
+const cancelConfirmation = useTimedConfirmation()
+const pendingArchiveId = archiveConfirmation.pendingId
+const pendingCancelId = cancelConfirmation.pendingId
 
 function toggleExpanded(job) {
   expandedJobId.value = expandedJobId.value === job.jobId ? '' : job.jobId
@@ -42,29 +45,23 @@ function formatStartTime(value) {
   }).format(date)
 }
 
-function clearArchiveConfirmation() {
-  pendingArchiveId.value = ''
-  clearTimeout(archiveConfirmTimer)
-  archiveConfirmTimer = undefined
-}
-
 function handleArchive(job) {
+  cancelConfirmation.clear()
   if (job.isArchived) {
-    clearArchiveConfirmation()
+    archiveConfirmation.clear()
     emit('archive', job, false)
     return
   }
-  if (pendingArchiveId.value === job.jobId) {
-    clearArchiveConfirmation()
-    emit('archive', job, true)
-    return
-  }
-  clearArchiveConfirmation()
-  pendingArchiveId.value = job.jobId
-  archiveConfirmTimer = setTimeout(clearArchiveConfirmation, 4000)
+  if (archiveConfirmation.request(job.jobId)) emit('archive', job, true)
 }
 
-defineProps({
+function handleCancel(job) {
+  archiveConfirmation.clear()
+  if (isCancellationPending(job, props.cancellingJobIds)) return
+  if (cancelConfirmation.request(job.jobId)) emit('cancel', job)
+}
+
+const props = defineProps({
   modelValue: { type: Boolean, required: true },
   deleteDialog: { type: Boolean, required: true },
   loading: { type: Boolean, default: false },
@@ -72,16 +69,20 @@ defineProps({
   queue: { type: Object, required: true },
   jobs: { type: Array, default: () => [] },
   actionId: { type: String, default: '' },
+  cancellingJobIds: { type: Array, default: () => [] },
   deleteTarget: { type: Object, default: null },
   currentJobId: { type: String, default: '' },
 })
 
 const emit = defineEmits([
   'update:modelValue', 'update:deleteDialog', 'update:tab', 'refresh', 'cancel',
-  'move', 'archive', 'restore', 'delete-request', 'delete-confirm',
+  'change-page', 'move', 'archive', 'restore', 'delete-request', 'delete-confirm',
 ])
 
-onBeforeUnmount(clearArchiveConfirmation)
+onBeforeUnmount(() => {
+  archiveConfirmation.dispose()
+  cancelConfirmation.dispose()
+})
 </script>
 
 <template>
@@ -96,7 +97,7 @@ onBeforeUnmount(clearArchiveConfirmation)
       <v-progress-linear v-if="loading" indeterminate color="secondary" />
       <v-tabs :model-value="tab" color="secondary" grow density="compact" @update:model-value="$emit('update:tab', $event)">
         <v-tab value="current">解析任务</v-tab>
-        <v-tab value="archived">已归档（{{ queue.jobs.filter(job => job.isArchived).length }}）</v-tab>
+        <v-tab value="archived">已归档（{{ queue.archivedCount || 0 }}）</v-tab>
       </v-tabs>
       <v-card-text class="analysis-queue-content">
         <div data-tour="analysis-queue-summary" class="analysis-queue-summary">
@@ -111,16 +112,21 @@ onBeforeUnmount(clearArchiveConfirmation)
             <v-list-item-subtitle>
               <div class="analysis-queue-item__meta"><span class="analysis-queue-start-time">{{ formatStartTime(job.createdAt) }}</span><span v-if="job.createdBy?.username" class="analysis-queue-start-time">创建人：{{ job.createdBy.username }}</span></div>
               <v-progress-linear v-if="job.queueState === 'running'" :model-value="progress(job)" color="accent" height="4" rounded class="mt-2" />
-              <small v-if="job.queueState === 'running'" class="analysis-queue-progress-detail">总进度 {{ Math.round(progress(job)) }}% · 对照 {{ job.completedReferenceFiles || 0 }}/{{ job.totalReferenceFiles || 0 }} · 设计页 {{ job.completedPages || 0 }}/{{ job.totalPages || 0 }}</small>
+              <small v-if="job.queueState === 'running'" class="analysis-queue-progress-detail">总进度 {{ Math.round(progress(job)) }}% · <template v-if="job.progressStage === 'optimizing-layout'">标识优化 {{ job.layoutCompletedPages || 0 }}/{{ job.layoutTotalPages || job.totalPages || 0 }} 页</template><template v-else>对照 {{ job.completedReferenceFiles || 0 }}/{{ job.totalReferenceFiles || 0 }} · 设计页 {{ job.completedPages || 0 }}/{{ job.totalPages || 0 }}</template></small>
             </v-list-item-subtitle>
             <template #append>
               <div class="analysis-queue-actions">
                 <v-chip size="x-small" :color="statusColor(job)" variant="tonal">{{ statusLabel(job) }}</v-chip>
                 <div v-if="job.canReorder" class="analysis-queue-order">
-                  <v-btn icon size="x-small" variant="text" :disabled="job.queuePosition <= 1 || actionId === job.jobId" aria-label="提高优先级" @click.stop="$emit('move', job, 'up')">↑</v-btn>
-                  <v-btn icon size="x-small" variant="text" :disabled="job.queuePosition >= queue.queuedCount || actionId === job.jobId" aria-label="降低优先级" @click.stop="$emit('move', job, 'down')">↓</v-btn>
+                  <v-btn icon size="x-small" variant="text" :disabled="job.queuePosition <= 1 || actionId === job.jobId || cancellingJobIds.includes(job.jobId)" aria-label="提高优先级" @click.stop="$emit('move', job, 'up')">↑</v-btn>
+                  <v-btn icon size="x-small" variant="text" :disabled="job.queuePosition >= queue.queuedCount || actionId === job.jobId || cancellingJobIds.includes(job.jobId)" aria-label="降低优先级" @click.stop="$emit('move', job, 'down')">↓</v-btn>
                 </div>
-                <v-btn v-if="job.canCancel" size="small" color="error" variant="text" :loading="actionId === job.jobId" @click.stop="$emit('cancel', job)">取消</v-btn>
+                <v-menu v-if="job.canCancel" :model-value="pendingCancelId === job.jobId" :open-on-click="false" :close-on-content-click="false" location="top" :offset="8">
+                  <template #activator="{ props: cancelActivatorProps }">
+                    <v-btn v-bind="cancelActivatorProps" icon size="small" color="error" variant="text" class="analysis-queue-icon-button" :disabled="actionId === job.jobId" :loading="isCancellationPending(job, cancellingJobIds)" :aria-label="pendingCancelId === job.jobId ? '确认取消解析任务' : '取消解析任务'" @click.stop="handleCancel(job)"><svg class="analysis-queue-action-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1"/></svg><v-tooltip v-if="pendingCancelId !== job.jobId && !isCancellationPending(job, cancellingJobIds)" activator="parent" location="top">取消解析任务</v-tooltip></v-btn>
+                  </template>
+                  <div class="analysis-queue-archive-confirm" role="status">确定取消</div>
+                </v-menu>
                 <v-btn v-if="job.canRestore" icon size="small" color="secondary" variant="text" class="analysis-queue-icon-button" :loading="actionId === job.jobId" aria-label="恢复核对" @click.stop="$emit('restore', job)"><svg class="analysis-queue-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7H5v-4M5.4 7.1A8 8 0 1 1 4 14"/><path d="M5 7l3.2-3.2"/></svg><v-tooltip activator="parent" location="top">恢复核对</v-tooltip></v-btn>
                 <v-btn v-if="job.canArchive && job.isArchived" icon size="small" color="secondary" variant="text" class="analysis-queue-icon-button" :loading="actionId === job.jobId" :aria-label="archiveActionLabel(job)" @click.stop="handleArchive(job)"><svg class="analysis-queue-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v13H4zM3 3h18v4H3zM9 11h6"/><path d="M12 17v-5m0 0-2 2m2-2 2 2"/></svg><v-tooltip activator="parent" location="top">{{ archiveActionLabel(job) }}</v-tooltip></v-btn>
                 <v-menu v-else-if="job.canArchive" :model-value="pendingArchiveId === job.jobId" :open-on-click="false" :close-on-content-click="false" location="top" :offset="8">
@@ -153,6 +159,16 @@ onBeforeUnmount(clearArchiveConfirmation)
           </v-expand-transition>
           </div>
         </v-list>
+        <v-pagination
+          v-if="(queue.pagination?.totalPages || 0) > 1"
+          class="analysis-queue-pagination"
+          :model-value="queue.pagination.page"
+          :length="queue.pagination.totalPages"
+          :total-visible="7"
+          density="compact"
+          aria-label="解析队列分页"
+          @update:model-value="$emit('change-page', $event)"
+        />
       </v-card-text>
       <v-card-actions class="settings-actions"><v-spacer /><v-btn color="primary" @click="$emit('update:modelValue', false)">关闭</v-btn></v-card-actions>
     </v-card>

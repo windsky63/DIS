@@ -4,6 +4,22 @@ import test from 'node:test'
 import { api } from '../src/api.js'
 
 
+test('analysis queue request includes its server-side page and scope', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedUrl
+  globalThis.fetch = async url => {
+    requestedUrl = String(url)
+    return { ok: true, json: async () => ({ jobs: [], pagination: { page: 3 } }) }
+  }
+  try {
+    await api.getAnalysisQueue({ scope: 'archived', page: 3, pageSize: 40 })
+    assert.equal(requestedUrl, '/api/analysis-queue?scope=archived&page=3&pageSize=40')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+
 test('tutorial reference manifest uses the tutorial endpoint and remains lazy', async () => {
   const originalFetch = globalThis.fetch
   const requested = []
@@ -71,30 +87,6 @@ test('interactive analysis can request queue-front priority', async () => {
     assert.equal(requestInfo.url, `/api/jobs/${'a'.repeat(32)}/queue-position`)
     assert.equal(JSON.parse(requestInfo.options.body).direction, 'front')
     assert.equal(result.queuePosition, 1)
-  } finally {
-    globalThis.fetch = originalFetch
-  }
-})
-
-test('AI assistant sends chat messages and workspace context to the protected backend endpoint', async () => {
-  const originalFetch = globalThis.fetch
-  let requestInfo
-  globalThis.fetch = async (url, options) => {
-    requestInfo = { url, options }
-    return { ok: true, json: async () => ({ message: { role: 'assistant', content: '回答' } }) }
-  }
-  try {
-    const result = await api.chat(
-      [{ role: 'user', content: '怎么导出？' }],
-      { currentPage: 2, jobLoaded: true },
-    )
-    assert.equal(requestInfo.url, '/api/ai/chat')
-    assert.equal(requestInfo.options.method, 'POST')
-    assert.deepEqual(JSON.parse(requestInfo.options.body), {
-      messages: [{ role: 'user', content: '怎么导出？' }],
-      context: { currentPage: 2, jobLoaded: true },
-    })
-    assert.equal(result.message.content, '回答')
   } finally {
     globalThis.fetch = originalFetch
   }

@@ -1,22 +1,42 @@
 import { nextTick } from 'vue'
 
-import { componentNumber, isDesignComponent, isSpecialMarker, numberDocumentResult, sameNumberingGroup } from '../numbering.js'
+import { isDesignComponent, isSpecialMarker, numberDocumentResult } from '../numbering.js'
 import { createSpecialMarkerAppearance } from '../defaultMarkerAppearance.js'
 import { createPastedMarker, matchesModificationType } from '../markerClipboard.js'
 import { manualLabelPosition } from '../manualMarkerPlacement.js'
+import { manualMarkerNumber, manualNumberingSequenceKey } from '../manualNumberingSettings.js'
 import { translateMarkerPair } from './useMarkerPresentation.js'
 
 export function useMarkerEditor({ state, operations }) {
   const {
-    result, pageData, pages, candidates, selectedCandidate, pendingRenumberCandidate,
+    result, pageData, pages, candidates, selectedCandidate,
     targetDocument, currentPage, previewPage, projectResults, activeProjectIndex, manualAddMode,
     manualAddType, canvasSurface, canvasLayout, canvasPointerPosition, referenceFocus, referenceShowAll,
     startNumber, numberPrefix, numberSuffix, useReferenceNumber, selectedId, swapSourceId,
-    renumberConfirmDialog, pendingRenumberId, editingId, editingValue,
-    pendingHistory, labelDragState, anchorDragState, groupDragState, manualLeaderLength, error,
+    editingId, editingValue,
+    pendingHistory, labelDragState, anchorDragState, groupDragState, manualLeaderLength, manualNumberingSettings, error,
   } = state
   let copiedMarker = null
   let pasteSequence = 0
+  const manualNumberingSessions = new Map()
+
+  function nextManualNumber(type) {
+    const sequenceKey = manualNumberingSequenceKey(manualNumberingSettings?.value, type)
+    const sessionKey = type === 'weld' ? type : `${type}:${Number(pageData.value?.page) || Number(currentPage.value) || 1}`
+    let session = manualNumberingSessions.get(sessionKey)
+    if (!session || session.document !== result.value || session.sequenceKey !== sequenceKey) {
+      session = {
+        document: result.value,
+        sequenceKey,
+        count: 0,
+      }
+      manualNumberingSessions.set(sessionKey, session)
+    }
+
+    const generated = manualMarkerNumber(manualNumberingSettings?.value, type, session.count)
+    session.count += 1
+    return generated
+  }
 
   async function ensureManualWorkspace() {
     if (result.value && pageData.value) return true
@@ -44,6 +64,9 @@ export function useMarkerEditor({ state, operations }) {
     const sameActiveType = manualAddMode.value && manualAddType.value === type
     manualAddType.value = type
     manualAddMode.value = !sameActiveType
+    if (manualAddMode.value && ['weld', 'valve', 'flange', 'support'].includes(type)) {
+      operations.selectMarkerAppearanceTab?.(type)
+    }
   }
 
   function mergeStagedManualCandidates(snapshot, stagedPages) {
@@ -91,10 +114,9 @@ export function useMarkerEditor({ state, operations }) {
     operations.beginHistory(`人工增加${typeTitle}`)
     const special = type === 'special'
     const componentType = ['valve', 'flange', 'support'].includes(type) ? type : (special ? 'special' : null)
-    const sameTypeCount = page.candidates.filter(item => item.included !== false && (
-      special ? isSpecialMarker(item) : (componentType ? item.componentType === componentType : !isDesignComponent(item) && !isSpecialMarker(item))
-    )).length
-    const prefix = ({ valve: 'V', flange: 'FL', support: 'SP', special: 'M' })[type]
+    const generatedNumber = special
+      ? { number: `M${page.candidates.filter(item => item.included !== false && isSpecialMarker(item)).length + 1}`, prefix: 'M' }
+      : nextManualNumber(type)
     const label = manualLabelPosition({ x, y }, page.width, page.height, manualLeaderLength.value)
     const specialStyle = special ? createSpecialMarkerAppearance() : null
     const item = {
@@ -104,11 +126,11 @@ export function useMarkerEditor({ state, operations }) {
       confidence: 1, tier: 'manual', glyphValidated: false, evidence: '人工添加',
       componentKind: special ? 'special-marker' : (componentType ? 'design-component' : 'manual-weld'), componentType,
       specialMarker: special || undefined,
-      autoNumberPrefix: prefix,
+      autoNumberPrefix: generatedNumber.prefix,
       defaultMarkerStyle: special ? { ...specialStyle } : (componentType ? { shape: 'rectangle', color: '#1769d2' } : { shape: 'circle', color: '#d4143c' }),
       markerStyle: special ? { ...specialStyle } : undefined,
       symbolShape: 'manual', included: true, origin: 'manual',
-      number: componentType ? `${prefix}${sameTypeCount + 1}` : formattedWeldNumber(Math.max(1, Number(startNumber.value) || 1) + sameTypeCount),
+      number: generatedNumber.number,
       referenceLabel: '', referenceMatched: false,
     }
     page.candidates.push(item)
@@ -164,44 +186,16 @@ export function useMarkerEditor({ state, operations }) {
     return true
   }
 
-  function numberResult(documentResult, startingNumberValue) {
+  function numberResult(documentResult, startingNumberValue, options = {}) {
     numberDocumentResult(documentResult, startingNumberValue, {
       useReferenceNumber: useReferenceNumber.value,
       formatWeldNumber: formattedWeldNumber,
+      ...options,
     })
   }
-
-  function requestRenumberFromSelected() {
-    if (!selectedCandidate.value) { error.value = '请先选中一个标识对象。'; return }
-    if (selectedCandidate.value.included === false) { error.value = '已排除的对象不能作为重新编号起点，请先恢复该对象。'; return }
-    if (isSpecialMarker(selectedCandidate.value)) { error.value = '特殊标识使用独立编号，不参与同类型智能重编。'; return }
-    pendingRenumberId.value = selectedCandidate.value.id
-    renumberConfirmDialog.value = true
-  }
-  function renumberFromSelected() {
-    const candidate = pendingRenumberCandidate.value
-    if (!candidate) { renumberConfirmDialog.value = false; error.value = '待重编的标识对象已不存在。'; return }
-    const current = pages.value.find(page => page.page === candidate.page)
-    const ordered = (current?.candidates || []).filter(item => item.included !== false && sameNumberingGroup(item, candidate)).sort((a, b) => a.y - b.y || a.x - b.x)
-    const startIndex = ordered.findIndex(item => item.id === candidate.id)
-    if (startIndex < 0) return
-    operations.beginHistory('从选中对象重新编号')
-    const rotated = ordered.slice(startIndex).concat(ordered.slice(0, startIndex))
-    let number = isDesignComponent(candidate) ? 1 : Math.max(1, Number(startNumber.value) || 1)
-    rotated.forEach(item => {
-      item.number = isDesignComponent(item) ? componentNumber(item, number)
-        : (useReferenceNumber.value && item.referenceLabel ? item.referenceLabel : formattedWeldNumber(number))
-      number += 1
-    })
-    operations.commitHistory()
-    selectedId.value = candidate.id
-    renumberConfirmDialog.value = false
-    pendingRenumberId.value = ''
-    operations.showNotice(`已在第 ${candidate.page} 页以 ${candidate.number || '?'} 为起点，重新编号同类对象 ${rotated.length} 个。`)
-  }
-  function cancelRenumberConfirmation() { renumberConfirmDialog.value = false; pendingRenumberId.value = '' }
 
   function pageMatchSummary(page) {
+    if (page?.detailsLoaded === false && page?.matchSummary) return page.matchSummary
     const included = (page?.candidates || []).filter(item => item.included !== false && !isDesignComponent(item) && !isSpecialMarker(item))
     const unmatched = included.filter(item => !item.referenceMatched || !String(item.referenceLabel || '').trim()).length
     const unresolved = Math.max(0, Number(page?.reference?.unresolvedCalloutGap) || 0)
@@ -400,7 +394,7 @@ export function useMarkerEditor({ state, operations }) {
   return {
     ensureManualWorkspace, toggleManualAddMode, mergeStagedManualCandidates, onCanvasClick, addManualAtClientPoint,
     candidateMatchesModificationType, copySelectedCandidate, pasteCopiedAtClientPoint, formattedWeldNumber, numberResult,
-    requestRenumberFromSelected, renumberFromSelected, cancelRenumberConfirmation, pageMatchSummary,
+    pageMatchSummary,
     swapSelectedWeldNumbers, selectCandidate, reflowCurrentPageLabelPositions, beginInlineEdit, commitInlineEdit,
     cancelInlineEdit, onApplicationPointerDown, startLabelDrag, moveLabel, endLabelDrag, setLeaderLineElement,
     startAnchorDrag, moveAnchor, endAnchorDrag, startGroupDrag, moveGroup, endGroupDrag,

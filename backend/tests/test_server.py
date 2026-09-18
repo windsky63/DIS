@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import json
-import base64
 from pathlib import Path
 import sys
 import tempfile
@@ -20,6 +19,7 @@ if str(BACKEND) not in sys.path:
 
 import server
 import job_runner
+from admin_store import AdminStore
 from assistant_agent import AssistantAgentEvent
 from job_store import JobStore
 
@@ -39,12 +39,36 @@ class _Response:
 
 
 class ServerTests(unittest.TestCase):
+    def test_analysis_queue_route_forwards_validated_pagination(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/analysis-queue?scope=archived&page=3&pageSize=40"
+        responses = []
+        handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+        expected = {"jobs": [], "pagination": {"scope": "archived", "page": 3, "pageSize": 40}}
+
+        with patch.object(server, "_analysis_queue_snapshot", return_value=expected) as load_snapshot:
+            handler._do_GET()
+
+        load_snapshot.assert_called_once_with(scope="archived", page=3, page_size=40)
+        self.assertEqual(responses, [(200, expected)])
+
+    def test_analysis_queue_route_normalizes_invalid_pagination(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/analysis-queue?scope=unknown&page=-2&pageSize=500"
+        handler._json = lambda *_args, **_kwargs: None
+
+        with patch.object(server, "_analysis_queue_snapshot", return_value={"jobs": []}) as load_snapshot:
+            handler._do_GET()
+
+        load_snapshot.assert_called_once_with(scope="current", page=1, page_size=100)
+
     def test_auth_store_bootstraps_the_default_admin_account(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             with patch.object(server, "DATA_ROOT", Path(folder_name) / "jobs"):
                 server.AUTH_STORES.clear()
                 user = server._auth_store().authenticate("admin", "123456")
             self.assertEqual(user["username"], "admin")
+            self.assertIs(user["isAdmin"], True)
 
     def test_registration_creates_session_and_me_resolves_cookie(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -61,6 +85,7 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(responses[0][0], 201)
                 self.assertIn("HttpOnly", responses[0][2]["Set-Cookie"])
                 self.assertIn("SameSite=Lax", responses[0][2]["Set-Cookie"])
+                self.assertNotIn("Max-Age", responses[0][2]["Set-Cookie"])
                 cookie = SimpleCookie()
                 cookie.load(responses[0][2]["Set-Cookie"])
                 token = cookie[server.SESSION_COOKIE_NAME].value
@@ -71,6 +96,101 @@ class ServerTests(unittest.TestCase):
 
             self.assertEqual(responses[1][0], 200)
             self.assertEqual(responses[1][1]["user"]["username"], "Reviewer01")
+            self.assertIs(responses[1][1]["user"]["isAdmin"], False)
+
+    def test_new_login_invalidates_the_previous_session_for_the_same_account(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            with patch.object(server, "DATA_ROOT", Path(folder_name) / "jobs"):
+                server.AUTH_STORES.clear()
+                store = server._auth_store()
+                user = store.authenticate("admin", "123456")
+                first_token = store.create_session(str(user["userId"]))
+                second_token = store.create_session(str(user["userId"]))
+
+                self.assertIsNone(store.resolve_session(first_token))
+                self.assertEqual(store.resolve_session(second_token)["userId"], user["userId"])
+
+    def test_new_login_releases_the_accounts_existing_page_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            jobs_root = Path(folder_name) / "jobs"
+            handler = object.__new__(server.ApiHandler)
+            handler.path = "/api/auth/login"
+            handler.headers = {}
+            handler._read_json = lambda *_args: {"username": "admin", "password": "123456"}
+            handler._json = lambda *_args, **_kwargs: None
+            with patch.object(server, "DATA_ROOT", jobs_root):
+                server.AUTH_STORES.clear()
+                server.PAGE_LOCK_STORES.clear()
+                admin = server._auth_store().authenticate("admin", "123456")
+                locks = server._page_lock_store()
+                locks.acquire("job", 1, str(admin["userId"]), "admin", "old-tab")
+
+                handler.do_POST()
+
+                self.assertIsNone(locks.get("job", 1))
+
+    def test_admin_routes_reject_regular_users_and_return_sanitized_database_data(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            jobs_root = Path(folder_name) / "jobs"
+            with patch.object(server, "DATA_ROOT", jobs_root):
+                server.AUTH_STORES.clear()
+                server.JOB_STORES.clear()
+                server.PAGE_LOCK_STORES.clear()
+                server.ASSISTANT_CONVERSATION_STORES.clear()
+                admin = server._auth_store().authenticate("admin", "123456")
+                regular = server._auth_store().register("reviewer", "correct-horse-battery")
+
+                denied = object.__new__(server.ApiHandler)
+                denied.path = "/api/admin/overview"
+                denied.headers = {}
+                denied._request_user = regular
+                denied_responses = []
+                denied._json = lambda status, payload, headers=None: denied_responses.append((status, payload))
+                denied.do_GET()
+                self.assertEqual(denied_responses, [(403, {"error": "需要管理员权限"})])
+
+                users = AdminStore(jobs_root / ".queue" / "jobs.db").users()
+                self.assertEqual(users["pagination"]["total"], 2)
+                self.assertTrue(any(item["isAdmin"] for item in users["users"]))
+                serialized = json.dumps(users, ensure_ascii=False)
+                self.assertNotIn("password_hash", serialized)
+                self.assertNotIn("password_salt", serialized)
+
+                allowed = object.__new__(server.ApiHandler)
+                allowed.path = "/api/admin/overview"
+                allowed.headers = {}
+                allowed._request_user = admin
+                allowed_responses = []
+                allowed._json = lambda status, payload, headers=None: allowed_responses.append((status, payload))
+                allowed.do_GET()
+                self.assertEqual(allowed_responses[0][0], 200)
+                self.assertEqual(allowed_responses[0][1]["metrics"]["totalUsers"], 2)
+
+    def test_login_remember_password_controls_persistent_cookie_only(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            jobs_root = Path(folder_name) / "jobs"
+            responses = []
+            handler = object.__new__(server.ApiHandler)
+            handler.path = "/api/auth/login"
+            handler.headers = {}
+            handler._json = lambda status, payload, headers=None: responses.append((status, payload, headers or {}))
+            with patch.object(server, "DATA_ROOT", jobs_root):
+                server.AUTH_STORES.clear()
+                handler._read_json = lambda *_args: {
+                    "username": "admin", "password": "123456", "rememberPassword": False,
+                }
+                handler.do_POST()
+                handler._read_json = lambda *_args: {
+                    "username": "admin", "password": "123456", "rememberPassword": True,
+                }
+                handler.do_POST()
+
+        session_cookie = responses[0][2]["Set-Cookie"]
+        persistent_cookie = responses[1][2]["Set-Cookie"]
+        self.assertNotIn("Max-Age", session_cookie)
+        self.assertNotIn("Expires=", session_cookie)
+        self.assertIn(f"Max-Age={7 * 24 * 60 * 60}", persistent_cookie)
+        self.assertNotIn("123456", session_cookie + persistent_cookie)
 
     def test_business_api_requires_authentication(self) -> None:
         handler = object.__new__(server.ApiHandler)
@@ -91,21 +211,6 @@ class ServerTests(unittest.TestCase):
         with patch.object(server.ai_assistant, "configuration_status", return_value={"configured": True, "model": "guide-model"}):
             handler.do_GET()
         self.assertEqual(responses, [(200, {"configured": True, "model": "guide-model"})])
-
-    def test_ai_chat_returns_assistant_message(self) -> None:
-        handler = object.__new__(server.ApiHandler)
-        handler.path = "/api/ai/chat"
-        handler.headers = {}
-        handler._request_user = {"userId": "u1", "username": "张三"}
-        handler._read_json = lambda *_args: {
-            "messages": [{"role": "user", "content": "如何开始？"}],
-            "context": {"currentPage": 1, "jobLoaded": False},
-        }
-        responses = []
-        handler._json = lambda status, payload, headers=None: responses.append((status, payload))
-        with patch.object(server.ai_assistant, "chat_completion", return_value="请先上传图纸。"):
-            handler.do_POST()
-        self.assertEqual(responses, [(200, {"message": {"role": "assistant", "content": "请先上传图纸。"}})])
 
     def test_ai_chat_stream_forwards_typed_agent_events(self) -> None:
         handler = object.__new__(server.ApiHandler)
@@ -217,7 +322,9 @@ class ServerTests(unittest.TestCase):
             handler._request_user = {"userId": "u1", "username": "张三"}
             handler._json = lambda status, payload, headers=None: responses.append((status, payload))
             with patch.object(server, "DATA_ROOT", jobs_root):
+                server.JOB_STORES.clear()
                 server.PAGE_LOCK_STORES.clear()
+                server._job_store().replace_job_pages(job_id, [{"page": 1, "candidates": []}])
                 handler.do_POST()
                 handler._request_user = {"userId": "u2", "username": "李四"}
                 handler._read_json = lambda *_args: {"clientInstanceId": "tab-b"}
@@ -242,7 +349,13 @@ class ServerTests(unittest.TestCase):
             }), encoding="utf-8")
             with patch.object(server, "DATA_ROOT", jobs_root):
                 server.JOB_STORES.clear(); server.PAGE_LOCK_STORES.clear()
-                server._job_store().import_existing(jobs_root, server.ANALYSIS_ALGORITHM_VERSION)
+                store = server._job_store()
+                store.create_job(
+                    job_id=job_id, analysis_signature="locked-delete", job_folder=job,
+                    original_target_name="drawing.pdf", algorithm_version="test",
+                )
+                claimed = store.claim_next("worker-test", 60)
+                store.finish(job_id, "complete", worker_id=str(claimed["lease_owner"]))
                 server._page_lock_store().acquire(job_id, 1, "u1", "张三", "tab-a")
                 with self.assertRaises(server.ApiError) as raised:
                     server._delete_completed_job(job_id)
@@ -265,7 +378,8 @@ class ServerTests(unittest.TestCase):
                 ],
             }), encoding="utf-8")
             with patch.object(server, "DATA_ROOT", jobs_root):
-                server.PAGE_LOCK_STORES.clear()
+                server.JOB_STORES.clear(); server.PAGE_LOCK_STORES.clear()
+                server._job_store().replace_job_pages(job_id, json.loads(result_path.read_text(encoding="utf-8"))["pages"])
                 lock_store = server._page_lock_store()
                 alice_lock = lock_store.acquire(job_id, 1, "u1", "张三", "tab-a")
                 bob_lock = lock_store.acquire(job_id, 2, "u2", "李四", "tab-b")
@@ -285,12 +399,13 @@ class ServerTests(unittest.TestCase):
                     }
                     handler._json = lambda status, payload, headers=None: responses.append((status, payload))
                     handler.do_PUT()
-                review_history = server._job_store().page_review_history(job_id)
+                page_store = server._job_store()
+                review_history = page_store.page_review_history(job_id)
+                saved_pages = page_store.get_job_pages(job_id)
 
-            saved = json.loads(result_path.read_text(encoding="utf-8"))
             self.assertEqual([response[0] for response in responses], [200, 200])
-            self.assertEqual([page["reviewRevision"] for page in saved["pages"]], [1, 1])
-            self.assertEqual([page["candidates"][0]["number"] for page in saved["pages"]], ["A1", "B1"])
+            self.assertEqual([page["reviewRevision"] for page in saved_pages], [1, 1])
+            self.assertEqual([page["candidates"][0]["number"] for page in saved_pages], ["A1", "B1"])
             self.assertEqual([(item["page_number"], item["username"]) for item in review_history], [(1, "张三"), (2, "李四")])
 
     def test_stale_page_revision_is_rejected_without_overwrite(self) -> None:
@@ -307,7 +422,10 @@ class ServerTests(unittest.TestCase):
                 }],
             }), encoding="utf-8")
             with patch.object(server, "DATA_ROOT", jobs_root):
-                server.PAGE_LOCK_STORES.clear()
+                server.JOB_STORES.clear(); server.PAGE_LOCK_STORES.clear()
+                server._job_store().replace_job_pages(
+                    job_id, json.loads(result_path.read_text(encoding="utf-8"))["pages"],
+                )
                 lock = server._page_lock_store().acquire(job_id, 1, "u1", "张三", "tab-a")
                 handler = object.__new__(server.ApiHandler)
                 handler.path = f"/api/jobs/{job_id}/pages/1"
@@ -320,9 +438,9 @@ class ServerTests(unittest.TestCase):
                 responses = []
                 handler._json = lambda status, payload, headers=None: responses.append((status, payload))
                 handler.do_PUT()
-            saved = json.loads(result_path.read_text(encoding="utf-8"))
+                saved = server._job_store().get_job_page(job_id, 1)
             self.assertEqual(responses[0][0], 409)
-            self.assertEqual(saved["pages"][0]["candidates"][0]["number"], "A1")
+            self.assertEqual(saved["candidates"][0]["number"], "A1")
 
     def test_binary_upload_streams_to_disk_and_is_consumed_by_job(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -451,6 +569,19 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(len(result["ep3dReferenceInventory"]["documents"]), 1)
             self.assertFalse(jobs_root.exists())
 
+    def test_tutorial_pages_are_read_only_and_cannot_enter_job_save_route(self) -> None:
+        responses = []
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/tutorial/pages/7"
+        handler.headers = {}
+        handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+
+        handler.do_PUT()
+
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], 404)
+        self.assertIn("error", responses[0][1])
+
     def test_tutorial_workspace_defers_non_visible_page_obstacles(self) -> None:
         tutorial = server._create_tutorial_session()
         first_page = int(tutorial["pages"][0]["page"])
@@ -537,8 +668,10 @@ class ServerTests(unittest.TestCase):
 
     def test_training_sample_is_generated_automatically_without_human_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
-            folder = Path(folder_name)
+            root = Path(folder_name)
             job_id = "d" * 32
+            folder = root / job_id
+            folder.mkdir()
             target = folder / "target.pdf"
             document = fitz.open()
             document.new_page(width=200, height=160)
@@ -546,10 +679,15 @@ class ServerTests(unittest.TestCase):
             document.close()
             (folder / "job.json").write_text(json.dumps({"targetFile": target.name}), encoding="utf-8")
             (folder / "result.json").write_text(json.dumps({
-                "pages": [{"page": 1, "candidates": [{"id": "V1", "page": 1, "included": True}]}],
+                "status": "complete",
             }), encoding="utf-8")
 
-            output, count = server._write_training_sample(job_id, folder)
+            with patch.object(server, "DATA_ROOT", root):
+                server.JOB_STORES.clear()
+                server._job_store().replace_job_pages(job_id, [{
+                    "page": 1, "candidates": [{"id": "V1", "page": 1, "included": True}],
+                }])
+                output, count = server._write_training_sample(job_id, folder)
 
             self.assertEqual(count, 1)
             self.assertTrue(output.is_file())
@@ -596,15 +734,17 @@ class ServerTests(unittest.TestCase):
     def test_recent_batch_restores_all_completed_jobs_in_latest_batch(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             root = Path(folder_name)
-            for index, name in enumerate(("A.pdf", "B.pdf")):
-                job = root / f"job-{index}"
+            job_ids = [(str(index + 1) * 32) for index in range(3)]
+            batches = (("batch-older", 0, "Old.pdf"), ("batch-latest", 0, "A.pdf"), ("batch-latest", 1, "B.pdf"))
+            for index, (batch_id, batch_index, name) in enumerate(batches):
+                job = root / job_ids[index]
                 job.mkdir()
                 (job / "job.json").write_text(json.dumps({
-                    "batchId": "batch-latest", "batchIndex": index, "originalTargetName": name,
+                    "batchId": batch_id, "batchIndex": batch_index, "originalTargetName": name,
                     "analysisAlgorithmVersion": server.ANALYSIS_ALGORITHM_VERSION,
                 }), encoding="utf-8")
                 (job / "result.json").write_text(json.dumps({
-                    "status": "complete", "jobId": f"id-{index}", "pages": [{"page": 1, "candidates": []}],
+                    "status": "complete", "jobId": job_ids[index],
                 }), encoding="utf-8")
             tutorial_job = root / "legacy-tutorial"
             tutorial_job.mkdir()
@@ -615,9 +755,34 @@ class ServerTests(unittest.TestCase):
                 "status": "complete", "jobId": "legacy-tutorial", "pages": [{"page": 7, "candidates": []}],
             }), encoding="utf-8")
             with patch.object(server, "DATA_ROOT", root):
-                restored = server._recent_batch_results()
+                server.JOB_STORES.clear()
+                store = server._job_store()
+                for index, (job_id, (batch_id, batch_index, name)) in enumerate(zip(job_ids, batches)):
+                    store.create_job(
+                        job_id=job_id, analysis_signature=f"batch-{index}", job_folder=root / job_id,
+                        original_target_name=name, algorithm_version=server.ANALYSIS_ALGORITHM_VERSION,
+                        batch_id=batch_id, batch_index=batch_index,
+                    )
+                    claimed = store.claim_next(f"worker-{index}", 60)
+                    store.replace_job_pages(job_id, [{"page": 1, "candidates": []}])
+                    self.assertTrue(store.finish(job_id, "complete", worker_id=str(claimed["lease_owner"])))
+                    with store._connection() as connection:
+                        connection.execute(
+                            "UPDATE jobs SET completed_at = ? WHERE job_id = ?",
+                            (f"2026-09-18T10:00:0{index}", job_id),
+                        )
+                loaded_job_ids = []
+                original_loader = server._load_job_result
+
+                def tracked_loader(job_id, *args, **kwargs):
+                    loaded_job_ids.append(job_id)
+                    return original_loader(job_id, *args, **kwargs)
+
+                with patch.object(server, "_load_job_result", side_effect=tracked_loader):
+                    restored = server._recent_batch_results()
             self.assertEqual(restored["batchId"], "batch-latest")
             self.assertEqual([item["originalTargetName"] for item in restored["jobs"]], ["A.pdf", "B.pdf"])
+            self.assertEqual(loaded_job_ids, job_ids[1:])
 
     def test_workspace_result_defers_non_visible_page_obstacles(self) -> None:
         result = {
@@ -630,45 +795,31 @@ class ServerTests(unittest.TestCase):
         }
         workspace = server._workspace_result(result, 3)
         self.assertNotIn("layoutObstacles", workspace["pages"][0])
+        self.assertEqual(workspace["pages"][0]["candidates"], [])
         self.assertFalse(workspace["pages"][0]["detailsLoaded"])
         self.assertIn("layoutObstacles", workspace["pages"][1])
         self.assertTrue(workspace["pages"][1]["detailsLoaded"])
         self.assertIn("layoutObstacles", result["pages"][0])
         self.assertNotIn("labelLayout", workspace)
 
-    def test_lazy_workspace_save_preserves_deferred_page_fields(self) -> None:
-        current = {
-            "analyzedRange": [1, 1],
-            "pages": [{
-                "page": 1,
-                "candidates": [{"id": "p1", "page": 1, "number": "F1", "x": 1, "y": 2}],
-                "layoutObstacles": {"textRects": [[1, 2, 3, 4]]},
-            }],
-        }
-        saved = server._merge_saved_pages([{
-            "page": 1,
-            "candidates": [{"id": "p1", "page": 1, "number": "F2", "x": 1, "y": 2}],
-            "detailsLoaded": False,
-        }], current)
-        self.assertEqual(saved[0]["candidates"][0]["number"], "F2")
-        self.assertEqual(saved[0]["layoutObstacles"]["textRects"], [[1, 2, 3, 4]])
-
     def test_analysis_signature_tracks_page_range_and_configuration(self) -> None:
         payload = {
-            "targetPdf": {"name": "drawing.pdf", "dataBase64": "YWJj"},
+            "targetUpload": {"uploadId": "a" * 32, "name": "drawing.pdf"},
             "startPage": 1,
             "endPage": 2,
             "symbolConfig": {"detectionMode": "placement"},
         }
-        first = server._analysis_signature(payload)
-        different_range = server._analysis_signature({**payload, "startPage": 99, "endPage": 120})
-        different_mode = server._analysis_signature({**payload, "symbolConfig": {"detectionMode": "comparison"}})
-        different_project = server._analysis_signature({**payload, "project": {"id": "another-project", "name": "其他项目"}})
-        self.assertNotEqual(first, different_range)
-        self.assertNotEqual(first, different_mode)
-        self.assertNotEqual(first, different_project)
-        with patch.object(server, "ANALYSIS_ALGORITHM_VERSION", "next-version"):
-            self.assertNotEqual(first, server._analysis_signature(payload))
+        upload = (Path("payload.bin"), {"name": "drawing.pdf", "sha256": "abc"})
+        with patch.object(server, "_upload_record", return_value=upload):
+            first = server._analysis_signature(payload)
+            different_range = server._analysis_signature({**payload, "startPage": 99, "endPage": 120})
+            different_mode = server._analysis_signature({**payload, "symbolConfig": {"detectionMode": "comparison"}})
+            different_project = server._analysis_signature({**payload, "project": {"id": "another-project", "name": "其他项目"}})
+            self.assertNotEqual(first, different_range)
+            self.assertNotEqual(first, different_mode)
+            self.assertNotEqual(first, different_project)
+            with patch.object(server, "ANALYSIS_ALGORITHM_VERSION", "next-version"):
+                self.assertNotEqual(first, server._analysis_signature(payload))
 
     def test_job_creation_rejects_disabled_comparison_mode(self) -> None:
         handler = object.__new__(server.ApiHandler)
@@ -683,16 +834,25 @@ class ServerTests(unittest.TestCase):
             source.new_page(width=100, height=100)
             pdf_bytes = source.tobytes()
             source.close()
+            upload_root = root / "uploads"
+            upload_id = "f" * 32
+            upload_folder = upload_root / upload_id
+            upload_folder.mkdir(parents=True)
+            (upload_folder / "payload.bin").write_bytes(pdf_bytes)
+            (upload_folder / "upload.json").write_text(json.dumps({
+                "name": "drawing.pdf", "size": len(pdf_bytes), "sha256": "test-pdf",
+                "createdAt": "2026-09-18T00:00:00",
+            }), encoding="utf-8")
             handler = object.__new__(server.ApiHandler)
             handler._request_user = {"userId": "user-1", "username": "Reviewer01"}
             handler._read_json = lambda *_args: {
-                "targetPdf": {"name": "drawing.pdf", "dataBase64": base64.b64encode(pdf_bytes).decode("ascii")},
+                "targetUpload": {"uploadId": upload_id, "name": "drawing.pdf"},
                 "project": {"id": "chengda-indonesia", "name": "成达印尼项目"},
                 "symbolConfig": {"detectionMode": "placement"},
             }
             responses = []
             handler._json = lambda status, payload, headers=None: responses.append((status, payload))
-            with patch.object(server, "DATA_ROOT", root):
+            with patch.object(server, "DATA_ROOT", root), patch.object(server, "UPLOAD_ROOT", upload_root):
                 server.JOB_STORES.clear()
                 handler._create_job()
             created = responses[0][1]
@@ -708,7 +868,7 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(result["project"]["name"], "成达印尼项目")
             self.assertEqual(row["createdBy"], expected)
 
-    def test_reconcile_imports_interrupted_jobs_back_into_queue(self) -> None:
+    def test_reconcile_does_not_import_json_only_legacy_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             root = Path(folder_name)
             job = root / ("e" * 32)
@@ -720,11 +880,12 @@ class ServerTests(unittest.TestCase):
                 "analysisSignature": "signature", "originalTargetName": "drawing.pdf",
             }), encoding="utf-8")
             with patch.object(server, "DATA_ROOT", root):
+                server.JOB_STORES.clear()
                 reconciled = server._reconcile_interrupted_jobs()
             saved = json.loads((job / "result.json").read_text(encoding="utf-8"))
-            self.assertEqual(reconciled, 1)
+            self.assertEqual(reconciled, 0)
             self.assertEqual(saved["status"], "processing")
-            self.assertEqual(JobStore(root / ".queue" / "jobs.db").get(job.name)["status"], "queued")
+            self.assertIsNone(JobStore(root / ".queue" / "jobs.db").get(job.name))
 
     def test_page_validation_rejects_out_of_range_and_mismatched_candidates(self) -> None:
         current = {"analyzedRange": [2, 3]}
@@ -748,7 +909,10 @@ class ServerTests(unittest.TestCase):
             handler._json = lambda status, payload: responses.append((status, payload))
             with patch.object(server, "DATA_ROOT", root):
                 store = server._job_store()
-                store.import_existing(root, server.ANALYSIS_ALGORITHM_VERSION)
+                store.create_job(
+                    job_id=job_id, analysis_signature="cancel-signature", job_folder=folder,
+                    original_target_name="drawing.pdf", algorithm_version="test",
+                )
                 claimed = store.claim_next("worker-test", 60)
                 self.assertIsNotNone(claimed)
                 handler._cancel_job(job_id)
@@ -774,7 +938,21 @@ class ServerTests(unittest.TestCase):
 
             with patch.object(server, "DATA_ROOT", root):
                 store = server._job_store()
-                store.import_existing(root, server.ANALYSIS_ALGORITHM_VERSION)
+                for queued_id in (queued_first, queued_second, queued_last, running):
+                    store.create_job(
+                        job_id=queued_id, analysis_signature=f"queue-{queued_id}",
+                        job_folder=root / queued_id, original_target_name=f"{queued_id[0]}.pdf",
+                        algorithm_version="test",
+                        queue_summary={
+                            "totalPages": 4,
+                            "completedReferenceFiles": 1,
+                            "totalReferenceFiles": 2,
+                            "referenceFileCount": 2,
+                            "progressCompletedUnits": 1.5,
+                            "progressTotalUnits": 6,
+                            "progressPercent": 35,
+                        },
+                    )
                 claimed = store.claim_next("worker-test", 60)
                 self.assertEqual(claimed["job_id"], queued_first)
                 store.move_queued(queued_first, "down") if False else None
@@ -810,9 +988,11 @@ class ServerTests(unittest.TestCase):
             folder.mkdir()
             (folder / "job.json").write_text(json.dumps({"analysisSignature": "same"}), encoding="utf-8")
             (folder / "result.json").write_text(json.dumps({
-                "jobId": folder.name, "status": "complete", "pages": [],
+                "jobId": folder.name, "status": "complete",
             }), encoding="utf-8")
             with patch.object(server, "DATA_ROOT", root):
+                server.JOB_STORES.clear()
+                server._job_store().replace_job_pages(folder.name, [{"page": 1, "candidates": []}])
                 existing = server._find_existing_analysis("same")
         self.assertEqual(existing["result"]["progressPercent"], 100)
 
@@ -827,15 +1007,24 @@ class ServerTests(unittest.TestCase):
                 "analysisAlgorithmVersion": server.ANALYSIS_ALGORITHM_VERSION,
             }), encoding="utf-8")
             (folder / "result.json").write_text(json.dumps({
-                "jobId": job_id, "status": "complete", "pages": [{"page": 1, "candidates": []}],
+                "jobId": job_id, "status": "complete",
             }), encoding="utf-8")
 
             with patch.object(server, "DATA_ROOT", root):
+                server.JOB_STORES.clear()
+                store = server._job_store()
+                store.create_job(
+                    job_id=job_id, analysis_signature="archive", job_folder=folder,
+                    original_target_name="done.pdf", algorithm_version=server.ANALYSIS_ALGORITHM_VERSION,
+                )
+                claimed = store.claim_next("worker-test", 60)
+                store.replace_job_pages(job_id, [{"page": 1, "candidates": []}])
+                self.assertTrue(store.finish(job_id, "complete", worker_id=str(claimed["lease_owner"])))
                 server._set_job_archived(job_id, True)
-                self.assertTrue(server._analysis_queue_snapshot()["jobs"][0]["isArchived"])
+                self.assertTrue(server._analysis_queue_snapshot(scope="archived")["jobs"][0]["isArchived"])
                 self.assertEqual(server._recent_batch_results()["jobs"], [])
                 server._set_job_archived(job_id, False)
-                self.assertFalse(server._analysis_queue_snapshot()["jobs"][0]["isArchived"])
+                self.assertFalse(server._analysis_queue_snapshot(scope="current")["jobs"][0]["isArchived"])
                 server._delete_completed_job(job_id)
 
             self.assertFalse(folder.exists())
@@ -892,13 +1081,21 @@ class ServerTests(unittest.TestCase):
             self.assertIn(1, [item.get("progressCompletedUnits") for item in progress_updates])
             self.assertIn(2, [item.get("progressCompletedUnits") for item in progress_updates])
             self.assertIn(25, [item.get("progressPercent") for item in progress_updates])
-            self.assertEqual(training_stage_progress, [95])
+            layout_updates = [item for item in progress_updates if item.get("progressStage") == "optimizing-layout"]
+            self.assertEqual([item.get("layoutCompletedPages") for item in layout_updates], [0, 1, 2])
+            self.assertEqual([item.get("progressPercent") for item in layout_updates], [95, 97.0, 99.0])
+            self.assertEqual(training_stage_progress, [99])
             saved = json.loads((folder / "result.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["progressCompletedUnits"], 4)
             self.assertEqual(saved["progressTotalUnits"], 4)
             self.assertEqual(saved["completedReferenceFiles"], 2)
             self.assertEqual(saved["completedPages"], 2)
             self.assertEqual(saved["progressPercent"], 100)
+            queue_summary = store.get(folder.name)["queueSummary"]
+            self.assertEqual(queue_summary["completedPages"], 2)
+            self.assertEqual(queue_summary["progressPercent"], 100)
+            self.assertEqual(queue_summary["progressStage"], "complete")
+            self.assertNotIn("pages", queue_summary)
 
     def test_worker_optimizes_all_pages_before_completing_job(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -943,7 +1140,9 @@ class ServerTests(unittest.TestCase):
                 job_runner.run_job(store, row, "worker-test")
 
             saved = json.loads((folder / "result.json").read_text(encoding="utf-8"))
-            self.assertTrue(all(page["candidates"][0]["labelX"] != 250 for page in saved["pages"]))
+            saved_pages = store.get_job_pages(folder.name)
+            self.assertNotIn("pages", saved)
+            self.assertTrue(all(page["candidates"][0]["labelX"] != 250 for page in saved_pages))
             self.assertNotIn("labelLayout", saved)
 
     def test_export_embeds_independent_marker_styles(self) -> None:
@@ -974,6 +1173,8 @@ class ServerTests(unittest.TestCase):
                 return output
 
             with patch.object(server, "DATA_ROOT", root), patch.object(server, "write_annotated_pdf", side_effect=fake_write):
+                server.JOB_STORES.clear()
+                server._job_store().replace_job_pages(job_id, [{"page": 1, "candidates": []}])
                 handler._export_job(job_id)
 
             self.assertEqual(captured["markerStyles"]["weld"]["frameSize"], 30)
@@ -981,61 +1182,67 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(captured["sourceFileName"], "target.pdf")
             self.assertTrue(responses)
 
-    def test_legacy_whole_job_save_is_disabled_without_changing_result(self) -> None:
+    def test_export_clears_stale_embedded_candidates_from_pages_omitted_by_filtered_payload(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             root = Path(folder_name)
-            job_id = "c" * 32
+            job_id = "d" * 32
             folder = root / job_id
             folder.mkdir()
+            (folder / "job.json").write_text(json.dumps({"targetFile": "target.pdf"}), encoding="utf-8")
             (folder / "result.json").write_text(json.dumps({
-                "status": "complete", "pages": [{"page": 1, "candidates": [{"id": "w1"}]}],
+                "status": "complete", "analyzedRange": [1, 2],
             }), encoding="utf-8")
+            (folder / "target.pdf").write_bytes(b"pdf")
             handler = object.__new__(server.ApiHandler)
-            handler.path = f"/api/jobs/{job_id}"
-            handler.headers = {}
-            handler._request_user = {"userId": "u1", "username": "张三"}
-            handler._read_json = lambda: {
-                "pages": [{"page": 1, "candidates": [{"id": "w1", "number": "F1"}]}],
-                "markerStyle": {"color": "#d4143c", "frameSize": 30},
-                "componentMarkerStyles": {"support": {"color": "#1769d2", "frameSize": 30}},
-                "markerStyles": {
-                    "weld": {"color": "#d4143c", "frameSize": 30},
-                    "components": {"support": {"color": "#1769d2", "frameSize": 30}},
-                },
-                "baseRevision": 0,
+            handler._read_json = lambda: {"candidates": [
+                {"id": "kept", "page": 1, "number": "F1", "included": True},
+            ]}
+            handler._json = lambda *_args: None
+            captured = {}
+
+            def fake_write(_source, output, _candidates, editable_data):
+                captured.update(editable_data)
+                output.write_bytes(b"annotated")
+                return output
+
+            with patch.object(server, "DATA_ROOT", root), patch.object(server, "write_annotated_pdf", side_effect=fake_write):
+                server.JOB_STORES.clear()
+                server._job_store().replace_job_pages(job_id, [
+                    {"page": 1, "candidates": [{"id": "old-1", "page": 1}], "candidateCount": 1},
+                    {"page": 2, "candidates": [{"id": "old-2", "page": 2}], "candidateCount": 1},
+                ])
+                handler._export_job(job_id)
+
+            pages = {page["page"]: page for page in captured["pages"]}
+            self.assertEqual([item["id"] for item in pages[1]["candidates"]], ["kept"])
+            self.assertEqual(pages[1]["candidateCount"], 1)
+            self.assertEqual(pages[2]["candidates"], [])
+            self.assertEqual(pages[2]["candidateCount"], 0)
+
+    def test_tutorial_export_clears_stale_embedded_candidates_when_all_are_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            export_root = Path(folder_name)
+            handler = object.__new__(server.ApiHandler)
+            handler._read_json = lambda: {"candidates": []}
+            handler._json = lambda *_args: None
+            captured = {}
+            tutorial_result = {
+                "status": "complete", "analyzedRange": [1, 1],
+                "pages": [{"page": 1, "candidates": [{"id": "old", "page": 1}], "candidateCount": 1}],
             }
-            responses = []
-            handler._json = lambda status, payload: responses.append((status, payload))
-            with patch.object(server, "DATA_ROOT", root):
-                handler.do_PUT()
 
-            saved = json.loads((folder / "result.json").read_text(encoding="utf-8"))
-            self.assertNotIn("number", saved["pages"][0]["candidates"][0])
-            self.assertEqual(responses[0][0], 409)
-            self.assertIn("逐页保存", responses[0][1]["error"])
+            def fake_write(_source, output, _candidates, editable_data):
+                captured.update(editable_data)
+                output.write_bytes(b"annotated")
+                return output
 
-    def test_save_job_rejects_stale_revision(self) -> None:
-        with tempfile.TemporaryDirectory() as folder_name:
-            root = Path(folder_name)
-            job_id = "f" * 32
-            folder = root / job_id
-            folder.mkdir()
-            (folder / "result.json").write_text(json.dumps({
-                "status": "complete", "revision": 2, "analyzedRange": [1, 1],
-                "pages": [{"page": 1, "candidates": []}],
-            }), encoding="utf-8")
-            handler = object.__new__(server.ApiHandler)
-            handler.path = f"/api/jobs/{job_id}"
-            handler.headers = {}
-            handler._request_user = {"userId": "u1", "username": "张三"}
-            handler._read_json = lambda: {"baseRevision": 1, "pages": [{"page": 1, "candidates": []}]}
-            responses = []
-            handler._json = lambda status, payload: responses.append((status, payload))
-            with patch.object(server, "DATA_ROOT", root):
-                handler.do_PUT()
-            self.assertEqual(responses[0][0], 409)
-            self.assertIn("逐页保存", responses[0][1]["error"])
+            with patch.object(server, "TUTORIAL_EXPORT_ROOT", export_root), \
+                    patch.object(server, "_create_tutorial_session", return_value=tutorial_result), \
+                    patch.object(server, "write_annotated_pdf", side_effect=fake_write):
+                handler._export_tutorial()
 
+            self.assertEqual(captured["pages"][0]["candidates"], [])
+            self.assertEqual(captured["pages"][0]["candidateCount"], 0)
 
 if __name__ == "__main__":
     unittest.main()

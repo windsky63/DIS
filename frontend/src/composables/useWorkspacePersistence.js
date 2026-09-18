@@ -10,7 +10,7 @@ export function useWorkspacePersistence({ state, operations }) {
 
   function scheduleDraftSave() {
     if (!state.activeFileFingerprint.value || !state.result.value || state.result.value.status === 'processing'
-        || state.applyingHistory.value || state.hydratingWorkspace.value || state.archivingWorkspace.value) return
+        || state.applyingHistory.value || state.hydratingWorkspace.value) return
     draftDirty.value = true
     backendSaveState.value = 'pending'
     operations.markDirty?.()
@@ -20,6 +20,15 @@ export function useWorkspacePersistence({ state, operations }) {
     if (!state.activeFileFingerprint.value || !state.result.value || state.result.value.status === 'processing'
         || state.applyingHistory.value || state.hydratingWorkspace.value || state.archivingWorkspace.value) return
     draftDirty.value = true
+  }
+
+  function markRecoveredPagesDirty(pages = []) {
+    const pageNumbers = new Set(pages
+      .map(page => Number(typeof page === 'object' ? page?.page : page))
+      .filter(page => Number.isInteger(page) && page > 0))
+    if (!pageNumbers.size) return
+    pageNumbers.forEach(page => operations.markDirty?.(page))
+    backendSaveState.value = 'pending'
   }
 
   async function persistDraftChanges() {
@@ -37,7 +46,9 @@ export function useWorkspacePersistence({ state, operations }) {
     savePromise = state.result.value.jobId === 'tutorial-000207'
       ? persistDraftChanges()
       : (async () => {
-          const savedPage = await operations.saveCurrentPage?.()
+          const savedPage = operations.saveAllDirtyPages
+            ? await operations.saveAllDirtyPages()
+            : await operations.saveCurrentPage?.()
           if (draftDirty.value) await persistDraftChanges()
           return savedPage
         })()
@@ -59,6 +70,7 @@ export function useWorkspacePersistence({ state, operations }) {
   function dispose() {}
   return {
     backendSaveState, backendSaveButtonLabel, draftDirty,
-    scheduleDraftSave, scheduleWorkspaceDraftSave, persistDraftChanges, persistBackendChanges, dispose,
+    scheduleDraftSave, scheduleWorkspaceDraftSave, markRecoveredPagesDirty,
+    persistDraftChanges, persistBackendChanges, dispose,
   }
 }

@@ -45,7 +45,32 @@ class _StreamResponse:
 
 
 class AiAssistantTests(unittest.TestCase):
-    def test_system_prompt_describes_real_components_and_injects_workspace_state(self) -> None:
+    def test_deepseek_balance_is_normalized_without_exposing_credentials(self) -> None:
+        captured = {}
+
+        def opener(request, timeout):
+            captured["url"] = request.full_url
+            captured["authorization"] = request.get_header("Authorization")
+            return _Response({
+                "is_available": True,
+                "balance_infos": [{
+                    "currency": "CNY", "total_balance": "12.50",
+                    "granted_balance": "2.50", "topped_up_balance": "10.00",
+                }],
+            })
+
+        with patch.dict("os.environ", {
+            "DRAWING_MARK_RECOGNITION_AI_PROVIDER": "deepseek",
+            "DEEPSEEK_API_KEY": "balance-secret",
+        }, clear=True):
+            result = ai_assistant.account_balance(opener=opener)
+
+        self.assertEqual(captured["url"], "https://api.deepseek.com/user/balance")
+        self.assertEqual(captured["authorization"], "Bearer balance-secret")
+        self.assertEqual(result["balances"][0]["totalBalance"], "12.50")
+        self.assertNotIn("balance-secret", json.dumps(result))
+
+    def test_system_prompt_is_compact_uses_documents_and_injects_workspace_state(self) -> None:
         prompt = ai_assistant._system_message({
             "jobLoaded": True,
             "currentPage": 3,
@@ -58,18 +83,15 @@ class AiAssistantTests(unittest.TestCase):
             "jobStatus": "complete",
         })
 
-        for component_name in (
-            "识别输入与操作", "拓扑标识辅助区域", "解析队列", "系统设置", "操作教程",
-            "智能编号", "推入解析队列", "保存并关闭", "全部标识修改模式",
-        ):
-            self.assertIn(component_name, prompt)
+        self.assertLess(len(ai_assistant.SYSTEM_PROMPT), 1_000)
+        self.assertIn("先使用系统文档工具", prompt)
+        self.assertIn("不要在段落后添加", prompt)
+        self.assertIn("参考资料", prompt)
+        self.assertIn("前端会单独展示检索来源", prompt)
         self.assertIn('"referenceMode": "pdf"', prompt)
         self.assertIn('"editMode": "all"', prompt)
         self.assertIn('"markerCount": 26', prompt)
         self.assertIn('"selectedMarkerType": "flange"', prompt)
-        self.assertNotIn("全部重编", prompt)
-        self.assertIn("先检索系统文档", prompt)
-        self.assertIn("不可信证据", prompt)
 
     def test_stream_chat_completion_yields_deepseek_content_deltas_until_done(self) -> None:
         captured = {}
@@ -115,10 +137,10 @@ class AiAssistantTests(unittest.TestCase):
             "DEEPSEEK_API_KEY": "deepseek-secret",
         }
         with patch.dict("os.environ", environment, clear=True):
-            answer = ai_assistant.chat_completion(
-                [{"role": "user", "content": "如何开始？"}],
-                opener=opener,
-            )
+            events = list(ai_assistant.stream_chat_completion(
+                [{"role": "user", "content": "如何开始？"}], opener=opener,
+            ))
+            answer = "".join(event.payload.get("content", "") for event in events if event.type == "delta")
             status = ai_assistant.configuration_status()
 
         self.assertEqual(answer, "可以开始核对图纸。")
@@ -150,7 +172,7 @@ class AiAssistantTests(unittest.TestCase):
             "model": "deepseek-v4-flash",
         })
 
-    def test_chat_completion_keeps_credentials_on_server_and_injects_product_guidance(self) -> None:
+    def test_stream_completion_keeps_credentials_on_server_and_injects_product_guidance(self) -> None:
         captured = {}
 
         def opener(request, timeout):
@@ -169,11 +191,11 @@ class AiAssistantTests(unittest.TestCase):
             "DRAWING_MARK_RECOGNITION_AI_MODEL": "guide-model",
         }
         with patch.dict("os.environ", environment, clear=False):
-            answer = ai_assistant.chat_completion(
+            events = list(ai_assistant.stream_chat_completion(
                 [{"role": "user", "content": "如何开始？"}],
-                context={"currentPage": 3, "jobLoaded": True},
-                opener=opener,
-            )
+                context={"currentPage": 3, "jobLoaded": True}, opener=opener,
+            ))
+            answer = "".join(event.payload.get("content", "") for event in events if event.type == "delta")
 
         self.assertEqual(answer, "请先上传待标识图纸。")
         self.assertEqual(captured["headers"]["Authorization"], "Bearer server-secret")

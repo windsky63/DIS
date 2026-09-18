@@ -57,11 +57,19 @@ def atomic_dump(path: Path, payload: dict[str, Any]) -> None:
             pass
 
 
-def update_result(folder: Path, update: dict[str, Any]) -> dict[str, Any]:
+def update_result(
+    folder: Path,
+    update: dict[str, Any],
+    *,
+    store: JobStore | None = None,
+    job_id: str | None = None,
+) -> dict[str, Any]:
     result_path = folder / "result.json"
     current = json.loads(result_path.read_text(encoding="utf-8"))
     current.update(update)
     atomic_dump(result_path, current)
+    if store is not None and job_id is not None:
+        store.update_queue_summary(job_id, current)
     return current
 
 
@@ -129,6 +137,7 @@ def run_job(
     folder = Path(str(row["job_folder"]))
     existing_result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
     if existing_result.get("status") == "complete":
+        store.update_queue_summary(job_id, existing_result)
         store.finish(job_id, "complete", worker_id=worker_id)
         log(f"[智能编号] 任务 {job_id} 的结果已完成，已修复队列终态")
         return "complete"
@@ -159,13 +168,17 @@ def run_job(
             raise JobCancelled("用户取消了解析任务")
 
     try:
+        def publish_result(update: dict[str, Any]) -> dict[str, Any]:
+            return update_result(folder, update, store=store, job_id=job_id)
+
         ensure_not_cancelled()
-        initial_state = update_result(folder, {
+        initial_state = publish_result({
             "status": "processing",
             "progressStage": "starting",
             "progressPercent": 15,
             "progressMessage": "Worker已领取任务，正在启动解析",
         })
+        store.clear_job_pages(job_id)
         total_pages = max(0, int(initial_state.get("totalPages") or 0))
         total_reference_files = len(references)
         progress_total_units = max(1, total_reference_files + total_pages)
@@ -212,33 +225,24 @@ def run_job(
                 update["progressPercent"] = analysis_progress_percent(
                     update["progressCompletedUnits"], progress_total_units
                 )
-            update_result(folder, update)
+            publish_result(update)
 
         def publish_page(page: dict[str, Any]) -> None:
             ensure_not_cancelled()
             page.setdefault("reviewRevision", 0)
-            result_path = folder / "result.json"
-            current = json.loads(result_path.read_text(encoding="utf-8"))
-            pages = [
-                existing for existing in current.get("pages", [])
-                if int(existing.get("page") or 0) != int(page.get("page") or 0)
-            ]
-            pages.append(page)
-            pages.sort(key=lambda item: int(item.get("page") or 0))
-            current.update({
-                "pages": pages,
-                "completedPages": len(pages),
+            completed_pages = store.publish_analysis_page(job_id, page)
+            publish_result({
+                "completedPages": completed_pages,
                 "progressStage": "design",
                 "completedReferenceFiles": total_reference_files,
                 "totalReferenceFiles": total_reference_files,
-                "progressCompletedUnits": total_reference_files + len(pages),
+                "progressCompletedUnits": total_reference_files + completed_pages,
                 "progressTotalUnits": progress_total_units,
                 "progressPercent": analysis_progress_percent(
-                    total_reference_files + len(pages), progress_total_units
+                    total_reference_files + completed_pages, progress_total_units
                 ),
                 "progressMessage": f"第 {page.get('page')} 页分析完成，已同步到前端",
             })
-            atomic_dump(result_path, current)
 
         result = analyze_documents(
             target,
@@ -251,12 +255,27 @@ def run_job(
             page_callback=publish_page,
         )
         ensure_not_cancelled()
-        update_result(folder, {
+        publish_result({
             "progressStage": "optimizing-layout",
             "progressPercent": 95,
+            "layoutCompletedPages": 0,
+            "layoutTotalPages": len(result.get("pages") or []),
             "progressMessage": "页面解析完成，正在优化全部页面的标识位置",
         })
-        layout_totals = optimize_result_label_positions(result)
+        def report_layout_progress(completed: int, total: int) -> None:
+            ensure_not_cancelled()
+            safe_total = max(1, total)
+            publish_result({
+                "progressStage": "optimizing-layout",
+                "progressPercent": round(95 + 4 * min(1.0, completed / safe_total), 2),
+                "layoutCompletedPages": completed,
+                "layoutTotalPages": total,
+                "progressMessage": f"正在优化标识位置：{completed} / {total} 页",
+            })
+
+        layout_totals = optimize_result_label_positions(
+            result, progress_callback=report_layout_progress
+        )
         log(
             f"[智能编号] 任务 {job_id} 已优化全部页面标识："
             f"放置 {layout_totals['placed']} 个，移动 {layout_totals['moved']} 个"
@@ -271,7 +290,7 @@ def run_job(
             "totalReferenceFiles": total_reference_files,
             "progressCompletedUnits": progress_total_units,
             "progressTotalUnits": progress_total_units,
-            "progressPercent": 95,
+            "progressPercent": 99,
             "progressMessage": "页面解析完成，正在自动生成 AI 训练样本",
             "revision": 0,
             "project": meta.get("project") or initial_state.get("project") or {},
@@ -281,6 +300,7 @@ def run_job(
         for page in result.get("pages") or []:
             page.setdefault("reviewRevision", 0)
         atomic_dump(folder / "result.json", result)
+        store.update_queue_summary(job_id, result)
         training_error = ""
         try:
             training_output, training_count = write_training_sample(job_id, folder)
@@ -302,7 +322,11 @@ def run_job(
             "progressMessage": "全部页面分析与训练样本导出完成" if not training_error else "页面分析完成，训练样本导出失败",
             "updatedAt": datetime.now().isoformat(timespec="seconds"),
         })
-        atomic_dump(folder / "result.json", result)
+        store.replace_job_pages(job_id, list(result.get("pages") or []))
+        result_metadata = dict(result)
+        result_metadata.pop("pages", None)
+        atomic_dump(folder / "result.json", result_metadata)
+        store.update_queue_summary(job_id, result_metadata)
         if not store.finish(job_id, "complete", worker_id=worker_id):
             if store.cancellation_requested(job_id):
                 raise JobCancelled("用户在任务完成提交前取消了解析任务")
@@ -310,7 +334,7 @@ def run_job(
         log(f"[智能编号] Worker {worker_id} 完成任务 {job_id}")
         return "complete"
     except JobCancelled:
-        update_result(folder, {"status": "cancelled", "progressStage": "cancelled", "progressMessage": "解析任务已取消"})
+        publish_result({"status": "cancelled", "progressStage": "cancelled", "progressMessage": "解析任务已取消"})
         store.finish(job_id, "cancelled", worker_id=worker_id)
         log(f"[智能编号] Worker {worker_id} 已取消任务 {job_id}")
         return "cancelled"
@@ -320,7 +344,7 @@ def run_job(
     except Exception as exc:
         traceback.print_exc()
         try:
-            update_result(folder, {"status": "failed", "error": str(exc), "progressStage": "failed", "progressMessage": "分析失败"})
+            publish_result({"status": "failed", "error": str(exc), "progressStage": "failed", "progressMessage": "分析失败"})
         finally:
             store.finish(job_id, "failed", str(exc), worker_id=worker_id)
         log(f"[智能编号] Worker {worker_id} 任务 {job_id} 失败：{exc}")

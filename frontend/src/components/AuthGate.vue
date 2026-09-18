@@ -2,36 +2,23 @@
 import { computed, ref, watch } from 'vue'
 
 import { validateAuthForm } from '../authFormValidation.js'
-import {
-  clearRememberedCredentials,
-  loadRememberedCredentials,
-  saveRememberedCredentials,
-} from '../rememberedCredentials.js'
 
 const props = defineProps({ auth: { type: Object, required: true } })
-const credentialStorage = typeof localStorage === 'undefined' ? null : localStorage
-const savedCredentials = loadRememberedCredentials(credentialStorage)
 const mode = ref('login')
-const username = ref(savedCredentials.username)
-const password = ref(savedCredentials.password)
+const username = ref('')
+const password = ref('')
 const confirmPassword = ref('')
 const showPassword = ref(false)
 const attempted = ref(false)
-const rememberPassword = ref(savedCredentials.remembered)
+const rememberPassword = ref(false)
 
 const validation = computed(() => validateAuthForm({ mode: mode.value, username: username.value, password: password.value, confirmPassword: confirmPassword.value }))
 const usernameError = computed(() => attempted.value || username.value ? validation.value.username : '')
 const passwordError = computed(() => attempted.value || password.value ? validation.value.password : '')
 const confirmPasswordError = computed(() => attempted.value || confirmPassword.value ? validation.value.confirmPassword : '')
 
-watch(mode, nextMode => {
-  if (nextMode === 'login' && rememberPassword.value) {
-    const saved = loadRememberedCredentials(credentialStorage)
-    username.value = saved.username
-    password.value = saved.password
-  } else {
-    password.value = ''
-  }
+watch(mode, () => {
+  password.value = ''
   confirmPassword.value = ''
   showPassword.value = false
   attempted.value = false
@@ -43,11 +30,8 @@ async function submit() {
   props.auth.clearError?.()
   if (!validation.value.valid) return
   try {
-    await props.auth[mode.value](username.value.trim(), password.value)
-    if (mode.value === 'login') {
-      if (rememberPassword.value) saveRememberedCredentials(credentialStorage, { username: username.value.trim(), password: password.value })
-      else clearRememberedCredentials(credentialStorage)
-    }
+    if (mode.value === 'login') await props.auth.login(username.value.trim(), password.value, rememberPassword.value)
+    else await props.auth.register(username.value.trim(), password.value)
   } catch { /* auth.error renders the server message */ }
 }
 

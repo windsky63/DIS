@@ -11,7 +11,7 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 import assistant_tools
-from document_knowledge import KnowledgeChunk, KnowledgeError, KnowledgeSource
+from document_knowledge import DocumentKnowledge, KnowledgeChunk, KnowledgeError, KnowledgeSource
 
 
 class _Knowledge:
@@ -102,6 +102,25 @@ class AssistantToolTests(unittest.TestCase):
         self.assertLessEqual(len(execution.content), assistant_tools.MAX_TOOL_CONTENT_CHARS)
         self.assertLessEqual(len(json.loads(execution.content)["results"]), 6)
         self.assertTrue(execution.sources)
+
+    def test_real_knowledge_covers_common_user_questions(self) -> None:
+        knowledge = DocumentKnowledge(BACKEND.parent)
+        cases = [
+            ("如何选择对照 PDF 或 PCF", "usage-guide", "参考资料如何选择"),
+            ("任务一直排队如何排查 Worker", "usage-guide", "任务队列与恢复"),
+            ("小屏幕工具栏按钮重叠", "usage-guide", "界面与屏幕适配"),
+            ("后台管理用户表和密钥余额", "usage-guide", "后台管理"),
+            ("如何部署 Docker 并配置 HTTPS", "deployment-guide", "Docker 部署"),
+        ]
+
+        for query, document_id, section in cases:
+            with self.subTest(query=query):
+                results = knowledge.search(query, limit=3)
+                self.assertTrue(results)
+                self.assertTrue(any(
+                    result.source.document_id == document_id and section in result.section
+                    for result in results
+                ))
 
 
 if __name__ == "__main__":

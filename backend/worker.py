@@ -24,9 +24,6 @@ except ImportError:  # Direct ``python backend/worker.py`` execution.
 ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = ROOT / "data" / "jobs"
 DATABASE_PATH = DATA_ROOT / ".queue" / "jobs.db"
-ALGORITHM_VERSION = os.environ.get(
-    "DRAWING_MARK_RECOGNITION_ALGORITHM_VERSION", "2026-09-08.1"
-)
 
 
 def _console(message: str) -> None:
@@ -62,9 +59,6 @@ def main() -> None:
     worker_id = args.worker_id or f"{os.environ.get('HOSTNAME', 'worker')}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     store = JobStore(DATABASE_PATH)
     store.initialize()
-    imported = store.import_existing(DATA_ROOT, ALGORITHM_VERSION)
-    if imported:
-        _console(f"已导入 {imported} 个历史任务")
 
     stopping = threading.Event()
 

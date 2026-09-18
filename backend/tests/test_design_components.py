@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import fitz
 
@@ -16,7 +17,9 @@ from backend.design_components import (
     _valve_material_numbers,
     extract_design_component_symbols,
 )
-from backend.engine import _match_design_components_to_reference, analyze_documents
+from backend.engine import _match_design_components_to_reference, _match_design_components_to_references, analyze_documents
+from backend.iso_weld_matcher.dual_pdf_topology import _semantic_pair_evidence, match_weld_callout_topology
+import numpy as np
 
 
 def _draw_design_components(page: fitz.Page) -> None:
@@ -224,16 +227,22 @@ class DesignComponentRecognitionTests(unittest.TestCase):
 
         self.assertEqual(matched, 2)
         self.assertEqual([item["referenceLabel"] for item in components], ["FL2", "FL1"])
-        self.assertTrue(all(item["componentMatchMethod"] == "weld-relative-topology-one-to-one" for item in components))
+        self.assertTrue(all(item["componentMatchMethod"] == "shared-weld-pipeline-topology-one-to-one" for item in components))
+        for item in components:
+            evidence = item["componentMatchEvidence"]
+            self.assertIn("design_pdf_graph_address", evidence)
+            self.assertIn("design_port_signature", evidence)
+            self.assertTrue(evidence["forced_unique"])
+            self.assertFalse(evidence["number_used_as_identity"])
 
-    def test_support_chain_is_matched_monotonically_from_a_shared_weld_anchor(self) -> None:
+    def test_support_chain_uses_full_pipeline_not_a_separate_ordering_rule(self) -> None:
         components = [
-            {"componentType": "support", "x": 100.0, "y": 90.0},
-            {"componentType": "support", "x": 100.0, "y": 30.0},
-            {"componentType": "support", "x": 100.0, "y": 60.0},
+            {"componentType": "support", "x": 90.0, "y": 10.0},
+            {"componentType": "support", "x": 30.0, "y": 10.0},
+            {"componentType": "support", "x": 60.0, "y": 10.0},
         ]
         welds = [
-            {"x": 100.0, "y": 0.0, "referenceLabel": "F1", "referenceMatched": True},
+            {"x": 0.0, "y": 0.0, "referenceLabel": "F1", "referenceMatched": True},
         ]
         reference = {
             "file": "ep3d.pdf",
@@ -246,15 +255,85 @@ class DesignComponentRecognitionTests(unittest.TestCase):
             ],
         }
 
-        matched = _match_design_components_to_reference(components, welds, reference)
+        with patch("backend.engine.match_weld_callout_topology", wraps=match_weld_callout_topology) as shared:
+            matched = _match_design_components_to_reference(components, welds, reference)
+        self.assertEqual(shared.call_count, 1)
 
         self.assertEqual(matched, 3)
         self.assertEqual([item["referenceLabel"] for item in components], ["SP3", "SP1", "SP2"])
         self.assertTrue(all(
-            item["componentMatchMethod"] == "weld-anchored-support-chain-one-to-one"
+            item["componentMatchMethod"] == "shared-weld-pipeline-topology-one-to-one"
             for item in components
         ))
-        self.assertTrue(all(item["componentMatchAnchor"] == "F1" for item in components))
+        self.assertTrue(all("componentMatchAnchor" not in item for item in components))
+
+    def test_singleton_without_topology_evidence_is_not_automatically_matched(self) -> None:
+        components = [{"componentType": "valve", "x": 50.0, "y": 50.0}]
+        reference = {"file": "ref.pdf", "page": 1, "component_callouts": [
+            SimpleNamespace(label="V1", component_type="valve", component_point=(50.0, 50.0)),
+        ]}
+        self.assertEqual(_match_design_components_to_reference(components, [], reference), 0)
+        self.assertFalse(components[0].get("referenceMatched", False))
+        self.assertEqual(components[0]["componentMatchDiagnostics"][0]["status"], "insufficient-callouts")
+
+    def test_all_component_types_share_typed_graph_with_weld_context(self) -> None:
+        components = [
+            {"componentType": "valve", "x": 20.0, "y": 10.0},
+            {"componentType": "flange", "x": 50.0, "y": 10.0},
+            {"componentType": "support", "x": 80.0, "y": 10.0},
+        ]
+        welds = [{"x": 0.0, "y": 0.0}, {"x": 100.0, "y": 0.0}, {"x": 0.0, "y": 100.0}]
+        skeleton = {"segments": [{"start": [0.0, 10.0], "end": [100.0, 10.0]}]}
+        reference = {"file": "ref.pdf", "page": 1, "skeleton": skeleton, "callouts": [
+            SimpleNamespace(label=f"F{i + 1}", weld_point=(item["x"], item["y"]))
+            for i, item in enumerate(welds)
+        ], "component_callouts": [
+            SimpleNamespace(label=label, component_type=item["componentType"], component_point=(item["x"], item["y"]))
+            for item, label in zip(components, ["V9", "FL7", "SP4"])
+        ]}
+        with patch("backend.engine.match_weld_callout_topology", wraps=match_weld_callout_topology) as shared:
+            matched = _match_design_components_to_reference(components, welds, reference, design_skeleton=skeleton)
+        self.assertEqual(matched, 3)
+        self.assertEqual([item["referenceLabel"] for item in components], ["V9", "FL7", "SP4"])
+        args, kwargs = shared.call_args
+        self.assertEqual([node.node_type for node in args[0]], ["weld"] * 3 + ["valve", "flange", "support"])
+        self.assertIs(kwargs["design_skeleton"], skeleton)
+        self.assertTrue(all(not item.get("referenceMatched") for item in welds))
+
+    def test_reference_attempt_errors_leave_components_available_for_review(self) -> None:
+        components = [{"componentType": "valve", "x": 50.0, "y": 50.0}]
+        reference = {"file": "ref.pdf", "page": 1, "component_callouts": [
+            SimpleNamespace(label="V1", component_type="valve", component_point=(50.0, 50.0)),
+        ]}
+        with patch("backend.engine.match_weld_callout_topology", side_effect=RuntimeError("invalid graph")):
+            self.assertEqual(_match_design_components_to_reference(components, [], reference), 0)
+        self.assertEqual(components[0]["componentMatchDiagnostics"][0]["error"], "invalid graph")
+
+    def test_type_mismatch_is_hard_semantic_rejection_even_without_port_evidence(self) -> None:
+        for other_type in ("weld", "flange", "support"):
+            evidence = _semantic_pair_evidence(
+                {"node_type": "valve"}, {"node_type": other_type},
+                np.array([[1., 0.], [0., 1.], [0., 0.]]), {}, {},
+            )
+            self.assertIn("physical-object-type-mismatch", evidence["hard_violation_reasons"])
+
+    def test_reference_pages_compete_by_shared_match_evidence_not_page_order(self) -> None:
+        components = [{"componentType": "valve", "x": 50.0, "y": 50.0}]
+        references = [
+            {"file": "ref.pdf", "page": page, "component_callouts": [
+                SimpleNamespace(label=f"V{page}", component_type="valve", component_point=(50.0, 50.0)),
+            ]}
+            for page in (1, 2)
+        ]
+        results = [
+            {"matches": [{"design_index": 0, "ep3d_index": 0, "confidence": confidence,
+                          "forced_uniqueness_margin": .1, "assignment_cost": .1}]}
+            for confidence in ("medium", "high")
+        ]
+        with patch("backend.engine.match_weld_callout_topology", side_effect=results):
+            self.assertEqual(_match_design_components_to_references(components, [], references), 1)
+        self.assertEqual(components[0]["referenceLabel"], "V2")
+        self.assertEqual(components[0]["referencePage"], 2)
 
     def test_material_callouts_find_both_valves_two_flanges_and_support(self) -> None:
         document = fitz.open()

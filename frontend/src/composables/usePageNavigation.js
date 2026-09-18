@@ -7,6 +7,17 @@ export function resolvePageJump(value, availablePages) {
   return availablePages.includes(page) ? page : null
 }
 
+export function pageLockFallbacks(targetPage, currentPage, availablePages) {
+  const target = Number(targetPage)
+  const current = Number(currentPage)
+  const ordered = availablePages.map(Number).filter(Number.isFinite).sort((a, b) => a - b)
+  const targetIndex = ordered.indexOf(target)
+  if (targetIndex < 0 || target === current) return []
+  return target > current
+    ? ordered.slice(targetIndex + 1)
+    : ordered.slice(0, targetIndex).reverse()
+}
+
 export function usePageNavigation({ result, pages, currentPage, previewPage, targetDocument, pageButtonsPerGroup, changePage, pageMatchSummary, pageLocks = null, clientInstanceId = '' }) {
   const shownPage = computed(() => result.value ? currentPage.value : previewPage.value)
   const targetPageCount = computed(() => targetDocument.value?.numPages || 0)
@@ -19,19 +30,22 @@ export function usePageNavigation({ result, pages, currentPage, previewPage, tar
   const canShowPreviousGroup = computed(() => groupStart.value > 0)
   const canShowNextGroup = computed(() => groupStart.value + pageButtonsPerGroup.value < navigationPages.value.length)
 
+  function navigate(page) {
+    void changePage(page, pageLockFallbacks(page, shownPage.value, navigationPages.value))
+  }
   function step(direction) {
     const next = navigationPages.value[navigationIndex.value + direction]
-    if (Number.isFinite(next)) void changePage(next)
+    if (Number.isFinite(next)) navigate(next)
   }
   function stepGroup(direction) {
     const targetIndex = direction > 0 ? groupStart.value + pageButtonsPerGroup.value : Math.max(0, groupStart.value - pageButtonsPerGroup.value)
     const next = navigationPages.value[targetIndex]
-    if (Number.isFinite(next)) void changePage(next)
+    if (Number.isFinite(next)) navigate(next)
   }
   function jump(value) {
     const page = resolvePageJump(value, navigationPages.value)
     if (page === null) return false
-    void changePage(page)
+    navigate(page)
     return true
   }
   function pageClasses(pageNumber) {
@@ -41,10 +55,11 @@ export function usePageNavigation({ result, pages, currentPage, previewPage, tar
     const lockedByOther = Boolean(lock && lock.clientInstanceId !== clientInstanceId)
     return {
       'page-status-button--active': shownPage.value === pageNumber,
+      'page-status-button--preview': !result.value,
       'page-status-button--complete': Boolean(page && complete),
       'page-status-button--incomplete': Boolean(page && !complete),
       'page-status-button--locked': lockedByOther,
     }
   }
-  return { shownPage, targetPageCount, navigationPages, visiblePages, canShowPreviousGroup, canShowNextGroup, step, stepGroup, jump, pageClasses }
+  return { shownPage, targetPageCount, navigationPages, visiblePages, canShowPreviousGroup, canShowNextGroup, navigate, step, stepGroup, jump, pageClasses }
 }
