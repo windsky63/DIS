@@ -1,3 +1,5 @@
+import { markerGeometry } from './markerGeometry.js'
+
 const REGULAR_LEADER_MULTIPLIER = 12
 const EMERGENCY_LEADER_MULTIPLIER = 18
 const MAX_REPAIR_PASSES = 3
@@ -69,10 +71,8 @@ function createSegmentIndex(segments, cellSize = 64) {
 
 function dimensions(item, resolveStyle) {
   const style = resolveStyle(item) || {}
-  const size = Number(style.frameSize) || 28
-  const fontSize = Number(style.fontSize) || 15
-  const width = style.shape === 'rectangle' ? Math.max(size * 1.35, 10 + String(item.number || '?').length * fontSize * .68) : size
-  return { width, height: size, frame: Math.max(width, size) }
+  const { width, height } = markerGeometry(item, style)
+  return { width, height, frame: Math.max(width, height) }
 }
 const layoutBounds = (item, page) => item._layoutBounds || { left: 0, top: 0, right: Number(page.width), bottom: Number(page.height) }
 

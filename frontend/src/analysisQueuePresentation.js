@@ -7,7 +7,7 @@ export function queueSummaryChips(queue = {}) {
 }
 
 export function archiveActionLabel(job = {}) {
-  return job.isArchived ? '移回解析队列' : '归档'
+  return job.isArchived ? '移回任务队列' : '归档'
 }
 
 export function isCancellationPending(job = {}, cancellingJobIds = []) {

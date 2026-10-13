@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
 import hashlib
 import hmac
 from pathlib import Path
@@ -11,6 +10,11 @@ import secrets
 import sqlite3
 import time
 from typing import Callable, Iterator, Sequence
+
+try:
+    from .time_utils import beijing_from_timestamp
+except ImportError:
+    from time_utils import beijing_from_timestamp
 
 
 class PageLockConflict(RuntimeError):
@@ -74,8 +78,8 @@ class PageLockStore:
             "page": int(row["page_number"]),
             "owner": {"userId": str(row["owner_user_id"]), "username": str(row["owner_username"])},
             "clientInstanceId": str(row["client_instance_id"]),
-            "acquiredAt": datetime.fromtimestamp(float(row["acquired_at"])).isoformat(timespec="seconds"),
-            "expiresAt": datetime.fromtimestamp(float(row["expires_at"])).isoformat(timespec="seconds"),
+            "acquiredAt": beijing_from_timestamp(float(row["acquired_at"])).isoformat(timespec="seconds"),
+            "expiresAt": beijing_from_timestamp(float(row["expires_at"])).isoformat(timespec="seconds"),
         }
         if token is not None:
             result["lockToken"] = token

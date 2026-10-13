@@ -8,7 +8,8 @@ export function useAnalysisQueue({ currentResult, error, showNotice, client = ap
   const loading = ref(false)
   const actionId = ref('')
   const cancellingJobIds = ref([])
-  const tab = ref('current')
+  const tab = ref('analysis')
+  const archivedTaskType = ref('analysis')
   const page = ref(1)
   const pageSize = 20
   const deleteTarget = ref(null)
@@ -16,24 +17,29 @@ export function useAnalysisQueue({ currentResult, error, showNotice, client = ap
   const queue = ref({
     jobs: [], runningCount: 0, queuedCount: 0, archivedCount: 0, currentCount: 0,
     maxConcurrent: 1,
-    pagination: { scope: 'current', page: 1, pageSize, totalItems: 0, totalPages: 0 },
+    pagination: { scope: 'current', taskType: 'analysis', page: 1, pageSize, totalItems: 0, totalPages: 0 },
   })
   const visibleJobs = computed(() => queue.value.jobs.filter(job => job.status !== 'cancelled'))
   let refreshGeneration = 0
 
   async function refresh(showLoading = true) {
     const generation = ++refreshGeneration
-    const requestedScope = tab.value
+    const requestedScope = tab.value === 'archived' ? 'archived' : 'current'
+    const requestedTaskType = tab.value === 'archived'
+      ? archivedTaskType.value
+      : (tab.value === 'direct-placement' ? 'direct-placement' : 'analysis')
     const requestedPage = page.value
     if (showLoading) loading.value = true
     try {
-      const snapshot = await client.getAnalysisQueue({ scope: requestedScope, page: requestedPage, pageSize })
+      const snapshot = await client.getAnalysisQueue({
+        scope: requestedScope, taskType: requestedTaskType, page: requestedPage, pageSize,
+      })
       if (generation !== refreshGeneration) return
       queue.value = { ...snapshot, jobs: snapshot.jobs || [] }
       page.value = Number(snapshot.pagination?.page) || 1
     } catch (cause) {
       if (generation !== refreshGeneration) return
-      error.value = `读取解析队列失败：${cause.message || cause}`
+      error.value = `读取任务队列失败：${cause.message || cause}`
     } finally {
       if (generation === refreshGeneration) loading.value = false
     }
@@ -51,7 +57,13 @@ export function useAnalysisQueue({ currentResult, error, showNotice, client = ap
   }
 
   async function selectTab(nextTab) {
-    tab.value = nextTab === 'archived' ? 'archived' : 'current'
+    tab.value = ['analysis', 'direct-placement', 'archived'].includes(nextTab) ? nextTab : 'analysis'
+    page.value = 1
+    await refresh(false)
+  }
+
+  async function selectArchivedTaskType(nextType) {
+    archivedTaskType.value = nextType === 'direct-placement' ? 'direct-placement' : 'analysis'
     page.value = 1
     await refresh(false)
   }
@@ -88,6 +100,20 @@ export function useAnalysisQueue({ currentResult, error, showNotice, client = ap
     finally { actionId.value = '' }
   }
 
+  async function exportFile(job, type = 'modified') {
+    if (!job?.canRestore || actionId.value) return
+    actionId.value = job.jobId
+    try {
+      const exported = type === 'csv'
+        ? await client.exportSavedCsv(job.jobId)
+        : await client.exportSavedPdf(job.jobId, type === 'initial' ? 'initial' : 'current')
+      globalThis.location.href = exported.downloadUrl
+      const label = type === 'initial' ? '原始解析 PDF' : type === 'csv' ? 'CSV 数据' : '修改版本 PDF'
+      showNotice(`已生成“${job.fileName}”的${label}。`)
+    } catch (cause) { error.value = cause.message || String(cause) }
+    finally { actionId.value = '' }
+  }
+
   function requestDelete(job) {
     if (!job?.canDelete || currentResult.value?.jobId === job.jobId) return
     deleteTarget.value = job
@@ -103,13 +129,13 @@ export function useAnalysisQueue({ currentResult, error, showNotice, client = ap
       deleteDialog.value = false
       deleteTarget.value = null
       await refresh(false)
-      showNotice(`已永久删除解析任务“${job.fileName}”。`)
+      showNotice(`已永久删除任务“${job.fileName}”。`)
     } catch (cause) { error.value = cause.message || String(cause) }
     finally { actionId.value = '' }
   }
 
   return {
-    dialog, loading, actionId, cancellingJobIds, tab, page, deleteTarget, deleteDialog, queue, visibleJobs,
-    refresh, open, changePage, selectTab, cancel, move, archive, requestDelete, confirmDelete,
+    dialog, loading, actionId, cancellingJobIds, tab, archivedTaskType, page, deleteTarget, deleteDialog, queue, visibleJobs,
+    refresh, open, changePage, selectTab, selectArchivedTaskType, cancel, move, archive, exportFile, requestDelete, confirmDelete,
   }
 }

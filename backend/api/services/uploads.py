@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from http import HTTPStatus
 import hashlib
 import json
@@ -14,6 +13,11 @@ from urllib.parse import unquote
 import uuid
 
 from ..exceptions import ApiError
+
+try:
+    from ...time_utils import beijing_now_text
+except ImportError:  # Direct ``python backend/server.py`` execution.
+    from time_utils import beijing_now_text
 
 
 JOB_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -79,7 +83,7 @@ def store_upload(
             "name": safe_name(unquote(original_name), "upload.bin"),
             "size": length,
             "sha256": digest.hexdigest(),
-            "createdAt": datetime.now().isoformat(timespec="seconds"),
+            "createdAt": beijing_now_text(),
         }
         dump_json(folder / "upload.json", meta)
         return meta

@@ -1,35 +1,36 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { createTutorialTargetTracker } from '../tutorialTargetTracker.js'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   steps: { type: Array, default: () => [] },
   tutorialTitle: { type: String, default: '操作教程' },
+  targetReady: { type: Boolean, default: true },
 })
 const emit = defineEmits(['update:modelValue', 'close', 'step-change'])
 const currentIndex = ref(0)
 const targetRect = ref(null)
-const cardStyle = ref({})
+const cardStyle = ref({ left: '50%', top: '50%', transform: 'translate(-50%, -50%)' })
 const cardElement = ref(null)
-let resizeObserver
+let lastTarget
+let cardResizeObserver
 
 const currentStep = computed(() => props.steps[currentIndex.value] || {})
 const isLastStep = computed(() => currentIndex.value === props.steps.length - 1)
 
-function resolveTarget() {
-  if (!props.modelValue) return
-  const target = currentStep.value.target ? document.querySelector(currentStep.value.target) : null
-  if (!target) {
+function positionCard(value) {
+  lastTarget = value
+  if (!value) {
     targetRect.value = null
     cardStyle.value = { left: '50%', top: '50%', transform: 'translate(-50%, -50%)' }
     return
   }
-  target.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
-  const rect = target.getBoundingClientRect()
+  const visibleRect = value.rect
   const padding = 8
   const highlighted = {
-    left: Math.max(8, rect.left - padding), top: Math.max(8, rect.top - padding),
-    right: Math.min(window.innerWidth - 8, rect.right + padding), bottom: Math.min(window.innerHeight - 8, rect.bottom + padding)
+    left: Math.max(8, visibleRect.left - padding), top: Math.max(8, visibleRect.top - padding),
+    right: Math.min(window.innerWidth - 8, visibleRect.right + padding), bottom: Math.min(window.innerHeight - 8, visibleRect.bottom + padding)
   }
   highlighted.width = highlighted.right - highlighted.left
   highlighted.height = highlighted.bottom - highlighted.top
@@ -50,7 +51,25 @@ function resolveTarget() {
   cardStyle.value = { left: `${left}px`, top: `${top}px`, width: `${cardWidth}px` }
 }
 
+let scrolledTarget
+const tracker = createTutorialTargetTracker({
+  isReady: () => props.modelValue && props.targetReady,
+  findTarget: () => {
+    const target = currentStep.value.target ? document.querySelector(currentStep.value.target) : null
+    if (target && target !== scrolledTarget) {
+      scrolledTarget = target
+      target.scrollIntoView?.({ block: 'nearest', inline: 'nearest', behavior: 'instant' })
+    }
+    return target
+  },
+  onTarget: positionCard,
+})
+function refreshTarget() {
+  if (props.modelValue) tracker.start()
+}
+
 function close(completed = false) {
+  tracker.stop()
   emit('update:modelValue', false)
   emit('close', { completed })
 }
@@ -73,25 +92,38 @@ watch(() => props.modelValue, async open => {
     currentIndex.value = 0
     emit('step-change', { index: 0, step: currentStep.value })
     await nextTick()
-    resolveTarget()
-  }
+    if (props.modelValue) refreshTarget()
+  } else tracker.stop()
 })
 watch(currentIndex, async () => {
+  tracker.stop()
+  scrolledTarget = null
+  positionCard(null)
   emit('step-change', { index: currentIndex.value, step: currentStep.value })
   await nextTick()
-  resolveTarget()
+  if (props.modelValue) refreshTarget()
 })
+watch(cardElement, element => {
+  cardResizeObserver?.disconnect()
+  if (element) cardResizeObserver?.observe(element)
+}, { flush: 'post' })
 onMounted(() => {
-  window.addEventListener('resize', resolveTarget)
+  window.addEventListener('resize', refreshTarget)
   window.addEventListener('keydown', onKeydown)
-  resizeObserver = new ResizeObserver(resolveTarget)
-  resizeObserver.observe(document.documentElement)
-  if (props.modelValue) resolveTarget()
+  cardResizeObserver = new ResizeObserver(() => {
+    if (lastTarget && props.modelValue) positionCard(lastTarget)
+  })
+  if (cardElement.value) cardResizeObserver.observe(cardElement.value)
+  if (props.modelValue) {
+    emit('step-change', { index: currentIndex.value, step: currentStep.value })
+    void nextTick().then(refreshTarget)
+  }
 })
 onBeforeUnmount(() => {
-  window.removeEventListener('resize', resolveTarget)
+  tracker.stop()
+  cardResizeObserver?.disconnect()
+  window.removeEventListener('resize', refreshTarget)
   window.removeEventListener('keydown', onKeydown)
-  resizeObserver?.disconnect()
 })
 </script>
 

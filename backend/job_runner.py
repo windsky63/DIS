@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -14,16 +13,22 @@ from typing import Any, Callable
 import uuid
 import zipfile
 
+import fitz
+
 try:
     from .engine import analyze_documents, dump_result, render_page
     from .job_store import JobStore
     from .label_layout import optimize_result_label_positions
+    from .pdf_optimizer import optimize_pdf
     from .progress import analysis_progress_percent
+    from .time_utils import beijing_now_text
 except ImportError:  # Direct ``python backend/worker.py`` execution.
     from engine import analyze_documents, dump_result, render_page
     from job_store import JobStore
     from label_layout import optimize_result_label_positions
+    from pdf_optimizer import optimize_pdf
     from progress import analysis_progress_percent
+    from time_utils import beijing_now_text
 
 
 class JobCancelled(RuntimeError):
@@ -32,6 +37,78 @@ class JobCancelled(RuntimeError):
 
 class LeaseLost(RuntimeError):
     pass
+
+
+_COMPONENT_PREFIXES = {"valve": "V", "flange": "FL", "support": "SP"}
+
+
+def _is_design_component(candidate: dict[str, Any]) -> bool:
+    return (
+        candidate.get("componentKind") == "design-component"
+        and candidate.get("componentType") in _COMPONENT_PREFIXES
+    )
+
+
+def _is_special_marker(candidate: dict[str, Any]) -> bool:
+    return bool(
+        candidate.get("componentKind") == "special-marker"
+        or candidate.get("componentType") == "special"
+        or candidate.get("specialMarker") is True
+    )
+
+
+def assign_page_numbers(page: dict[str, Any], numbering_config: dict[str, Any] | None) -> None:
+    """Persist the initial display number for every recognized page candidate."""
+
+    config = numbering_config if isinstance(numbering_config, dict) else {}
+    use_reference_number = config.get("useReferenceNumber") is not False
+    try:
+        starting_number = max(1, int(config.get("startNumber") or 1))
+    except (TypeError, ValueError):
+        starting_number = 1
+    prefix = str(config.get("prefix") or "")
+    suffix = str(config.get("suffix") or "")
+    candidates = page.get("candidates") if isinstance(page.get("candidates"), list) else []
+
+    component_numbers = {component_type: 1 for component_type in _COMPONENT_PREFIXES}
+    reserved = {component_type: set() for component_type in _COMPONENT_PREFIXES}
+    for candidate in candidates:
+        if not _is_design_component(candidate):
+            continue
+        reference_label = str(candidate.get("referenceLabel") or "").strip()
+        match = re.search(r"(\d+)$", reference_label) if use_reference_number else None
+        if match:
+            reserved[str(candidate["componentType"])].add(int(match.group(1)))
+
+    weld_number = starting_number
+    included = [candidate for candidate in candidates if candidate.get("included", True)]
+    included.sort(key=lambda candidate: (
+        float(candidate.get("y") or 0),
+        float(candidate.get("x") or 0),
+    ))
+    for candidate in included:
+        if _is_special_marker(candidate):
+            continue
+        reference_label = str(candidate.get("referenceLabel") or "").strip()
+        if _is_design_component(candidate):
+            component_type = str(candidate["componentType"])
+            if use_reference_number and reference_label:
+                candidate["number"] = reference_label
+                continue
+            while component_numbers[component_type] in reserved[component_type]:
+                component_numbers[component_type] += 1
+            candidate["number"] = (
+                f"{candidate.get('autoNumberPrefix') or _COMPONENT_PREFIXES[component_type]}"
+                f"{component_numbers[component_type]}"
+            )
+            component_numbers[component_type] += 1
+            continue
+        candidate["number"] = (
+            reference_label
+            if use_reference_number and reference_label
+            else f"{prefix}{weld_number}{suffix}"
+        )
+        weld_number += 1
 
 
 def atomic_dump(path: Path, payload: dict[str, Any]) -> None:
@@ -91,7 +168,7 @@ def write_training_sample(job_id: str, folder: Path) -> tuple[Path, int]:
     manifest = {
         "schema": "weld-marker.training.v1",
         "jobId": job_id,
-        "createdAt": datetime.now().isoformat(),
+        "createdAt": beijing_now_text(),
         "exportMode": "post-analysis-auto",
         "candidateCount": len(candidates),
         "candidates": candidates,
@@ -123,6 +200,98 @@ def _resolve_sources(folder: Path, meta: dict[str, Any]) -> tuple[Path, list[Pat
     return target, references, pcfs
 
 
+def _optimized_name(name: str) -> str:
+    path = Path(name)
+    if "__" in path.stem:
+        storage_prefix, display_stem = path.stem.split("__", 1)
+        return f"{storage_prefix}.optimized__{display_stem}.pdf"
+    return f"{path.stem}.optimized.pdf"
+
+
+def _optimize_job_pdfs(
+    folder: Path,
+    meta: dict[str, Any],
+    cancellation_check: Callable[[], None],
+    progress: Callable[[str], None],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    existing = meta.get("pdfOptimization") if isinstance(meta.get("pdfOptimization"), list) else []
+    if existing and all(
+        item.get("status") == "complete" and (folder / str(item.get("optimizedFile") or "")).is_file()
+        for item in existing
+    ):
+        return meta, existing
+
+    original_target = Path(str(meta.get("originalTargetFile") or meta["targetFile"])).name
+    original_references = [
+        Path(str(name)).name
+        for name in (meta.get("originalReferenceFiles") or meta.get("referenceFiles") or [])
+    ]
+    sources = [("target", original_target), *[("reference", name) for name in original_references]]
+    reports: list[dict[str, Any]] = []
+    optimized_names: list[str] = []
+    for index, (kind, source_name) in enumerate(sources, start=1):
+        cancellation_check()
+        progress(f"正在优化 PDF：{index} / {len(sources)}（{source_name}）")
+        source_path = folder / source_name
+        if not source_path.is_file():
+            reports.append({
+                "status": "skipped",
+                "kind": kind,
+                "sourceFile": source_name,
+                "reason": "source-missing",
+            })
+            optimized_names.append(source_name)
+            continue
+        output_name = _optimized_name(source_name)
+        report = optimize_pdf(
+            source_path,
+            folder / output_name,
+            cancellation_check=cancellation_check,
+        )
+        report["kind"] = kind
+        reports.append(report)
+        optimized_names.append(output_name)
+    meta = {
+        **meta,
+        "originalTargetFile": original_target,
+        "originalReferenceFiles": original_references,
+        "targetFile": optimized_names[0],
+        "referenceFiles": optimized_names[1:],
+        "pdfOptimization": reports,
+    }
+    atomic_dump(folder / "job.json", meta)
+    return meta, reports
+
+
+def _direct_placement_pages(target: Path, start_page: int = 1, end_page: int | None = None) -> list[dict[str, Any]]:
+    """Create editable empty pages without running recognition or numbering."""
+
+    with fitz.open(target) as document:
+        first = max(1, int(start_page or 1))
+        last = min(document.page_count, int(end_page) if end_page else document.page_count)
+        if first > last:
+            raise ValueError("直接落图页码范围无效")
+        pages = []
+        for page_number in range(first, last + 1):
+            rect = document.load_page(page_number - 1).rect
+            pages.append({
+                "page": page_number,
+                "width": float(rect.width),
+                "height": float(rect.height),
+                "candidates": [],
+                "candidateCount": 0,
+                "weldCandidateCount": 0,
+                "designComponentCount": 0,
+                "referenceMatchedCount": 0,
+                "componentReferenceMatchedCount": 0,
+                "validatedCount": 0,
+                "drawingCount": 1,
+                "layoutObstacles": {"textRects": [], "processSegments": []},
+                "reviewRevision": 0,
+            })
+        return pages
+
+
 def run_job(
     store: JobStore,
     row: dict[str, Any],
@@ -142,7 +311,6 @@ def run_job(
         log(f"[智能编号] 任务 {job_id} 的结果已完成，已修复队列终态")
         return "complete"
     meta = json.loads((folder / "job.json").read_text(encoding="utf-8"))
-    target, references, pcfs = _resolve_sources(folder, meta)
     heartbeat_stop = threading.Event()
     lease_lost = threading.Event()
 
@@ -178,10 +346,80 @@ def run_job(
             "progressPercent": 15,
             "progressMessage": "Worker已领取任务，正在启动解析",
         })
+        meta, optimization_reports = _optimize_job_pdfs(
+            folder,
+            meta,
+            ensure_not_cancelled,
+            lambda message: publish_result({
+                "progressStage": "optimizing-pdf",
+                "progressPercent": 16,
+                "progressMessage": message,
+            }),
+        )
+        target, references, pcfs = _resolve_sources(folder, meta)
+        publish_result({
+            "pdfOptimization": optimization_reports,
+            "progressStage": "starting",
+            "progressPercent": 18,
+            "progressMessage": "PDF优化完成，正在建立落图页面" if meta.get("taskType") == "direct-placement" else "PDF优化完成，正在启动图纸解析",
+        })
         store.clear_job_pages(job_id)
+        if meta.get("taskType") == "direct-placement":
+            pages = _direct_placement_pages(
+                target,
+                int(meta.get("startPage") or 1),
+                int(meta["endPage"]) if meta.get("endPage") else None,
+            )
+            for index, page in enumerate(pages, start=1):
+                ensure_not_cancelled()
+                store.publish_analysis_page(job_id, page)
+                publish_result({
+                    "completedPages": index,
+                    "totalPages": len(pages),
+                    "progressStage": "direct-placement",
+                    "progressCompletedUnits": index,
+                    "progressTotalUnits": max(1, len(pages)),
+                    "progressPercent": round(18 + 81 * index / max(1, len(pages)), 2),
+                    "progressMessage": f"正在建立可编辑页面：{index} / {len(pages)}",
+                })
+            result = {
+                **initial_state,
+                "jobId": job_id,
+                "status": "complete",
+                "taskType": "direct-placement",
+                "targetFile": target.name,
+                "analyzedRange": [pages[0]["page"], pages[-1]["page"]],
+                "pages": pages,
+                "completedPages": len(pages),
+                "totalPages": len(pages),
+                "completedReferenceFiles": 0,
+                "totalReferenceFiles": 0,
+                "progressCompletedUnits": len(pages),
+                "progressTotalUnits": max(1, len(pages)),
+                "progressStage": "complete",
+                "progressPercent": 100,
+                "progressMessage": "PDF优化完成，可以直接落图",
+                "revision": 0,
+                "project": meta.get("project") or initial_state.get("project") or {},
+                "createdBy": meta.get("createdBy") or initial_state.get("createdBy"),
+                "pdfOptimization": optimization_reports,
+                "updatedAt": beijing_now_text(),
+            }
+            store.replace_job_pages(job_id, pages)
+            result_metadata = dict(result)
+            result_metadata.pop("pages", None)
+            atomic_dump(folder / "result.json", result_metadata)
+            store.update_queue_summary(job_id, result_metadata)
+            if not store.finish(job_id, "complete", worker_id=worker_id):
+                if store.cancellation_requested(job_id):
+                    raise JobCancelled("用户在直接落图任务完成前取消了任务")
+                raise LeaseLost("完成直接落图任务时发现Worker已失去租约")
+            log(f"[直接落图] Worker {worker_id} 完成任务 {job_id}")
+            return "complete"
         total_pages = max(0, int(initial_state.get("totalPages") or 0))
         total_reference_files = len(references)
         progress_total_units = max(1, total_reference_files + total_pages)
+        numbering_config = initial_state.get("numberingConfig") or {}
         completed_reference_files = 0
         log(f"[智能编号] Worker {worker_id} 开始任务 {job_id}：{target.name}")
 
@@ -229,6 +467,7 @@ def run_job(
 
         def publish_page(page: dict[str, Any]) -> None:
             ensure_not_cancelled()
+            assign_page_numbers(page, numbering_config)
             page.setdefault("reviewRevision", 0)
             completed_pages = store.publish_analysis_page(job_id, page)
             publish_result({
@@ -255,6 +494,8 @@ def run_job(
             page_callback=publish_page,
         )
         ensure_not_cancelled()
+        for page in result.get("pages") or []:
+            assign_page_numbers(page, numbering_config)
         publish_result({
             "progressStage": "optimizing-layout",
             "progressPercent": 95,
@@ -320,7 +561,7 @@ def run_job(
             "progressStage": "complete",
             "progressPercent": 100,
             "progressMessage": "全部页面分析与训练样本导出完成" if not training_error else "页面分析完成，训练样本导出失败",
-            "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            "updatedAt": beijing_now_text(),
         })
         store.replace_job_pages(job_id, list(result.get("pages") or []))
         result_metadata = dict(result)

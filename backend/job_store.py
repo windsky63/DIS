@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
 import json
 from pathlib import Path
 import sqlite3
@@ -13,9 +12,11 @@ from typing import Any, Iterator
 try:
     from .page_reviews import PageRevisionConflict, merge_review_page
     from .page_lock_store import PageLockConflict, PageLockStore
+    from .time_utils import beijing_from_timestamp, beijing_now_text
 except ImportError:  # Direct ``python backend/worker.py`` execution.
     from page_reviews import PageRevisionConflict, merge_review_page
     from page_lock_store import PageLockConflict, PageLockStore
+    from time_utils import beijing_from_timestamp, beijing_now_text
 
 
 ACTIVE_STATUSES = ("queued", "leased", "processing", "cancelling")
@@ -25,11 +26,50 @@ QUEUE_SUMMARY_FIELDS = {
     "completedReferenceFiles", "totalReferenceFiles", "layoutCompletedPages",
     "layoutTotalPages", "progressCompletedUnits", "progressTotalUnits",
     "progressPercent", "project", "referenceFileCount", "createdAt", "updatedAt",
+    "taskType",
 }
 
 
 def _now_text() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return beijing_now_text()
+
+
+def page_business_deltas(before: dict[str, Any], after: dict[str, Any]) -> dict[str, int]:
+    """Return canonical human-edit counts derived from two persisted page states."""
+
+    def candidates(page: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        values = page.get("candidates") if isinstance(page.get("candidates"), list) else []
+        return {
+            str(item.get("id")): item for item in values
+            if isinstance(item, dict) and item.get("id") is not None
+        }
+
+    previous, current = candidates(before), candidates(after)
+    added = [item for key, item in current.items() if key not in previous]
+    common = [(previous[key], current[key]) for key in previous.keys() & current.keys()]
+    removed = sum(
+        1 for key, item in previous.items()
+        if item.get("included", True) and (key not in current or current[key].get("included", True) is False)
+    )
+    content_fields = ("number", "included", "componentType", "componentKind")
+    layout_fields = ("x", "y", "labelX", "labelY", "anchorX", "anchorY", "leaderLength")
+    result = {
+        "marker.manual_added": sum(
+            item.get("included", True) is not False
+            and str(item.get("origin") or "").casefold() == "manual"
+            for item in added
+        ),
+        "marker.content_corrected": sum(
+            any(old.get(field) != new.get(field) for field in content_fields)
+            for old, new in common
+        ),
+        "marker.layout_adjusted": sum(
+            any(old.get(field) != new.get(field) for field in layout_fields)
+            for old, new in common
+        ),
+        "marker.deleted": removed,
+    }
+    return {action: int(count) for action, count in result.items() if count}
 
 
 class ActiveJobExists(RuntimeError):
@@ -117,11 +157,36 @@ class JobStore:
                     reviewed_by_user_id TEXT,
                     reviewed_by_username TEXT,
                     reviewed_at TEXT,
+                    created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(job_id, page_number)
                 );
                 CREATE INDEX IF NOT EXISTS job_pages_job
                     ON job_pages(job_id, page_number);
+                CREATE TABLE IF NOT EXISTS initial_job_pages (
+                    job_id TEXT NOT NULL,
+                    page_number INTEGER NOT NULL,
+                    page_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(job_id, page_number),
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS initial_job_pages_job
+                    ON initial_job_pages(job_id, page_number);
+                CREATE TABLE IF NOT EXISTS business_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    job_id TEXT,
+                    page_number INTEGER,
+                    amount INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS business_events_created
+                    ON business_events(created_at, action);
+                CREATE INDEX IF NOT EXISTS business_events_job
+                    ON business_events(job_id, page_number, created_at);
                 CREATE TABLE IF NOT EXISTS workers (
                     worker_id TEXT PRIMARY KEY,
                     started_at TEXT NOT NULL,
@@ -146,6 +211,20 @@ class JobStore:
                 connection.execute("ALTER TABLE jobs ADD COLUMN batch_index INTEGER")
             if "completed_at" not in columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN completed_at TEXT")
+            page_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(job_pages)")}
+            if "created_at" not in page_columns:
+                connection.execute("ALTER TABLE job_pages ADD COLUMN created_at TEXT")
+            connection.execute(
+                """
+                UPDATE job_pages
+                SET created_at = COALESCE(
+                    (SELECT completed_at FROM jobs WHERE jobs.job_id = job_pages.job_id),
+                    (SELECT created_at FROM jobs WHERE jobs.job_id = job_pages.job_id),
+                    updated_at
+                )
+                WHERE created_at IS NULL OR created_at = ''
+                """
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_recent_batch "
                 "ON jobs(status, archived_at, algorithm_version, completed_at DESC, batch_id, batch_index)"
@@ -174,7 +253,7 @@ class JobStore:
                     completed_at = None
                     result_path = job_folder / "result.json"
                     if row["status"] == "complete" and result_path.is_file():
-                        completed_at = datetime.fromtimestamp(result_path.stat().st_mtime).isoformat(timespec="seconds")
+                        completed_at = beijing_from_timestamp(result_path.stat().st_mtime).isoformat(timespec="seconds")
                     connection.execute(
                         """
                         UPDATE jobs
@@ -338,21 +417,28 @@ class JobStore:
             ).fetchall()
         return [self._job_dict(row) for row in rows]
 
-    def list_queue_page(self, scope: str, page: int, page_size: int) -> dict[str, Any]:
+    def list_queue_page(
+        self, scope: str, page: int, page_size: int, task_type: str = "analysis",
+    ) -> dict[str, Any]:
         """Return one ordered queue page plus global queue counters."""
 
         archived = scope == "archived"
-        where = "archived_at IS NOT NULL" if archived else "archived_at IS NULL AND status != 'cancelled'"
+        normalized_task_type = "direct-placement" if task_type == "direct-placement" else "analysis"
+        type_where = "COALESCE(json_extract(summary_json, '$.taskType'), 'analysis') = ?"
+        archive_where = "archived_at IS NOT NULL" if archived else "archived_at IS NULL AND status != 'cancelled'"
+        where = f"{archive_where} AND {type_where}"
         with self._connection() as connection:
             counts = connection.execute(
-                """
+                f"""
                 SELECT
                     SUM(CASE WHEN status IN ('leased','processing','cancelling') THEN 1 ELSE 0 END) AS running_count,
                     SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queued_count,
                     SUM(CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END) AS archived_count,
                     SUM(CASE WHEN archived_at IS NULL AND status != 'cancelled' THEN 1 ELSE 0 END) AS current_count
                 FROM jobs
-                """
+                WHERE {type_where}
+                """,
+                (normalized_task_type,),
             ).fetchone()
             total_items = int((counts["archived_count"] if archived else counts["current_count"]) or 0)
             total_pages = max(1, (total_items + page_size - 1) // page_size)
@@ -369,10 +455,11 @@ class JobStore:
                     CASE WHEN status NOT IN ('leased','processing','cancelling','queued') THEN updated_at END DESC
                 LIMIT ? OFFSET ?
                 """,
-                (page_size, (resolved_page - 1) * page_size),
+                (normalized_task_type, page_size, (resolved_page - 1) * page_size),
             ).fetchall()
             queued_rows = connection.execute(
-                "SELECT job_id FROM jobs WHERE status = 'queued' ORDER BY priority DESC, created_at ASC"
+                f"SELECT job_id FROM jobs WHERE status = 'queued' AND {type_where} ORDER BY priority DESC, created_at ASC",
+                (normalized_task_type,),
             ).fetchall()
         return {
             "records": [self._job_dict(row) for row in rows],
@@ -385,6 +472,7 @@ class JobStore:
             "pageSize": page_size,
             "totalItems": total_items,
             "totalPages": (total_items + page_size - 1) // page_size,
+            "taskType": normalized_task_type,
         }
 
     def record_page_review(
@@ -427,6 +515,15 @@ class JobStore:
         now = _now_text()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            existing_created = {
+                int(row["page_number"]): str(row["created_at"] or now)
+                for row in connection.execute(
+                    "SELECT page_number, created_at FROM job_pages WHERE job_id = ?", (job_id,),
+                )
+            }
+            capture_initial = connection.execute(
+                "SELECT 1 FROM jobs WHERE job_id = ?", (job_id,),
+            ).fetchone() is not None
             connection.execute("DELETE FROM job_pages WHERE job_id = ?", (job_id,))
             for page in pages:
                 page_number = int(page.get("page") or 0)
@@ -438,21 +535,35 @@ class JobStore:
                     """
                     INSERT INTO job_pages(
                         job_id, page_number, page_json, revision,
-                        reviewed_by_user_id, reviewed_by_username, reviewed_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        reviewed_by_user_id, reviewed_by_username, reviewed_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         job_id, page_number,
                         json.dumps(page, ensure_ascii=False, separators=(",", ":")),
                         revision, reviewed_by.get("userId"), reviewed_by.get("username"),
-                        page.get("reviewedAt"), now,
+                        page.get("reviewedAt"), existing_created.get(page_number, now), now,
                     ),
                 )
+                if capture_initial:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO initial_job_pages(
+                            job_id, page_number, page_json, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            job_id, page_number,
+                            json.dumps(page, ensure_ascii=False, separators=(",", ":")),
+                            existing_created.get(page_number, now),
+                        ),
+                    )
             connection.commit()
 
     def clear_job_pages(self, job_id: str) -> None:
         with self._connection() as connection:
             connection.execute("DELETE FROM job_pages WHERE job_id = ?", (job_id,))
+            connection.execute("DELETE FROM initial_job_pages WHERE job_id = ?", (job_id,))
 
     def publish_analysis_page(self, job_id: str, page: dict[str, Any]) -> int:
         """Upsert one Worker-produced page and return the published page count."""
@@ -469,8 +580,8 @@ class JobStore:
                 """
                 INSERT INTO job_pages(
                     job_id, page_number, page_json, revision,
-                    reviewed_by_user_id, reviewed_by_username, reviewed_at, updated_at
-                ) VALUES (?, ?, ?, 0, NULL, NULL, NULL, ?)
+                    reviewed_by_user_id, reviewed_by_username, reviewed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, 0, NULL, NULL, NULL, ?, ?)
                 ON CONFLICT(job_id, page_number) DO UPDATE SET
                     page_json=excluded.page_json,
                     revision=0,
@@ -481,7 +592,7 @@ class JobStore:
                 """,
                 (
                     job_id, page_number,
-                    json.dumps(page, ensure_ascii=False, separators=(",", ":")), now,
+                    json.dumps(page, ensure_ascii=False, separators=(",", ":")), now, now,
                 ),
             )
             row = connection.execute(
@@ -498,6 +609,19 @@ class JobStore:
                 (job_id,),
             ).fetchall()
         return [self._page_payload(row) for row in rows]
+
+    def get_initial_job_pages(self, job_id: str) -> list[dict[str, Any]]:
+        """Return the immutable pages captured when analysis first completed."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT page_json FROM initial_job_pages
+                WHERE job_id = ? ORDER BY page_number
+                """,
+                (job_id,),
+            ).fetchall()
+        return [json.loads(str(row["page_json"])) for row in rows]
 
     @staticmethod
     def _workspace_page_summary(row: sqlite3.Row, page: dict[str, Any]) -> dict[str, Any]:
@@ -636,6 +760,7 @@ class JobStore:
         *,
         client_instance_id: str | None = None,
         lock_token: str | None = None,
+        save_request_id: str = "",
     ) -> dict[str, Any]:
         """Atomically save one page and its review event."""
 
@@ -675,6 +800,11 @@ class JobStore:
             updated_page = merge_review_page(
                 container, int(page_number), incoming_page, current_revision, user,
             )
+            # This receipt belongs to the authenticated save, never to page
+            # data supplied by a client or restored from an old PDF.
+            updated_page.pop("reviewSaveRequestId", None)
+            if save_request_id:
+                updated_page["reviewSaveRequestId"] = save_request_id
             reviewed_by = updated_page.get("reviewedBy") or {}
             updated = connection.execute(
                 """
@@ -709,12 +839,46 @@ class JobStore:
                     str(user["userId"]), str(user["username"]), str(updated_page["reviewedAt"]),
                 ),
             )
+            for action, amount in page_business_deltas(current_page, updated_page).items():
+                connection.execute(
+                    """
+                    INSERT INTO business_events(
+                        action, user_id, username, job_id, page_number, amount, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        action, str(user["userId"]), str(user["username"]), job_id,
+                        int(page_number), int(amount), str(updated_page["reviewedAt"]),
+                    ),
+                )
             connection.execute(
                 "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
                 (str(updated_page["reviewedAt"]), job_id),
             )
             connection.commit()
         return updated_page
+
+    def record_business_event(
+        self, action: str, user: dict[str, object], *, job_id: str | None = None,
+        page_number: int | None = None, amount: int = 1,
+    ) -> None:
+        """Durably record a server-derived business event before returning success."""
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO business_events(
+                    action, user_id, username, job_id, page_number, amount, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(action), str(user["userId"]), str(user["username"]),
+                    str(job_id) if job_id else None, int(page_number) if page_number is not None else None,
+                    max(1, int(amount)), _now_text(),
+                ),
+            )
+            connection.commit()
 
     def page_review_history(self, job_id: str) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -956,6 +1120,7 @@ class JobStore:
     def delete(self, job_id: str) -> None:
         with self._connection() as connection:
             connection.execute("DELETE FROM job_pages WHERE job_id = ?", (job_id,))
+            connection.execute("DELETE FROM initial_job_pages WHERE job_id = ?", (job_id,))
             connection.execute("DELETE FROM page_review_events WHERE job_id = ?", (job_id,))
             connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
 

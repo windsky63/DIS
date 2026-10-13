@@ -6,9 +6,10 @@ export function createDefaultMarkerAppearance() {
       flange: { shape: 'rectangle', frameSize: 20, fontSize: 12, lineWidth: 1.35, color: '#1769d2', fillOpacity: 0 },
       support: { shape: 'rectangle', frameSize: 20, fontSize: 12, lineWidth: 1.35, color: '#1769d2', fillOpacity: 0 },
     },
+    special: createSpecialMarkerAppearance(),
   }
 }
 
 export function createSpecialMarkerAppearance() {
-  return { shape: 'rectangle', frameSize: 20, fontSize: 12, lineWidth: 1.35, color: '#c45d3c', fillOpacity: 0 }
+  return { shape: 'split-circle', frameSize: 28, fontSize: 11, lineWidth: 1.35, color: '#c45d3c', fillOpacity: 0 }
 }

@@ -1,10 +1,11 @@
 import { computed, ref } from 'vue'
 
-import { saveDraft } from '../workspaceStorage.js'
+import { saveDraft, saveDraftPage } from '../workspaceStorage.js'
 
 export function useWorkspacePersistence({ state, operations }) {
   const backendSaveState = ref('idle')
   const draftDirty = ref(false)
+  const workspaceDraftDirty = ref(false)
   const backendSaveButtonLabel = computed(() => ({ pending: '待保存', saving: '保存中…', saved: '已保存', error: '重试保存' })[backendSaveState.value] || '保存')
   let savePromise = null
 
@@ -20,6 +21,7 @@ export function useWorkspacePersistence({ state, operations }) {
     if (!state.activeFileFingerprint.value || !state.result.value || state.result.value.status === 'processing'
         || state.applyingHistory.value || state.hydratingWorkspace.value || state.archivingWorkspace.value) return
     draftDirty.value = true
+    workspaceDraftDirty.value = true
   }
 
   function markRecoveredPagesDirty(pages = []) {
@@ -33,10 +35,24 @@ export function useWorkspacePersistence({ state, operations }) {
 
   async function persistDraftChanges() {
     if (!state.activeFileFingerprint.value || !state.result.value) return null
-    const saved = await saveDraft(state.activeFileFingerprint.value, operations.buildDraftPayload())
+    const saveWorkspace = operations.saveDraft || saveDraft
+    const saved = await saveWorkspace(state.activeFileFingerprint.value, operations.buildDraftPayload())
     draftDirty.value = false
+    workspaceDraftDirty.value = false
     operations.logAudit('draft.saved')
     return saved
+  }
+
+  async function persistPageDraft(pageNumber) {
+    if (!state.activeFileFingerprint.value || !state.result.value) return null
+    if (workspaceDraftDirty.value) return persistDraftChanges()
+    const page = state.pages.value.find(item => Number(item.page) === Number(pageNumber))
+    if (!page) return null
+    const savePage = operations.saveDraftPage || saveDraftPage
+    await savePage(state.activeFileFingerprint.value, Number(state.activeProjectIndex?.value) || 0, page)
+    if (!workspaceDraftDirty.value) draftDirty.value = false
+    operations.logAudit('draft.page-saved', { page: Number(pageNumber) })
+    return page
   }
 
   async function persistBackendChanges(notifyUser = false) {
@@ -60,7 +76,7 @@ export function useWorkspacePersistence({ state, operations }) {
       return saved
     } catch (cause) {
       backendSaveState.value = 'error'
-      state.error.value = `保存失败，修改仍保留在当前页面：${cause.message || cause}`
+      state.error.value = `${cause.outcomeUnknown ? '保存结果待确认' : '保存失败'}，修改仍保留在当前页面：${cause.message || cause}`
       throw cause
     } finally {
       savePromise = null
@@ -71,6 +87,6 @@ export function useWorkspacePersistence({ state, operations }) {
   return {
     backendSaveState, backendSaveButtonLabel, draftDirty,
     scheduleDraftSave, scheduleWorkspaceDraftSave, markRecoveredPagesDirty,
-    persistDraftChanges, persistBackendChanges, dispose,
+    persistPageDraft, persistDraftChanges, persistBackendChanges, dispose,
   }
 }

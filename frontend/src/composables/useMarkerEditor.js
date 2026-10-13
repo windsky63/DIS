@@ -1,27 +1,54 @@
-import { nextTick } from 'vue'
+import { nextTick, watch } from 'vue'
 
-import { isDesignComponent, isSpecialMarker, numberDocumentResult } from '../numbering.js'
+import { isDesignComponent, isSpecialMarker } from '../numbering.js'
 import { createSpecialMarkerAppearance } from '../defaultMarkerAppearance.js'
 import { createPastedMarker, matchesModificationType } from '../markerClipboard.js'
 import { manualLabelPosition } from '../manualMarkerPlacement.js'
 import { manualMarkerNumber, manualNumberingSequenceKey } from '../manualNumberingSettings.js'
+import { shiftMarkerNumbersAfterSelection } from '../markerSequence.js'
 import { translateMarkerPair } from './useMarkerPresentation.js'
 
-export function useMarkerEditor({ state, operations }) {
+export function useMarkerEditor({ state, operations, requestFrame = callback => window.requestAnimationFrame(callback), cancelFrame = handle => window.cancelAnimationFrame(handle) }) {
   const {
     result, pageData, pages, candidates, selectedCandidate,
     targetDocument, currentPage, previewPage, projectResults, activeProjectIndex, manualAddMode,
     manualAddType, canvasSurface, canvasLayout, canvasPointerPosition, referenceFocus, referenceShowAll,
-    startNumber, numberPrefix, numberSuffix, useReferenceNumber, selectedId, swapSourceId,
-    editingId, editingValue,
-    pendingHistory, labelDragState, anchorDragState, groupDragState, manualLeaderLength, manualNumberingSettings, error,
+    selectedId, swapSourceId,
+    editingId, editingValue, editingSecondaryValue,
+    pendingHistory, labelDragState, anchorDragState, groupDragState, manualLeaderLength, manualNumberingSettings,
+    specialMarkerAppearance, error,
   } = state
   let copiedMarker = null
   let pasteSequence = 0
   const manualNumberingSessions = new Map()
 
-  function nextManualNumber(type) {
-    const sequenceKey = manualNumberingSequenceKey(manualNumberingSettings?.value, type)
+  function applyMarkerDrag(dragState, item) {
+    dragState.animationFrame = 0
+    if (dragState.pending) Object.assign(item, dragState.pending)
+  }
+
+  function queueMarkerDrag(dragState, item, values) {
+    dragState.pending = values
+    if (!dragState.animationFrame) dragState.animationFrame = requestFrame(() => applyMarkerDrag(dragState, item))
+  }
+
+  function flushMarkerDrag(dragState, item) {
+    if (dragState.animationFrame) cancelFrame(dragState.animationFrame)
+    applyMarkerDrag(dragState, item)
+  }
+
+  function cancelScheduledMarkerDrags() {
+    for (const drag of [anchorDragState, groupDragState]) {
+      const value = drag.value
+      if (value?.animationFrame) cancelFrame(value.animationFrame)
+      drag.value = null
+      if (value?.element?.hasPointerCapture?.(value.pointerId)) value.element.releasePointerCapture(value.pointerId)
+    }
+  }
+  watch(pageData, cancelScheduledMarkerDrags, { flush: 'sync' })
+
+  function nextManualNumber(type, splitCircle = false, consume = true) {
+    const sequenceKey = manualNumberingSequenceKey(manualNumberingSettings?.value, type, splitCircle)
     const sessionKey = type === 'weld' ? type : `${type}:${Number(pageData.value?.page) || Number(currentPage.value) || 1}`
     let session = manualNumberingSessions.get(sessionKey)
     if (!session || session.document !== result.value || session.sequenceKey !== sequenceKey) {
@@ -30,33 +57,21 @@ export function useMarkerEditor({ state, operations }) {
         sequenceKey,
         count: 0,
       }
-      manualNumberingSessions.set(sessionKey, session)
+      if (consume) manualNumberingSessions.set(sessionKey, session)
     }
 
-    const generated = manualMarkerNumber(manualNumberingSettings?.value, type, session.count)
-    session.count += 1
+    const generated = manualMarkerNumber(manualNumberingSettings?.value, type, session.count, splitCircle)
+    if (consume) session.count += 1
     return generated
   }
 
   async function ensureManualWorkspace() {
-    if (result.value && pageData.value) return true
-    if (!targetDocument.value) { error.value = '请先选择并加载待标识 ISO PDF。'; return false }
-    const generatedPages = await Promise.all(Array.from({ length: targetDocument.value.numPages }, async (_, index) => {
-      const pdfPage = await targetDocument.value.getPage(index + 1)
-      const viewport = pdfPage.getViewport({ scale: 1 })
-      return {
-        page: index + 1, width: viewport.width, height: viewport.height, candidates: [], candidateCount: 0,
-        weldCandidateCount: 0, designComponentCount: 0, layoutObstacles: { textRects: [], processSegments: [] },
-      }
-    }))
-    result.value = {
-      schema: 'weld-marker.topology.v1', status: 'manual', jobId: null, pages: generatedPages,
-      analyzedRange: [1, generatedPages.length], manualWorkspace: true,
-    }
-    currentPage.value = Math.max(1, Math.min(generatedPages.length, previewPage.value))
-    projectResults.value[activeProjectIndex.value] = result.value
-    await nextTick()
-    return true
+    if (result.value?.jobId && pageData.value) return true
+    manualAddMode.value = false
+    error.value = targetDocument.value
+      ? '当前图纸尚未完成任务准备，暂时无法编辑标识。'
+      : '请先选择并加载待标识 ISO PDF。'
+    return false
   }
 
   async function toggleManualAddMode(type = 'weld') {
@@ -64,7 +79,7 @@ export function useMarkerEditor({ state, operations }) {
     const sameActiveType = manualAddMode.value && manualAddType.value === type
     manualAddType.value = type
     manualAddMode.value = !sameActiveType
-    if (manualAddMode.value && ['weld', 'valve', 'flange', 'support'].includes(type)) {
+    if (manualAddMode.value && ['weld', 'valve', 'flange', 'support', 'other'].includes(type)) {
       operations.selectMarkerAppearanceTab?.(type)
     }
   }
@@ -88,11 +103,44 @@ export function useMarkerEditor({ state, operations }) {
     canvasPointerPosition.value = { clientX: event.clientX, clientY: event.clientY }
   }
 
-  function formattedWeldNumber(number) {
-    return `${numberPrefix.value || ''}${number}${numberSuffix.value || ''}`
+  function createManualMarker(xNorm, yNorm, labelPosition = null, preview = false) {
+    const page = pageData.value
+    const x = xNorm * page.width
+    const y = yNorm * page.height
+    const type = ['all', 'other'].includes(manualAddType.value) ? 'special' : manualAddType.value
+    const special = type === 'special'
+    const componentType = ['valve', 'flange', 'support'].includes(type) ? type : (special ? 'special' : null)
+    const markerAppearance = operations.manualMarkerStyle?.(special ? 'other' : type) || (special
+      ? { ...createSpecialMarkerAppearance(), ...(specialMarkerAppearance?.value || {}) }
+      : {})
+    const splitCircle = markerAppearance.shape === 'split-circle'
+    const generatedNumber = nextManualNumber(special ? 'other' : type, splitCircle, !preview)
+    const label = labelPosition || manualLabelPosition({ x, y }, page.width, page.height, manualLeaderLength.value)
+    const specialStyle = special ? markerAppearance : null
+    const item = {
+      id: preview ? 'manual-marker-preview' : `p${page.page}-manual-${type}-${Date.now()}`, page: page.page, x, y, xNorm, yNorm,
+      labelX: label.x, labelY: label.y,
+      labelXNorm: label.x / page.width, labelYNorm: label.y / page.height,
+      confidence: 1, tier: 'manual', glyphValidated: false, evidence: '人工添加',
+      componentKind: special ? 'special-marker' : (componentType ? 'design-component' : 'manual-weld'), componentType,
+      specialMarker: special || undefined,
+      autoNumberPrefix: generatedNumber.prefix,
+      defaultMarkerStyle: special ? { ...specialStyle } : (componentType ? { shape: 'rectangle', color: '#1769d2' } : { shape: 'circle', color: '#d4143c' }),
+      markerStyle: special ? { ...specialStyle } : undefined,
+      secondaryText: splitCircle ? generatedNumber.secondaryText : undefined,
+      symbolShape: 'manual', included: true, origin: 'manual',
+      number: generatedNumber.number,
+      referenceLabel: '', referenceMatched: false,
+    }
+    return item
   }
 
-  function addManualAtClientPoint(clientX, clientY) {
+  function previewManualMarker(start, end) {
+    if (!pageData.value) return null
+    return createManualMarker(start.x, start.y, { x: end.x * pageData.value.width, y: end.y * pageData.value.height }, true)
+  }
+
+  function addManualAtClientPoint(clientX, clientY, labelPosition = null) {
     if (!manualAddMode.value || !canvasSurface.value || !pageData.value) return
     const bounds = canvasSurface.value.getBoundingClientRect()
     const layout = canvasLayout.value
@@ -107,32 +155,10 @@ export function useMarkerEditor({ state, operations }) {
     const page = pageData.value
     const xNorm = localX / layout.target.width
     const yNorm = localY / layout.target.height
-    const x = xNorm * page.width
-    const y = yNorm * page.height
-    const type = manualAddType.value === 'all' ? 'special' : manualAddType.value
+    const type = ['all', 'other'].includes(manualAddType.value) ? 'special' : manualAddType.value
     const typeTitle = ({ weld: '焊口', valve: '阀门', flange: '法兰', support: '支架', special: '特殊标识' })[type]
     operations.beginHistory(`人工增加${typeTitle}`)
-    const special = type === 'special'
-    const componentType = ['valve', 'flange', 'support'].includes(type) ? type : (special ? 'special' : null)
-    const generatedNumber = special
-      ? { number: `M${page.candidates.filter(item => item.included !== false && isSpecialMarker(item)).length + 1}`, prefix: 'M' }
-      : nextManualNumber(type)
-    const label = manualLabelPosition({ x, y }, page.width, page.height, manualLeaderLength.value)
-    const specialStyle = special ? createSpecialMarkerAppearance() : null
-    const item = {
-      id: `p${page.page}-manual-${type}-${Date.now()}`, page: page.page, x, y, xNorm, yNorm,
-      labelX: label.x, labelY: label.y,
-      labelXNorm: label.x / page.width, labelYNorm: label.y / page.height,
-      confidence: 1, tier: 'manual', glyphValidated: false, evidence: '人工添加',
-      componentKind: special ? 'special-marker' : (componentType ? 'design-component' : 'manual-weld'), componentType,
-      specialMarker: special || undefined,
-      autoNumberPrefix: generatedNumber.prefix,
-      defaultMarkerStyle: special ? { ...specialStyle } : (componentType ? { shape: 'rectangle', color: '#1769d2' } : { shape: 'circle', color: '#d4143c' }),
-      markerStyle: special ? { ...specialStyle } : undefined,
-      symbolShape: 'manual', included: true, origin: 'manual',
-      number: generatedNumber.number,
-      referenceLabel: '', referenceMatched: false,
-    }
+    const item = createManualMarker(xNorm, yNorm, labelPosition)
     page.candidates.push(item)
     page.candidateCount = page.candidates.length
     selectedId.value = item.id
@@ -149,12 +175,12 @@ export function useMarkerEditor({ state, operations }) {
     const item = selectedCandidate.value
     if (!item) { error.value = '请先选中要复制的标识。'; return false }
     copiedMarker = operations.cloneValue(item)
-    operations.showNotice(`已复制标识 ${item.number || '?'}，将鼠标移到目标位置后按 Ctrl+V 粘贴。`)
+    operations.showNotice(`已复制标识 ${item.number || '未编号'}，将鼠标移到目标位置后使用粘贴快捷键。`)
     return true
   }
 
   function pasteCopiedAtClientPoint(clientX, clientY) {
-    if (!copiedMarker) { error.value = '请先选中标识并按 Ctrl+C 复制。'; return false }
+    if (!copiedMarker) { error.value = '请先选中标识并使用复制快捷键。'; return false }
     if (!canvasSurface.value || !pageData.value || !Number.isFinite(clientX) || !Number.isFinite(clientY)) {
       error.value = '请把鼠标移到待标识 PDF 的目标位置后再粘贴。'
       return false
@@ -182,16 +208,8 @@ export function useMarkerEditor({ state, operations }) {
     selectedId.value = item.id
     operations.commitHistory()
     operations.logAudit('marker.pasted', { id: item.id, number: item.number, componentType: item.componentType || 'weld' })
-    operations.showNotice(`已粘贴标识 ${item.number || '?'}；可继续调整端点、标识框或编号。`)
+    operations.showNotice(`已粘贴标识 ${item.number || '未编号'}；可继续调整端点、标识框或编号。`)
     return true
-  }
-
-  function numberResult(documentResult, startingNumberValue, options = {}) {
-    numberDocumentResult(documentResult, startingNumberValue, {
-      useReferenceNumber: useReferenceNumber.value,
-      formatWeldNumber: formattedWeldNumber,
-      ...options,
-    })
   }
 
   function pageMatchSummary(page) {
@@ -206,20 +224,43 @@ export function useMarkerEditor({ state, operations }) {
     const selected = selectedCandidate.value
     if (!selected || selected.included === false) { error.value = '请先选中一个参与编号的焊口，再按 X。'; return }
     if (isSpecialMarker(selected)) { error.value = '特殊标识使用独立编号，不能参与编号交换。'; return }
-    if (!swapSourceId.value) { swapSourceId.value = selected.id; operations.showNotice(`已暂存焊口 ${selected.number || '?'}；请选择另一个焊口并再次按 X。`); return }
+    if (!swapSourceId.value) { swapSourceId.value = selected.id; operations.showNotice(`已暂存焊口 ${selected.number || '未编号'}；请选择另一个焊口并再次按 X。`); return }
     if (swapSourceId.value === selected.id) { swapSourceId.value = ''; operations.showNotice('已取消交换编号。'); return }
     const source = candidates.value.find(item => item.id === swapSourceId.value && item.included !== false)
-    if (!source) { swapSourceId.value = selected.id; operations.showNotice(`原交换对象已失效，现已暂存焊口 ${selected.number || '?'}。`); return }
+    if (!source) { swapSourceId.value = selected.id; operations.showNotice(`原交换对象已失效，现已暂存焊口 ${selected.number || '未编号'}。`); return }
     const sourceNumber = source.number
     operations.beginHistory('交换焊口编号')
     source.number = selected.number
     selected.number = sourceNumber
     operations.commitHistory()
     swapSourceId.value = ''
-    operations.showNotice(`已交换焊口 ${source.number || '?'} 与 ${selected.number || '?'} 的编号。`)
+    operations.showNotice(`已交换焊口 ${source.number || '未编号'} 与 ${selected.number || '未编号'} 的编号。`)
   }
 
   function selectCandidate(item) { selectedId.value = item.id }
+  function shiftFollowingMarkerNumbers() {
+    const selected = selectedCandidate.value
+    if (!selected || selected.included === false) {
+      error.value = '请先选中一个有效标识。'
+      return false
+    }
+    operations.beginHistory('顺延后续标识编号')
+    const result = shiftMarkerNumbersAfterSelection(pageData.value, selected)
+    if (!result.changed.length) {
+      operations.cancelHistory?.()
+      if (result.reason === 'invalid-number') error.value = '所选标识的编号中没有可顺延的数字。'
+      else operations.showNotice('当前页没有需要顺延的同类标识。')
+      return false
+    }
+    operations.commitHistory()
+    operations.logAudit('marker.following_numbers_shifted', {
+      selectedId: selected.id,
+      selectedNumber: selected.number,
+      changed: result.changed,
+    })
+    operations.showNotice(`已从 ${selected.number} 之后顺延 ${result.changed.length} 个同类标识，可使用 Ctrl+Z 撤销。`)
+    return true
+  }
   function reflowCurrentPageLabelPositions(announce = false) {
     if (!result.value) return
     operations.beginHistory('重新优化当前页标识位置')
@@ -233,16 +274,19 @@ export function useMarkerEditor({ state, operations }) {
     if (event.button !== 0 || item.included === false) return
     event.stopPropagation(); selectCandidate(item); operations.beginHistory('修改标识编号')
     editingId.value = item.id; editingValue.value = String(item.number || '')
-    nextTick(() => document.querySelector('.inline-weld-input')?.select())
+    editingSecondaryValue.value = String(item.secondaryText || '')
+    nextTick(() => globalThis.document?.querySelector('.inline-weld-input--primary')?.select())
   }
   function commitInlineEdit(item) {
     if (editingId.value !== item.id) return
-    item.number = editingValue.value.trim(); editingId.value = ''; operations.commitHistory()
-    operations.logAudit('weld.number_changed', { id: item.id, number: item.number })
+    item.number = editingValue.value.trim()
+    if (operations.candidateMarkerStyle?.(item)?.shape === 'split-circle') item.secondaryText = editingSecondaryValue.value.trim()
+    editingId.value = ''; operations.commitHistory()
+    operations.logAudit('weld.number_changed', { id: item.id, number: item.number, secondaryText: item.secondaryText })
   }
-  function cancelInlineEdit() { editingId.value = ''; editingValue.value = ''; pendingHistory.value = null }
+  function cancelInlineEdit() { editingId.value = ''; editingValue.value = ''; editingSecondaryValue.value = ''; pendingHistory.value = null }
   function onApplicationPointerDown(event) {
-    if (!editingId.value || event.target?.closest?.('.inline-weld-input')) return
+    if (!editingId.value || event.target?.closest?.('.inline-split-editor, .inline-weld-input')) return
     const item = candidates.value.find(candidate => candidate.id === editingId.value)
     if (item) commitInlineEdit(item); else cancelInlineEdit()
   }
@@ -299,7 +343,7 @@ export function useMarkerEditor({ state, operations }) {
     if (event.button !== 0 || item.included === false || !manualAddMode.value || !candidateMatchesModificationType(item)) return
     event.preventDefault(); event.stopPropagation(); selectCandidate(item)
     operations.beginHistory(item.origin === 'manual' ? '移动人工标识引线端点' : '调整识别标识引线端点')
-    anchorDragState.value = { id: item.id, pointerId: event.pointerId }; event.currentTarget.setPointerCapture?.(event.pointerId)
+    anchorDragState.value = { id: item.id, pointerId: event.pointerId, element: event.currentTarget, pending: null, animationFrame: 0 }; event.currentTarget.setPointerCapture?.(event.pointerId)
   }
   function moveAnchor(event, item) {
     if (anchorDragState.value?.id !== item.id || !canvasSurface.value || !pageData.value) return
@@ -309,10 +353,11 @@ export function useMarkerEditor({ state, operations }) {
     const worldY = (event.clientY - bounds.top) / bounds.height * layout.height
     const xNorm = Math.max(0, Math.min(1, (worldX - layout.target.x) / layout.target.width))
     const yNorm = Math.max(0, Math.min(1, (worldY - layout.target.y) / layout.target.height))
-    item.xNorm = xNorm; item.yNorm = yNorm; item.x = xNorm * pageData.value.width; item.y = yNorm * pageData.value.height
+    queueMarkerDrag(anchorDragState.value, item, { xNorm, yNorm, x: xNorm * pageData.value.width, y: yNorm * pageData.value.height })
   }
   function endAnchorDrag(event, item) {
     if (anchorDragState.value?.id !== item.id) return
+    flushMarkerDrag(anchorDragState.value, item)
     event.stopPropagation(); event.currentTarget.releasePointerCapture?.(event.pointerId); anchorDragState.value = null
     operations.commitHistory(); operations.logAudit('weld.anchor_moved', { id: item.id })
   }
@@ -333,6 +378,7 @@ export function useMarkerEditor({ state, operations }) {
     groupDragState.value = {
       id: item.id,
       pointerId: event.pointerId,
+      element: event.currentTarget, pending: null, animationFrame: 0,
       startClientX: event.clientX,
       startClientY: event.clientY,
       bounds,
@@ -358,7 +404,7 @@ export function useMarkerEditor({ state, operations }) {
       deltaWorldX / layout.target.width,
       deltaWorldY / layout.target.height,
     )
-    Object.assign(item, translated, {
+    queueMarkerDrag(dragState, item, { ...translated,
       x: translated.xNorm * pageData.value.width,
       y: translated.yNorm * pageData.value.height,
       labelX: translated.labelXNorm * pageData.value.width,
@@ -367,17 +413,11 @@ export function useMarkerEditor({ state, operations }) {
   }
   function endGroupDrag(event, item) {
     if (groupDragState.value?.id !== item.id) return
+    flushMarkerDrag(groupDragState.value, item)
     event.preventDefault(); event.stopPropagation()
     event.currentTarget.releasePointerCapture?.(event.pointerId)
     groupDragState.value = null
     operations.commitHistory(); operations.logAudit('weld.marker_group_moved', { id: item.id })
-  }
-  function toggleCandidate(item) {
-    const restoring = item.included === false
-    operations.beginHistory(restoring ? '恢复焊口' : '排除误识别焊口')
-    if (restoring) { item.included = true; if (item.numberBeforeExclusion !== undefined) item.number = item.numberBeforeExclusion }
-    else { item.numberBeforeExclusion = item.number; item.included = false }
-    operations.commitHistory(); operations.logAudit('weld.inclusion_changed', { id: item.id, included: item.included })
   }
   function deleteSelectedWeld() {
     const item = selectedCandidate.value
@@ -387,17 +427,18 @@ export function useMarkerEditor({ state, operations }) {
     if (!page || index < 0) { error.value = '选中的焊口已不存在。'; return }
     operations.beginHistory('删除焊口'); page.candidates.splice(index, 1); page.candidateCount = page.candidates.length
     selectedId.value = ''; swapSourceId.value = swapSourceId.value === item.id ? '' : swapSourceId.value
-    operations.commitHistory(); operations.showNotice(`已删除焊口 ${item.number || '?'}，可使用 Ctrl+Z 撤销。`)
+    operations.commitHistory(); operations.showNotice(`已删除焊口 ${item.number || '未编号'}，可使用 Ctrl+Z 撤销。`)
     operations.logAudit('weld.deleted', { id: item.id, number: item.number, origin: item.origin || 'recognized' })
   }
 
   return {
     ensureManualWorkspace, toggleManualAddMode, mergeStagedManualCandidates, onCanvasClick, addManualAtClientPoint,
-    candidateMatchesModificationType, copySelectedCandidate, pasteCopiedAtClientPoint, formattedWeldNumber, numberResult,
+    previewManualMarker, candidateMatchesModificationType, copySelectedCandidate, pasteCopiedAtClientPoint,
     pageMatchSummary,
-    swapSelectedWeldNumbers, selectCandidate, reflowCurrentPageLabelPositions, beginInlineEdit, commitInlineEdit,
+    swapSelectedWeldNumbers, selectCandidate, shiftFollowingMarkerNumbers, reflowCurrentPageLabelPositions, beginInlineEdit, commitInlineEdit,
     cancelInlineEdit, onApplicationPointerDown, startLabelDrag, moveLabel, endLabelDrag, setLeaderLineElement,
     startAnchorDrag, moveAnchor, endAnchorDrag, startGroupDrag, moveGroup, endGroupDrag,
-    toggleCandidate, deleteSelectedWeld,
+    deleteSelectedWeld,
+    cancelScheduledMarkerDrags,
   }
 }

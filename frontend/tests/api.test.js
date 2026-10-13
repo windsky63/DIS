@@ -12,8 +12,74 @@ test('analysis queue request includes its server-side page and scope', async () 
     return { ok: true, json: async () => ({ jobs: [], pagination: { page: 3 } }) }
   }
   try {
-    await api.getAnalysisQueue({ scope: 'archived', page: 3, pageSize: 40 })
-    assert.equal(requestedUrl, '/api/analysis-queue?scope=archived&page=3&pageSize=40')
+    await api.getAnalysisQueue({ scope: 'archived', taskType: 'direct-placement', page: 3, pageSize: 40 })
+    assert.equal(requestedUrl, '/api/analysis-queue?scope=archived&taskType=direct-placement&page=3&pageSize=40')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+
+test('admin jobs request includes search, status, and pagination filters', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedUrl
+  globalThis.fetch = async url => {
+    requestedUrl = String(url)
+    return { ok: true, json: async () => ({ jobs: [], pagination: { page: 2 } }) }
+  }
+  try {
+    await api.getAdminJobs({ search: 'drawing 01', status: 'complete', page: 2, pageSize: 50 })
+    assert.equal(requestedUrl, '/api/admin/jobs?search=drawing+01&status=complete&page=2&pageSize=50')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('admin sessions request includes search and pagination filters', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedUrl
+  globalThis.fetch = async url => {
+    requestedUrl = String(url)
+    return { ok: true, json: async () => ({ sessions: [], pagination: { page: 2 } }) }
+  }
+  try {
+    await api.getAdminSessions({ search: 'reviewer', page: 2, pageSize: 50 })
+    assert.equal(requestedUrl, '/api/admin/sessions?search=reviewer&page=2&pageSize=50')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('business dashboard request includes active filters', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedUrl
+  globalThis.fetch = async url => {
+    requestedUrl = String(url)
+    return { ok: true, json: async () => ({ summary: {}, projects: [] }) }
+  }
+  try {
+    await api.getAdminBusinessStats({
+      from: '2026-09-01', to: '2026-09-20', project: '项目 A', username: 'reviewer', action: 'weld.manual_added',
+    })
+    assert.equal(requestedUrl, '/api/admin/business-stats?from=2026-09-01&to=2026-09-20&project=%E9%A1%B9%E7%9B%AE+A&username=reviewer&action=weld.manual_added')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('admin audit request includes timeline filters and pagination', async () => {
+  const originalFetch = globalThis.fetch
+  let requestedUrl
+  globalThis.fetch = async url => {
+    requestedUrl = String(url)
+    return { ok: true, json: async () => ({ events: [], pagination: { page: 2 } }) }
+  }
+  try {
+    await api.getAdminAuditEvents({
+      from: '2026-09-01', to: '2026-09-20', username: '审核员', action: 'page.saved',
+      source: 'review', jobId: 'abc', search: 'revision', page: 2, pageSize: 100,
+    })
+    assert.equal(requestedUrl, '/api/admin/audit-events?page=2&pageSize=100&from=2026-09-01&to=2026-09-20&username=%E5%AE%A1%E6%A0%B8%E5%91%98&action=page.saved&source=review&jobId=abc&search=revision')
   } finally {
     globalThis.fetch = originalFetch
   }

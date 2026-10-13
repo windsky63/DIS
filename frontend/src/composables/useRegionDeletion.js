@@ -4,7 +4,7 @@ import { isSpecialMarker } from '../numbering.js'
 export function useRegionDeletion({ pageData, canvasSurface, canvasLayout, readOnly, manualAddMode, manualAddType = ref('all'), selectedId, swapSourceId, editingId, operations }) {
   const active = ref(false)
   const deletionType = computed(() => manualAddMode.value && manualAddType.value !== 'all' ? manualAddType.value : 'all')
-  const scopeLabel = computed(() => ({ weld: '焊口', valve: '阀门', flange: '法兰', support: '支架', all: '全部标识' })[deletionType.value] || '全部标识')
+  const scopeLabel = computed(() => ({ weld: '焊口', valve: '阀门', flange: '法兰', support: '支架', other: '其他标识', all: '全部标识' })[deletionType.value] || '全部标识')
   const selection = ref(null)
   let capturedElement = null
   const rectangle = computed(() => {
@@ -72,7 +72,8 @@ export function useRegionDeletion({ pageData, canvasSurface, canvasLayout, readO
       const page = value.page
       const removed = page.candidates.filter(item => {
         const type = isSpecialMarker(item) ? 'special' : (item.componentType || 'weld')
-        if (value.type !== 'all' && type !== value.type) return false
+        const requestedType = value.type === 'other' ? 'special' : value.type
+        if (requestedType !== 'all' && type !== requestedType) return false
         const x = item.xNorm ?? item.x / page.width
         const y = item.yNorm ?? item.y / page.height
         return x >= rect.left && x <= rect.left + rect.width && y >= rect.top && y <= rect.top + rect.height

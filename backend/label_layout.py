@@ -5,6 +5,11 @@ from __future__ import annotations
 import math
 from typing import Any, Callable
 
+try:
+    from .marker_geometry import marker_geometry
+except ImportError:
+    from marker_geometry import marker_geometry
+
 REGULAR_LEADER_MULTIPLIER = 12.0
 EMERGENCY_LEADER_MULTIPLIER = 18.0
 MAX_REPAIR_PASSES = 3
@@ -143,10 +148,8 @@ def _style(item: dict[str, Any]) -> dict[str, Any]:
 
 def _dimensions(item: dict[str, Any]) -> tuple[float, float, float]:
     style = _style(item)
-    size = float(style.get("frameSize") or 28)
-    font_size = float(style.get("fontSize") or 15)
-    width = max(size * 1.35, 10 + len(str(item.get("number") or "?")) * font_size * 0.68) if style.get("shape") == "rectangle" else size
-    return width, size, max(width, size)
+    width, height, _ = marker_geometry(item, style)
+    return width, height, max(width, height)
 
 
 def _angle_difference(a: float, b: float) -> float:

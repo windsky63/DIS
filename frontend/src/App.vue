@@ -1,9 +1,10 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from './api'
 import { CANVAS_PERFORMANCE_PROFILES, selectCanvasPerformanceProfile } from './canvasPerformance'
-import { encodeCsv } from './csv'
+import { canvasFitDecision } from './canvasFitPolicy'
+import { appHeaderHeightForViewport } from './appHeaderLayout'
 import { enforceFolderFileLimit, filesFromFolderDrop } from './folderDrop'
 import { createLatestMessageChannel } from './messageChannel'
 import { classifyRecoveryPages } from './recoveryReconciliation'
@@ -11,6 +12,7 @@ import {
   ERROR_MESSAGES_KEY,
   OPERATION_MESSAGES_KEY,
   loadMessagePreferences,
+  saveMessageLocation,
   saveMessagePreference,
 } from './messagePreferences'
 import { referenceFileSlot, resolveReferenceFileIndex } from './referenceIdentity'
@@ -44,6 +46,8 @@ import { useRegionDeletion } from './composables/useRegionDeletion.js'
 import { useRecoveryConflictDecision } from './composables/useRecoveryConflictDecision.js'
 import { useThemeSettings } from './composables/useThemeSettings.js'
 import { useMarkerEditor } from './composables/useMarkerEditor'
+import { useManualMarkerDrag } from './composables/useManualMarkerDrag'
+import { useBatchMarkerEditor } from './composables/useBatchMarkerEditor.js'
 import { useReferenceWorkspace } from './composables/useReferenceWorkspace'
 import { useDetachedReferenceWindow } from './composables/useDetachedReferenceWindow'
 import { normalizeFiles, useProjectWorkspace } from './composables/useProjectWorkspace'
@@ -51,6 +55,7 @@ import { useWorkspacePersistence } from './composables/useWorkspacePersistence'
 import { usePageNavigation } from './composables/usePageNavigation'
 import { useAuthSession } from './composables/useAuthSession'
 import { browserClientInstanceId, usePageCollaboration } from './composables/usePageCollaboration'
+const BatchMarkerEditorDialog = defineAsyncComponent(() => import('./components/BatchMarkerEditorDialog.vue'))
 import { isDesignComponent, isSpecialMarker } from './numbering'
 import {
   loadAutoReferenceWindow,
@@ -62,7 +67,7 @@ import {
 import { createDefaultMarkerAppearance } from './defaultMarkerAppearance'
 import { saveAndCloseWorkspace } from './saveAndCloseWorkspace'
 import { DEFAULT_MANUAL_LEADER_LENGTH, normalizeManualLeaderLength } from './manualMarkerPlacement'
-import { applyLeaderDefault, applyMarkerTypeDefault, createTaskMarkerSettings, restoreTaskCreationSettings } from './markerSettingsScope'
+import { applyLeaderDefault, applyMarkerTypeDefault, createTaskMarkerSettings, firstInheritedMarkerStyle as firstSavedStyle, restoreTaskCreationSettings } from './markerSettingsScope'
 import {
   createManualNumberingSettings,
   loadManualNumberingSettings,
@@ -70,7 +75,12 @@ import {
 } from './manualNumberingSettings'
 import { loadProjectProfiles, createRecognitionRules } from './projectProfiles'
 import { createSystemSettingsDefaults } from './systemSettingsDefaults'
-import { workspaceLayoutForWidth } from './workspaceLayout'
+import { DRAWER_SIZE_OPTIONS, loadDrawerSize, saveDrawerSize, workspaceLayoutForWidth } from './workspaceLayout'
+import {
+  HEADER_BUTTON_OPTIONS,
+  loadHeaderButtonVisibility,
+  saveHeaderButtonVisibility,
+} from './headerButtonVisibility'
 
 const { preference: themePreference, options: themeOptions } = useThemeSettings()
 let pageCollaboration = null
@@ -90,6 +100,8 @@ const canvasPerformanceMode = ref(['auto', ...Object.keys(CANVAS_PERFORMANCE_PRO
 const canvasPerformanceProfile = computed(() => canvasPerformanceMode.value === 'auto'
   ? detectedCanvasPerformanceProfile
   : CANVAS_PERFORMANCE_PROFILES[canvasPerformanceMode.value] || detectedCanvasPerformanceProfile)
+const autoFitPdf = ref(localStorage.getItem('weld-marker.auto-fit-pdf') === 'true')
+let initialCanvasFitPending = false
 const canvasPerformanceOptions = [
   { title: `自动检测（当前：${detectedCanvasPerformanceProfile.label}）`, value: 'auto' },
   ...Object.values(CANVAS_PERFORMANCE_PROFILES).map(profile => ({ title: profile.label, value: profile.key }))
@@ -116,21 +128,32 @@ const targetPreparationPercent = computed(() => {
   return Math.max(0, Math.min(100, (Number(targetPreparation.value.completed) || 0) / total * 100))
 })
 const leftDrawerOpen = ref(true)
+const leftDrawerSize = ref(loadDrawerSize(localStorage, 'weld-marker.left-drawer-size'))
 const leftPanelTab = ref('input')
 const reviewDrawerOpen = ref(true)
+const reviewDrawerSize = ref(loadDrawerSize(localStorage, 'weld-marker.review-drawer-size'))
 const systemSettingsDialog = ref(false)
+const headerButtons = ref(loadHeaderButtonVisibility(localStorage))
 const tutorialOpen = ref(false)
 const tutorialCatalogOpen = ref(false)
 const activeTutorialId = ref('overview')
 const tutorialLoadingId = ref('')
 const activeTutorial = computed(() => tutorialCatalog.find(item => item.id === activeTutorialId.value) || tutorialCatalog[0])
 const activeTutorialSteps = computed(() => tutorialStepsById[activeTutorialId.value] || tutorialStepsById.overview)
+const activeTutorialStep = ref(null)
+const tutorialStepPrepared = ref(false)
+let tutorialStepGeneration = 0
+const tutorialTargetReady = computed(() => tutorialStepPrepared.value
+  && !(activeTutorialStep.value?.batchDialog === 'open' && batchMarkerEditor.loading.value)
+  && !(activeTutorialStep.value?.queueDialog === 'open' && analysisQueueLoading.value))
+const tutorialSettingsSection = computed(() => tutorialOpen.value ? activeTutorialStep.value?.settingsDialog || '' : '')
 const assistantOpen = ref(false)
 const tutorialSampleLoading = ref(false)
 const tutorialSessionActive = ref(false)
 const tutorialStorageKey = 'weld-marker.tutorial.seen.v2'
 
 function openTutorial() {
+  if (tutorialOpen.value) finishTutorial()
   shortcutMenu.value = false
   systemSettingsDialog.value = false
   tutorialOpen.value = false
@@ -145,6 +168,7 @@ async function startTutorial(tutorial) {
   leftPanelTab.value = 'input'
   try {
     if (tutorial.requiresSample && !tutorialSessionActive.value && !tutorialSampleLoading.value) await loadTutorialSample()
+    if (tutorial.requiresSample && !tutorialSessionActive.value) return
     tutorialCatalogOpen.value = false
     tutorialOpen.value = true
   } finally {
@@ -152,18 +176,37 @@ async function startTutorial(tutorial) {
   }
 }
 
-function handleTutorialStepChange({ step } = {}) {
+async function handleTutorialStepChange({ step } = {}) {
+  const generation = ++tutorialStepGeneration
+  tutorialStepPrepared.value = false
+  activeTutorialStep.value = step || null
   leftDrawerOpen.value = true
   reviewDrawerOpen.value = true
+  if (step?.queueDialog === 'open' && !analysisQueueDialog.value) await openAnalysisQueue()
+  if (generation !== tutorialStepGeneration) return
+  if (step?.queueDialog === 'close') analysisQueueDialog.value = false
+  if (step?.batchDialog === 'open' && !batchMarkerEditorOpen.value) await openBatchMarkerEditor()
+  if (generation !== tutorialStepGeneration) return
+  if (step?.batchDialog === 'close' && batchMarkerEditorOpen.value && !batchMarkerEditor.changedRows.value.length) batchMarkerEditor.close()
+  if (step?.settingsDialog) systemSettingsDialog.value = step.settingsDialog !== 'close'
   if (step?.ensureSelection && !selectedCandidate.value) selectedId.value = candidates.value.find(item => item.included !== false)?.id || ''
   if (step?.leftPanel === 'input') leftPanelTab.value = 'input'
   if (step?.leftPanel === 'reference' && result.value?.ep3dReferenceInventory?.documents?.length) {
-    void syncReferenceForPage(currentPage.value, false)
+    await syncReferenceForPage(currentPage.value, false)
+    if (generation !== tutorialStepGeneration) return
     leftPanelTab.value = referenceHintsInDetachedWindow.value ? 'input' : 'reference'
   }
+  await nextTick()
+  if (generation === tutorialStepGeneration && tutorialOpen.value) tutorialStepPrepared.value = true
 }
 
 function finishTutorial() {
+  tutorialStepGeneration += 1
+  tutorialStepPrepared.value = false
+  if (activeTutorialId.value === 'collaboration') analysisQueueDialog.value = false
+  if (activeTutorialId.value === 'settings') systemSettingsDialog.value = false
+  if (activeTutorialId.value === 'batch' && batchMarkerEditorOpen.value && !batchMarkerEditor.changedRows.value.length) batchMarkerEditor.close()
+  activeTutorialStep.value = null
   try { localStorage.setItem(tutorialStorageKey, 'true') } catch { /* localStorage may be unavailable */ }
 }
 
@@ -178,6 +221,11 @@ const noticeOpen = ref(false)
 const messagePreferences = loadMessagePreferences(localStorage)
 const operationMessagesEnabled = ref(messagePreferences.operationMessagesEnabled)
 const errorMessagesEnabled = ref(messagePreferences.errorMessagesEnabled)
+const messageLocation = ref(messagePreferences.messageLocation)
+const messageLocationOptions = [
+  { title: '底部', value: 'bottom' },
+  { title: '顶部', value: 'top' },
+]
 const clearReferencesOnDesignUpload = ref(localStorage.getItem('weld-marker.clear-references-on-design-upload') !== 'false')
 const autoReferenceWindow = ref(loadAutoReferenceWindow())
 const referenceHintLocation = ref(loadReferenceHintLocation())
@@ -206,12 +254,14 @@ const uncertainReviewSave = ref(false)
 const uploadCommitPending = useUploadCloseGuard({ dirty: unsavedReviewChanges, uncertain: uncertainReviewSave })
 let analysisQueueTimer
 const result = ref(null)
+const workspaceHasTask = computed(() => Boolean(result.value?.jobId))
 const {
   dialog: analysisQueueDialog,
   loading: analysisQueueLoading,
   actionId: analysisQueueActionId,
   cancellingJobIds: analysisQueueCancellingJobIds,
   tab: analysisQueueTab,
+  archivedTaskType: analysisQueueArchivedTaskType,
   deleteTarget: analysisQueueDeleteTarget,
   deleteDialog: analysisQueueDeleteDialog,
   queue: analysisQueue,
@@ -220,9 +270,11 @@ const {
   open: openAnalysisQueue,
   changePage: changeAnalysisQueuePage,
   selectTab: selectAnalysisQueueTab,
+  selectArchivedTaskType: selectArchivedAnalysisQueueTaskType,
   cancel: cancelQueueJob,
   move: moveQueueJob,
   archive: setQueueJobArchived,
+  exportFile: exportQueueJobFile,
   requestDelete: requestDeleteQueueJob,
   confirmDelete: confirmDeleteQueueJob,
 } = useAnalysisQueue({ currentResult: result, error, showNotice })
@@ -242,7 +294,10 @@ const previewPage = ref(1)
 const selectedId = ref('')
 const editingId = ref('')
 const editingValue = ref('')
+const editingSecondaryValue = ref('')
 const manualAddMode = ref(false)
+const manualAddInteraction = ref(localStorage.getItem('weld-marker.manual-add-interaction') === 'drag' ? 'drag' : 'keyboard')
+const manualAddHint = computed(() => manualAddInteraction.value === 'drag' ? '左键从定位点拖向标识框位置，松开新增；中键平移画布' : '鼠标定位后按 A 新增')
 const manualAddType = ref('weld')
 const hydratingWorkspace = ref(false)
 const activeFileFingerprint = ref('')
@@ -281,14 +336,19 @@ const canvasPointerPosition = ref(null)
 const canvasViewport = ref(null)
 const canvasSurface = ref(null)
 const pdfCanvas = ref(null)
+const reviewScroll = ref(null)
+const selectedObjectCard = ref(null)
 const displayEmbeddedReference = ref(true)
 const pcfSelector = ref(null)
 const pcfSelectorWidth = ref(0)
 const appViewport = ref({ width: window.innerWidth, height: window.innerHeight })
-const workspaceLayout = computed(() => workspaceLayoutForWidth(appViewport.value.width))
+const workspaceLayout = computed(() => workspaceLayoutForWidth(appViewport.value.width, {
+  leftSize: leftDrawerSize.value,
+  rightSize: reviewDrawerSize.value,
+}))
 const leftDrawerWidth = computed(() => workspaceLayout.value.leftDrawerWidth)
 const reviewDrawerWidth = computed(() => workspaceLayout.value.reviewDrawerWidth)
-const appHeaderHeight = computed(() => Math.round(appViewport.value.height * 0.06))
+const appHeaderHeight = computed(() => appHeaderHeightForViewport(appViewport.value.height))
 const labelDragState = shallowRef(null)
 const canvasLayout = ref({ width: 1, height: 1, target: { x: 0, y: 34, width: 1, height: 1 }, reference: null })
 const {
@@ -302,13 +362,16 @@ const {
   startPan: startCanvasPan,
   movePan: moveCanvasPan,
   endPan: endCanvasPan,
+  consumePanClick: consumeCanvasPanClick,
 } = useCanvasViewport({
+  blockLeftPan: () => manualAddMode.value && manualAddInteraction.value === 'drag',
   canvasLayout,
   canvasViewport,
   onResolutionChange: scheduleResolutionRender,
   onPointerMove(event) {
     canvasPointerPosition.value = { clientX: event.clientX, clientY: event.clientY }
   },
+  onPageStep: direction => stepPage(direction),
 })
 const {
   mode: referenceMode,
@@ -372,8 +435,10 @@ const {
 const defaultMarkerAppearance = createDefaultMarkerAppearance()
 const defaultMarkerStyle = ref(cloneValue(defaultMarkerAppearance.weld))
 const defaultComponentMarkerStyles = ref(cloneValue(defaultMarkerAppearance.components))
+const defaultSpecialMarkerAppearance = ref(cloneValue(defaultMarkerAppearance.special))
 const markerStyle = ref(cloneValue(defaultMarkerAppearance.weld))
 const componentMarkerStyles = ref(cloneValue(defaultMarkerAppearance.components))
+const specialMarkerAppearance = ref(cloneValue(defaultMarkerAppearance.special))
 const markerAppearanceTab = ref('weld')
 const settingsAppearanceTab = ref('weld')
 const symbolConfigDialog = ref(false)
@@ -439,6 +504,10 @@ const pages = computed(() => result.value?.pages || [])
 const pageData = computed(() => pages.value.find(item => item.page === currentPage.value) || pages.value[0] || null)
 const candidates = computed(() => pages.value.flatMap(page => page.candidates || []))
 const activeCandidates = computed(() => candidates.value.filter(item => item.included !== false))
+const visiblePageCandidates = computed(() => (pageData.value?.candidates || []).filter(item => item.included !== false))
+const editablePageCandidates = computed(() => manualAddMode.value
+  ? visiblePageCandidates.value.filter(item => candidateMatchesModificationType(item))
+  : [])
 const selectedCandidate = computed(() => candidates.value.find(item => item.id === selectedId.value) || null)
 const assistantContext = computed(() => ({
   recognitionProject: activeRecognitionProject.value.name,
@@ -467,6 +536,7 @@ const {
   redo,
   clear: clearHistory,
   clearPage: clearPageHistory,
+  recordPageEdit: recordBatchPageEdit,
 } = useWorkspaceHistory({
   result,
   pages,
@@ -514,15 +584,24 @@ const markerEditor = useMarkerEditor({
     result, pageData, pages, candidates, selectedCandidate,
     targetDocument, currentPage, previewPage, projectResults, activeProjectIndex, manualAddMode,
     manualAddType, canvasSurface, canvasLayout, canvasPointerPosition, referenceFocus, referenceShowAll,
-    startNumber, numberPrefix, numberSuffix, useReferenceNumber, selectedId, swapSourceId,
-    editingId, editingValue,
-    pendingHistory, labelDragState, anchorDragState, groupDragState, manualLeaderLength, manualNumberingSettings, error,
+    selectedId, swapSourceId, editingId, editingValue, editingSecondaryValue,
+    pendingHistory, labelDragState, anchorDragState, groupDragState, manualLeaderLength, manualNumberingSettings,
+    specialMarkerAppearance, error,
   },
   operations: {
     cloneValue, beginHistory, commitHistory,
+    cancelHistory: () => { pendingHistory.value = null },
     reflowCurrentPageLabelPositions: calculateCurrentPageLabelPositions,
-    leaderEnd, logAudit, showNotice,
-    selectMarkerAppearanceTab: type => { markerAppearanceTab.value = type },
+    leaderEnd, logAudit, showNotice, candidateMarkerStyle,
+    manualMarkerStyle: type => {
+      if (type === 'other') return specialMarkerAppearance.value
+      if (['valve', 'flange', 'support'].includes(type)) return componentMarkerStyles.value[type]
+      return markerStyle.value
+    },
+    selectMarkerAppearanceTab: type => {
+      markerAppearanceTab.value = type
+      if (type === 'other') reviewDrawerOpen.value = true
+    },
     getLeaderLine: id => leaderLineElements.get(id) || null,
     setLeaderLine(id, element) {
       if (element) leaderLineElements.set(id, element)
@@ -533,18 +612,17 @@ const markerEditor = useMarkerEditor({
 const {
   ensureManualWorkspace, toggleManualAddMode, mergeStagedManualCandidates, onCanvasClick,
   addManualAtClientPoint, candidateMatchesModificationType, copySelectedCandidate, pasteCopiedAtClientPoint,
-  formattedWeldNumber, numberResult,
-  pageMatchSummary, swapSelectedWeldNumbers, selectCandidate,
+  pageMatchSummary, swapSelectedWeldNumbers, selectCandidate, shiftFollowingMarkerNumbers,
   reflowCurrentPageLabelPositions, beginInlineEdit, commitInlineEdit, cancelInlineEdit,
   onApplicationPointerDown, startLabelDrag, moveLabel, endLabelDrag, setLeaderLineElement,
   startAnchorDrag, moveAnchor, endAnchorDrag, startGroupDrag, moveGroup, endGroupDrag,
-  toggleCandidate, deleteSelectedWeld,
+  deleteSelectedWeld,
 } = markerEditor
 
 const {
   loading,
+  directPlacementRunning,
   enqueueing,
-  enqueueProgress,
   referenceInputMissing,
   progress: analysisProgress,
   activeJobId: activeAnalysisJobId,
@@ -553,6 +631,7 @@ const {
   duplicateInfo: duplicateJobInfo,
   enqueue: enqueueForReview,
   analyze,
+  directPlacement,
   cancel: cancelActiveAnalysis,
   resolveDuplicate: resolveDuplicateJob,
   dispose: disposeAnalysisWorkflow,
@@ -573,7 +652,6 @@ const {
     materializeReferenceFile,
     clearReferenceDisplay,
     mergeStagedManualCandidates,
-    numberResult,
     currentMarkerAppearancePayload,
     scheduleDraftSave: scheduleWorkspaceDraftSave,
     logAudit,
@@ -886,12 +964,12 @@ const projectWorkspace = useProjectWorkspace({
       manualLeaderLength.value = restored.leaderLength
       manualNumberingSettings.value = restored.numbering
     },
-    numberResult, currentMarkerAppearancePayload, selectRecoveryVersion,
+    currentMarkerAppearancePayload, selectRecoveryVersion,
     clearReferencesOnDesignUpload, clearReferenceFiles, clearReferenceDisplay,
     cancelReferenceArchiving, syncReferenceForPage, matchedReference, loadReferencePdf,
     archiveLazyReferences: archiveLazyReferencesForDraft, invalidateCanvas: () => canvasRenderer.invalidate(),
-    renderCanvas: (...args) => renderUnifiedCanvas(...args), targetPageCount, dismissError,
-    clearHistory, showNotice, logAudit, reconcileRecovery,
+    renderCanvas: (...args) => renderUnifiedCanvas(...args), requestInitialCanvasFit, targetPageCount, dismissError,
+    clearHistory, showNotice, logAudit, reconcileRecovery, scheduleDraftSave: scheduleWorkspaceDraftSave,
     markRecoveredPagesDirty: pages => workspacePersistence.markRecoveredPagesDirty(pages),
     overwriteRecoveredPages: (pages, unavailablePages) => pageCollaboration.saveAllDirtyPages({ overwritePages: pages, skipPages: unavailablePages }),
     activateRecoveredPage: () => pageCollaboration.acquireCurrentPage(),
@@ -911,6 +989,11 @@ async function restoreWorkspaceDraft() {
     error.value = `恢复结果保存失败，恢复内容仍保留在当前工作区：${cause?.message || cause}`
     return false
   }
+}
+function handleCanvasBackgroundClick(event) {
+  if (consumeCanvasPanClick()) return
+  clearReferenceHintSelection()
+  onCanvasClick(event)
 }
 
 async function leaveCurrentPageFor(action, failurePrefix) {
@@ -973,36 +1056,67 @@ async function selectProject(index) {
 }
 const shapeOptions = [
   { title: '方形框', value: 'rectangle' },
-  { title: '圆形（默认）', value: 'circle' },
+  { title: '圆形', value: 'circle' },
+  { title: '分栏圆形', value: 'split-circle' },
   { title: '菱形', value: 'diamond' },
 ]
+function shapeTitle(shape) {
+  return shapeOptions.find(option => option.value === shape)?.title || '未设置'
+}
+function shapeOptionsWithDefault(defaultShape) {
+  return shapeOptions.map(option => ({
+    ...option,
+    title: option.value === defaultShape ? `${option.title}（默认）` : option.title,
+  }))
+}
 const markerAppearanceGroups = computed(() => [
   { key: 'weld', title: '焊口标识', style: markerStyle.value, numbering: manualNumberingSettings.value.weld },
   { key: 'valve', title: '阀门标识', style: componentMarkerStyles.value.valve, numbering: manualNumberingSettings.value.valve },
   { key: 'flange', title: '法兰标识', style: componentMarkerStyles.value.flange, numbering: manualNumberingSettings.value.flange },
-  { key: 'support', title: '支架标识', style: componentMarkerStyles.value.support, numbering: manualNumberingSettings.value.support }
+  { key: 'support', title: '支架标识', style: componentMarkerStyles.value.support, numbering: manualNumberingSettings.value.support },
+  { key: 'other', title: '其他', style: specialMarkerAppearance.value, numbering: manualNumberingSettings.value.other },
 ])
 const defaultMarkerAppearanceGroups = computed(() => [
-  { key: 'weld', title: '焊口标识', subtitle: '默认红色圆形框', style: defaultMarkerStyle.value, numbering: defaultManualNumberingSettings.value.weld },
-  { key: 'valve', title: '阀门标识', subtitle: '默认编号前缀 V', style: defaultComponentMarkerStyles.value.valve, numbering: defaultManualNumberingSettings.value.valve },
-  { key: 'flange', title: '法兰标识', subtitle: '默认编号前缀 FL', style: defaultComponentMarkerStyles.value.flange, numbering: defaultManualNumberingSettings.value.flange },
-  { key: 'support', title: '支架标识', subtitle: '默认编号前缀 SP', style: defaultComponentMarkerStyles.value.support, numbering: defaultManualNumberingSettings.value.support }
+  { key: 'weld', title: '焊口标识', subtitle: `默认外形：${shapeTitle(defaultMarkerStyle.value.shape)}`, style: defaultMarkerStyle.value, numbering: defaultManualNumberingSettings.value.weld },
+  { key: 'valve', title: '阀门标识', subtitle: `默认外形：${shapeTitle(defaultComponentMarkerStyles.value.valve.shape)}`, style: defaultComponentMarkerStyles.value.valve, numbering: defaultManualNumberingSettings.value.valve },
+  { key: 'flange', title: '法兰标识', subtitle: `默认外形：${shapeTitle(defaultComponentMarkerStyles.value.flange.shape)}`, style: defaultComponentMarkerStyles.value.flange, numbering: defaultManualNumberingSettings.value.flange },
+  { key: 'support', title: '支架标识', subtitle: `默认外形：${shapeTitle(defaultComponentMarkerStyles.value.support.shape)}`, style: defaultComponentMarkerStyles.value.support, numbering: defaultManualNumberingSettings.value.support },
+  { key: 'other', title: '其他标识', subtitle: `默认外形：${shapeTitle(defaultSpecialMarkerAppearance.value.shape)}`, style: defaultSpecialMarkerAppearance.value, numbering: defaultManualNumberingSettings.value.other },
 ])
 const activeMarkerAppearanceGroup = computed(() => markerAppearanceGroups.value.find(group => group.key === markerAppearanceTab.value) || markerAppearanceGroups.value[0])
 const activeSettingsAppearanceGroup = computed(() => defaultMarkerAppearanceGroups.value.find(group => group.key === settingsAppearanceTab.value) || defaultMarkerAppearanceGroups.value[0])
+const activeMarkerShapeOptions = computed(() => {
+  const defaultGroup = defaultMarkerAppearanceGroups.value.find(group => group.key === activeMarkerAppearanceGroup.value.key)
+  return shapeOptionsWithDefault(defaultGroup?.style?.shape)
+})
+const selectedCandidateAppearanceGroup = computed(() => {
+  if (!selectedCandidate.value) return null
+  const type = isSpecialMarker(selectedCandidate.value) ? 'other' : (selectedCandidate.value.componentType || 'weld')
+  return markerAppearanceGroups.value.find(group => group.key === type) || markerAppearanceGroups.value[0]
+})
+const selectedCandidateAppearance = computed(() => isSpecialMarker(selectedCandidate.value) || selectedCandidate.value?.markerStyleOverride
+  ? selectedCandidate.value.markerStyle
+  : selectedCandidateAppearanceGroup.value?.style)
+const selectedCandidateShapeOptions = computed(() => {
+  const defaults = defaultMarkerAppearanceGroups.value.find(group => group.key === selectedCandidateAppearanceGroup.value?.key)
+  return shapeOptionsWithDefault(defaults?.style?.shape)
+})
+const selectedAppearanceScopeLabel = computed(() => isSpecialMarker(selectedCandidate.value) || selectedCandidate.value?.markerStyleOverride
+  ? '仅影响当前选中对象'
+  : `作用于全部${selectedCandidateAppearanceGroup.value?.title || ''}`)
 function normalizeManualNumberingInput() {
   manualNumberingSettings.value = createManualNumberingSettings(manualNumberingSettings.value)
 }
 function taskMarkerSettingsProfile() {
   return createTaskMarkerSettings({
-    appearance: { weld: markerStyle.value, components: componentMarkerStyles.value },
+    appearance: { weld: markerStyle.value, components: componentMarkerStyles.value, special: specialMarkerAppearance.value },
     numbering: manualNumberingSettings.value,
     leaderLength: manualLeaderLength.value,
   })
 }
 function defaultMarkerSettingsProfile() {
   return createTaskMarkerSettings({
-    appearance: { weld: defaultMarkerStyle.value, components: defaultComponentMarkerStyles.value },
+    appearance: { weld: defaultMarkerStyle.value, components: defaultComponentMarkerStyles.value, special: defaultSpecialMarkerAppearance.value },
     numbering: defaultManualNumberingSettings.value,
     leaderLength: defaultManualLeaderLength.value,
   })
@@ -1011,6 +1125,7 @@ function assignTaskMarkerSettings(profile) {
   const next = createTaskMarkerSettings(profile)
   markerStyle.value = next.appearance.weld
   componentMarkerStyles.value = next.appearance.components
+  specialMarkerAppearance.value = next.appearance.special
   manualNumberingSettings.value = next.numbering
   manualLeaderLength.value = next.leaderLength
 }
@@ -1032,16 +1147,23 @@ function restoreSystemDefaults() {
   themePreference.value = defaults.themePreference
   leftDrawerOpen.value = defaults.leftDrawerOpen
   reviewDrawerOpen.value = defaults.reviewDrawerOpen
+  leftDrawerSize.value = defaults.leftDrawerSize
+  reviewDrawerSize.value = defaults.reviewDrawerSize
   tooltipsEnabled.value = defaults.tooltipsEnabled
   operationMessagesEnabled.value = defaults.operationMessagesEnabled
   errorMessagesEnabled.value = defaults.errorMessagesEnabled
+  messageLocation.value = defaults.messageLocation
+  headerButtons.value = defaults.headerButtons
   pageButtonsPerGroup.value = defaults.pageButtonsPerGroup
   clearReferencesOnDesignUpload.value = defaults.clearReferencesOnDesignUpload
   setAutoReferenceWindow(defaults.autoReferenceWindow)
   setReferenceHintLocation(defaults.referenceHintLocation)
+  autoFitPdf.value = defaults.autoFitPdf
   canvasPerformanceMode.value = defaults.canvasPerformanceMode
+  manualAddInteraction.value = defaults.manualAddInteraction
   defaultMarkerStyle.value = cloneValue(defaults.markerAppearance.weld)
   defaultComponentMarkerStyles.value = cloneValue(defaults.markerAppearance.components)
+  defaultSpecialMarkerAppearance.value = cloneValue(defaults.markerAppearance.special)
   defaultManualNumberingSettings.value = defaults.manualNumbering
   defaultManualLeaderLength.value = defaults.manualLeaderLength
   restoreDefaultShortcuts()
@@ -1049,12 +1171,13 @@ function restoreSystemDefaults() {
   showNotice('系统设置已恢复为默认值，并已同步到当前任务的新增标识设置。')
 }
 const workspacePersistence = useWorkspacePersistence({
-  state: { result, pages, activeFileFingerprint, applyingHistory, hydratingWorkspace, archivingWorkspace, error },
+  state: { result, pages, activeProjectIndex, activeFileFingerprint, applyingHistory, hydratingWorkspace, archivingWorkspace, error },
   operations: {
     cloneValue,
     currentMarkerAppearancePayload,
     logAudit,
     showNotice,
+    saveDraftPage,
     markDirty: page => pageCollaboration?.markDirty(page ?? currentPage.value),
     saveCurrentPage: () => pageCollaboration?.saveCurrentPage(),
     saveAllDirtyPages: () => pageCollaboration?.saveAllDirtyPages(),
@@ -1092,19 +1215,58 @@ pageCollaboration = usePageCollaboration({
   getCurrentPage: () => currentPage.value,
   getPageData: page => pages.value.find(item => Number(item.page) === Number(page)),
   saveDraftBoundary: () => workspacePersistence.persistDraftChanges(),
+  savePageDraftBoundary: page => workspacePersistence.persistPageDraft(page),
   hasPendingDraftChanges: () => workspacePersistence.draftDirty.value,
-  switchPage: (page, options) => projectWorkspace.changePage(page, options),
+  switchPage: (page, options) => projectWorkspace.changePage(page, { ...options, hydrateDetails: false }),
   onPageReloaded: page => clearPageHistory(page),
 })
 const collaborationReadOnly = computed(() => pageCollaboration.readOnly.value)
-const collaborationInteractionBlocked = computed(() => collaborationReadOnly.value || pageCollaboration.synchronizing.value || pageCollaboration.saveState.value === 'saving')
+const hasEditableJobPage = computed(() => result.value?.jobId === 'tutorial-000207' || Boolean(
+  result.value?.jobId
+  && pageCollaboration.activeLock.value?.jobId === result.value.jobId
+  && pageCollaboration.activeLock.value?.page === Number(pageData.value?.page)
+))
+const collaborationInteractionBlocked = computed(() => !hasEditableJobPage.value || collaborationReadOnly.value || pageCollaboration.synchronizing.value || pageCollaboration.saveState.value === 'saving')
 const regionDeletion = useRegionDeletion({
   pageData, canvasSurface, canvasLayout, readOnly: collaborationInteractionBlocked,
   manualAddMode, manualAddType, selectedId, swapSourceId, editingId,
   operations: { beginHistory, commitHistory, logAudit, showNotice },
 })
 const { active: regionDeleteMode, rectangle: regionDeleteRectangle, rectangleStyle: regionDeleteRectangleStyle } = regionDeletion
-watch(pageCollaboration.dirtyPages, dirty => { unsavedReviewChanges.value = dirty.size > 0 }, { deep: true })
+const manualMarkerDrag = useManualMarkerDrag({
+  mode: manualAddInteraction, editing: manualAddMode, type: manualAddType,
+  pageData, canvasSurface, canvasLayout, readOnly: collaborationInteractionBlocked,
+  regionDeleting: regionDeleteMode, addMarker: addManualAtClientPoint,
+  previewMarker: markerEditor.previewManualMarker,
+})
+const manualDragPreview = manualMarkerDrag.markerPreview
+const batchMarkerEditor = useBatchMarkerEditor({
+  getJobId: () => result.value?.jobId || '', getPages: () => pages.value,
+  getPage: (jobId, page) => {
+    const local = pages.value.find(item => Number(item.page) === page)
+    return jobId === 'tutorial-000207' && local?.detailsLoaded !== false ? { page: local } : api.getJobPage(jobId, page)
+  },
+  styleFor: candidateMarkerStyle, pageLockOwner,
+  prepare: async () => { await pageCollaboration.saveAllDirtyPages(); await pageCollaboration.refreshLocks() },
+  apply: (jobId, changes, onProgress) => pageCollaboration.applyMarkerEdits(jobId, changes, {
+    onProgress,
+    onPageSaved: (before, after) => {
+      recordBatchPageEdit(before, after, '批量修改标识')
+      logAudit('marker.batch_modified', { page: after.page, count: changes.filter(change => change.page === Number(after.page)).length })
+    },
+    onPageSettled: () => projectWorkspace.releasePageDetails(currentPage.value, [...pageCollaboration.dirtyPages.value]),
+  }),
+})
+const batchMarkerEditorOpen = batchMarkerEditor.open
+async function openBatchMarkerEditor() {
+  if (collaborationInteractionBlocked.value || result.value?.status !== 'complete') return
+  regionDeletion.exit()
+  manualMarkerDrag.cancel()
+  await batchMarkerEditor.show()
+}
+watch([() => pageCollaboration.dirtyPages.value.size, () => batchMarkerEditor.changedRows.value.length], ([dirty, staged]) => {
+  unsavedReviewChanges.value = dirty > 0 || staged > 0
+})
 watch([pageCollaboration.saveState, pageCollaboration.leaseUncertain], ([state, leaseUncertain]) => {
   uncertainReviewSave.value = leaseUncertain || state === 'saving' || state === 'error'
 })
@@ -1140,6 +1302,22 @@ watch(analysisQueueDialog, open => {
 watch(clearReferencesOnDesignUpload, value => {
   localStorage.setItem('weld-marker.clear-references-on-design-upload', String(value))
 })
+watch(messageLocation, value => saveMessageLocation(localStorage, value))
+watch(headerButtons, value => {
+  saveHeaderButtonVisibility(localStorage, value)
+}, { deep: true })
+watch(leftDrawerSize, value => saveDrawerSize(localStorage, 'weld-marker.left-drawer-size', value))
+watch(reviewDrawerSize, value => saveDrawerSize(localStorage, 'weld-marker.review-drawer-size', value))
+watch(selectedId, async id => {
+  if (!id) return
+  reviewDrawerOpen.value = true
+  await nextTick()
+  selectedObjectCard.value?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
+})
+watch(autoFitPdf, value => {
+  localStorage.setItem('weld-marker.auto-fit-pdf', String(value))
+  if (value && targetDocument.value) nextTick(() => fitCanvas())
+})
 watch(error, value => {
   if (value && errorMessagesEnabled.value) errorOpen.value = true
   else if (value && !errorMessagesEnabled.value) error.value = ''
@@ -1148,6 +1326,9 @@ watch(pageButtonsPerGroup, value => {
   const normalized = Math.max(1, Math.min(20, Number.parseInt(value, 10) || 5))
   if (normalized !== value) pageButtonsPerGroup.value = normalized
   localStorage.setItem('weld-marker.page-buttons-per-group', String(normalized))
+})
+watch(manualAddInteraction, value => {
+  localStorage.setItem('weld-marker.manual-add-interaction', value)
 })
 watch(manualLeaderLength, value => {
   const normalized = normalizeManualLeaderLength(value)
@@ -1165,10 +1346,10 @@ watch(canvasPerformanceMode, value => {
   canvasRenderer.clearCache()
   if (targetDocument.value) void renderUnifiedCanvas(false)
 })
-watch([markerStyle, componentMarkerStyles], () => {
+watch([markerStyle, componentMarkerStyles, specialMarkerAppearance], () => {
   scheduleWorkspaceDraftSave()
 }, { deep: true })
-watch([defaultMarkerStyle, defaultComponentMarkerStyles], () => {
+watch([defaultMarkerStyle, defaultComponentMarkerStyles, defaultSpecialMarkerAppearance], () => {
   const userId = auth.user.value?.userId
   if (userId) localStorage.setItem(`weld-marker.appearance.${userId}`, JSON.stringify(defaultMarkerAppearancePayload()))
 }, { deep: true })
@@ -1180,6 +1361,7 @@ watch(() => auth.user.value?.userId, userId => {
     const profile = createTaskMarkerSettings(saved || {})
     defaultMarkerStyle.value = profile.appearance.weld
     defaultComponentMarkerStyles.value = profile.appearance.components
+    defaultSpecialMarkerAppearance.value = profile.appearance.special
   } catch { /* keep defaults when local settings are invalid */ }
   resetTaskMarkerSettings()
 })
@@ -1197,7 +1379,7 @@ watch(defaultManualNumberingSettings, value => {
   const userId = auth.user.value?.userId
   if (userId) saveManualNumberingSettings(localStorage, userId, value)
 }, { deep: true })
-for (const type of ['weld', 'valve', 'flange', 'support']) {
+for (const type of ['weld', 'valve', 'flange', 'support', 'other']) {
   watch(
     () => {
       const group = defaultMarkerAppearanceGroups.value.find(item => item.key === type)
@@ -1236,35 +1418,41 @@ function storeWorkspaceFile(file) {
 async function materializeStoredWorkspaceFile(saved) {
   return materializeWorkspaceFile(saved, loadStoredFile)
 }
-function firstSavedStyle(documentResult, componentType = '') {
-  return (documentResult?.pages || []).flatMap(page => page.candidates || []).find(item => (
-    componentType ? item.componentType === componentType : !isDesignComponent(item) && !isSpecialMarker(item)
-  ))?.markerStyle || null
-}
 function restoreMarkerAppearances(payload) {
   const documentResult = payload?.result
   const savedGroups = payload?.markerStyles || documentResult?.markerStyles || {}
   const tutorialStyle = documentResult?.referenceMode === 'tutorial-reference-pdf' ? markerStyle.value : null
-  markerStyle.value = cloneValue(savedGroups.weld || payload?.markerStyle || documentResult?.markerStyle || tutorialStyle || firstSavedStyle(documentResult) || markerStyle.value)
+  markerStyle.value = cloneValue({ ...defaultMarkerAppearance.weld, ...(savedGroups.weld || payload?.markerStyle || documentResult?.markerStyle || tutorialStyle || firstSavedStyle(documentResult) || markerStyle.value) })
   const savedComponents = payload?.componentMarkerStyles || savedGroups.components || documentResult?.componentMarkerStyles || {}
   componentMarkerStyles.value = Object.fromEntries(['valve', 'flange', 'support'].map(componentType => [
     componentType,
-    cloneValue(savedComponents[componentType] || firstSavedStyle(documentResult, componentType) || componentMarkerStyles.value[componentType])
+    cloneValue({ ...defaultMarkerAppearance.components[componentType], ...(savedComponents[componentType] || firstSavedStyle(documentResult, componentType) || componentMarkerStyles.value[componentType]) })
   ]))
+  specialMarkerAppearance.value = cloneValue({ ...defaultMarkerAppearance.special, ...(
+    savedGroups.special || payload?.specialMarkerAppearance || documentResult?.specialMarkerAppearance
+      || firstSavedStyle(documentResult, 'special') || specialMarkerAppearance.value
+  ) })
 }
-function markerAppearancePayload(weldValue, componentValues) {
+function markerAppearancePayload(weldValue, componentValues, specialValue) {
   const weld = cloneValue(weldValue)
   const components = cloneValue(componentValues)
-  return { markerStyle: weld, componentMarkerStyles: components, markerStyles: { weld, components } }
+  const special = cloneValue(specialValue)
+  return { markerStyle: weld, componentMarkerStyles: components, specialMarkerAppearance: special, markerStyles: { weld, components, special } }
 }
 function currentMarkerAppearancePayload() {
-  return markerAppearancePayload(markerStyle.value, componentMarkerStyles.value)
+  return markerAppearancePayload(markerStyle.value, componentMarkerStyles.value, specialMarkerAppearance.value)
 }
 function defaultMarkerAppearancePayload() {
-  return markerAppearancePayload(defaultMarkerStyle.value, defaultComponentMarkerStyles.value)
+  return markerAppearancePayload(defaultMarkerStyle.value, defaultComponentMarkerStyles.value, defaultSpecialMarkerAppearance.value)
 }
-function logAudit(action, details = {}) { void api.audit(action, { jobId: result.value?.jobId || null, file: targetPdf.value?.name || null, page: currentPage.value, ...details }).catch(() => {}) }
-function scheduleDraftSave() { workspacePersistence.scheduleDraftSave() }
+function logAudit(action, details = {}) {
+  if (result.value?.jobId === 'tutorial-000207') return
+  void api.audit(action, { jobId: result.value?.jobId || null, file: targetPdf.value?.name || null, page: currentPage.value, ...details }).catch(() => {})
+}
+function scheduleDraftSave(options = {}) {
+  workspacePersistence.scheduleDraftSave()
+  if (options.workspace) workspacePersistence.scheduleWorkspaceDraftSave()
+}
 function scheduleWorkspaceDraftSave() { workspacePersistence.scheduleWorkspaceDraftSave() }
 function persistBackendChanges(notifyUser = false) { return workspacePersistence.persistBackendChanges(notifyUser) }
 async function openManagedDraft(entry) {
@@ -1309,7 +1497,7 @@ async function restoreQueueJob(job) {
   try {
     const [snapshot, source, references] = await Promise.all([
       api.getJobWorkspace(job.jobId),
-      api.getJobTargetFile(job.jobId, job.fileName),
+      api.getJobTargetSource(job.jobId, job.fileName),
       api.getJobReferenceManifest(job.jobId),
     ])
     restoreRecognitionSettings(snapshot)
@@ -1328,10 +1516,6 @@ async function restoreQueueJob(job) {
     startNumber.value = Math.max(1, Number(queuedNumbering.startNumber) || Number(startNumber.value) || 1)
     numberPrefix.value = String(queuedNumbering.prefix ?? numberPrefix.value)
     numberSuffix.value = String(queuedNumbering.suffix ?? numberSuffix.value)
-    // Server-side analysis stores recognition identities separately from the
-    // editable display number. Fill only missing display numbers when a queue
-    // result is restored, while preserving any numbers reviewers already saved.
-    numberResult(snapshot, startNumber.value, { preserveExistingNumbers: true })
     activeReferenceIndex.value = references.length ? 0 : -1
     referencePdf.value = references[0] || null
     await loadTargetPdf(source, true, false, snapshot.analyzedRange?.[0] || snapshot.pages?.[0]?.page || 1)
@@ -1348,6 +1532,12 @@ async function restoreQueueJob(job) {
     showNotice(`已从服务器恢复“${job.fileName}”，可以直接核对。`)
     scheduleWorkspaceDraftSave()
     void archiveLazyReferencesForDraft()
+    void api.getJobTargetFile(job.jobId, job.fileName).then(archivedSource => {
+      if (result.value?.jobId !== job.jobId || targetPdf.value !== source) return
+      projectPdfs.value[0] = archivedSource
+      targetPdf.value = archivedSource
+      scheduleWorkspaceDraftSave()
+    }).catch(() => { /* Range 渲染仍可继续，稍后恢复任务时会重新归档。 */ })
   } catch (cause) { error.value = `恢复解析任务失败：${cause.message || cause}` }
   finally {
     await nextTick()
@@ -1408,6 +1598,9 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  manualMarkerDrag.cancel()
+  batchMarkerEditor.close()
+  markerEditor.cancelScheduledMarkerDrags()
   const activeLabelDrag = labelDragState.value
   if (activeLabelDrag?.animationFrame) window.cancelAnimationFrame(activeLabelDrag.animationFrame)
   if (activeLabelDrag?.element) activeLabelDrag.element.style.translate = ''
@@ -1436,16 +1629,17 @@ function syncAppViewport() {
 }
 
 function handleShortcut(event) {
+  if (batchMarkerEditorOpen.value) return
   const tag = event.target?.tagName?.toLowerCase()
   const isEditing = ['input', 'textarea', 'select'].includes(tag) || event.target?.isContentEditable
   if (tutorialOpen.value || tutorialCatalogOpen.value) return
-  if (event.key === 'F1') { event.preventDefault(); shortcutMenu.value = !shortcutMenu.value; return }
+  if (matchesShortcut(event, shortcutSettings.value.toggleHelp)) { event.preventDefault(); shortcutMenu.value = !shortcutMenu.value; return }
   if (isEditing && event.key !== 'Escape') return
   if ((draftRecoveryDialog.value || draftManagerDialog.value || draftDeleteTarget.value || draftBatchDeleteDialog.value || systemSettingsDialog.value || symbolConfigDialog.value) && event.key !== 'Escape') return
-  if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); return }
-  if ((event.ctrlKey || event.metaKey) && (event.key.toLowerCase() === 'y' || (event.shiftKey && event.key.toLowerCase() === 'z'))) { event.preventDefault(); redo(); return }
-  if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'c' && selectedCandidate.value) { event.preventDefault(); copySelectedCandidate(); return }
-  if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'v' && result.value) {
+  if (matchesShortcut(event, shortcutSettings.value.undo)) { event.preventDefault(); undo(); return }
+  if (matchesShortcut(event, shortcutSettings.value.redo) || ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'z')) { event.preventDefault(); redo(); return }
+  if (matchesShortcut(event, shortcutSettings.value.copyMarker) && selectedCandidate.value) { event.preventDefault(); copySelectedCandidate(); return }
+  if (matchesShortcut(event, shortcutSettings.value.pasteMarker) && result.value) {
     event.preventDefault()
     const point = canvasPointerPosition.value
     pasteCopiedAtClientPoint(point?.clientX, point?.clientY)
@@ -1459,7 +1653,7 @@ function handleShortcut(event) {
     if (!shortcutConflict.value && !event.repeat) regionDeletion.toggle()
     return
   }
-  if (!collaborationInteractionBlocked.value && manualAddMode.value && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'a') {
+  if (!collaborationInteractionBlocked.value && manualAddMode.value && manualAddInteraction.value === 'keyboard' && !regionDeleteMode.value && matchesShortcut(event, shortcutSettings.value.addAtPointer)) {
     event.preventDefault()
     const point = canvasPointerPosition.value
     if (!point) { error.value = '请先把鼠标移到待标识 PDF 的目标位置。'; return }
@@ -1470,14 +1664,13 @@ function handleShortcut(event) {
   if (matchesShortcut(event, shortcutSettings.value.addValve)) { event.preventDefault(); if (!shortcutConflict.value) toggleManualAddMode('valve'); return }
   if (matchesShortcut(event, shortcutSettings.value.addFlange)) { event.preventDefault(); if (!shortcutConflict.value) toggleManualAddMode('flange'); return }
   if (matchesShortcut(event, shortcutSettings.value.addSupport)) { event.preventDefault(); if (!shortcutConflict.value) toggleManualAddMode('support'); return }
-  if (matchesShortcut(event, shortcutSettings.value.modifyAll)) { event.preventDefault(); if (!shortcutConflict.value) toggleManualAddMode('all'); return }
+  if (matchesShortcut(event, shortcutSettings.value.modifyAll)) { event.preventDefault(); if (!shortcutConflict.value) toggleManualAddMode('other'); return }
   if (matchesShortcut(event, shortcutSettings.value.swapWeld)) { event.preventDefault(); if (!shortcutConflict.value && !collaborationInteractionBlocked.value) swapSelectedWeldNumbers(); return }
+  if (matchesShortcut(event, shortcutSettings.value.shiftFollowing)) { event.preventDefault(); if (!event.repeat && !shortcutConflict.value && !collaborationInteractionBlocked.value) shiftFollowingMarkerNumbers(); return }
   if (matchesShortcut(event, shortcutSettings.value.deleteWeld)) { event.preventDefault(); if (!shortcutConflict.value && !collaborationInteractionBlocked.value) deleteSelectedWeld(); return }
-  if (event.key === '+' || event.key === '=') { event.preventDefault(); zoomBy(1.25); return }
-  if (event.key === '-') { event.preventDefault(); zoomBy(.8); return }
-  if (event.key === '0') { event.preventDefault(); fitCanvas(); return }
-  if (event.key === 'ArrowLeft') { event.preventDefault(); stepPage(-1); return }
-  if (event.key === 'ArrowRight') { event.preventDefault(); stepPage(1); return }
+  if (matchesShortcut(event, shortcutSettings.value.fitCanvas)) { event.preventDefault(); fitCanvas(); return }
+  if (matchesShortcut(event, shortcutSettings.value.previousPage)) { event.preventDefault(); stepPage(-1); return }
+  if (matchesShortcut(event, shortcutSettings.value.nextPage)) { event.preventDefault(); stepPage(1); return }
   if (event.key === 'Escape') { regionDeletion.exit(); cancelInlineEdit(); selectedId.value = ''; swapSourceId.value = ''; shortcutMenu.value = false; manualAddMode.value = false }
 }
 
@@ -1486,6 +1679,7 @@ async function changePage(pageNumber, fallbackPages = []) {
   if (!result.value || result.value.jobId === 'tutorial-000207' || result.value.status !== 'complete') return projectWorkspace.changePage(pageNumber)
   try {
     const enteredPage = await pageCollaboration.enterPage(pageNumber, fallbackPages)
+    if (!Number.isInteger(enteredPage) || enteredPage < 1) return false
     projectWorkspace.releasePageDetails(enteredPage, [...pageCollaboration.dirtyPages.value])
     if (Number(enteredPage) !== Number(pageNumber)) showNotice(`第 ${pageNumber} 页正由其他用户核对，已自动跳到第 ${enteredPage} 页。`)
     return enteredPage
@@ -1500,8 +1694,24 @@ function pageLockOwner(pageNumber) {
   return lock?.clientInstanceId === clientInstanceId ? '' : (lock?.owner?.username || '')
 }
 
-function renderUnifiedCanvas(fitAfter = false, indicateLoading = true) {
-  return canvasRenderer.render(fitAfter, indicateLoading)
+function requestInitialCanvasFit() {
+  initialCanvasFitPending = true
+}
+
+async function renderUnifiedCanvas(fitAfter = false, indicateLoading = true) {
+  const waitingForReference = initialCanvasFitPending
+    && displayEmbeddedReference.value
+    && referenceMode.value === 'pdf'
+    && referencePdfs.value.length > 0
+    && !referenceDocument.value
+  const decision = canvasFitDecision({
+    requested: fitAfter,
+    autoFit: autoFitPdf.value,
+    initialFitPending: initialCanvasFitPending,
+    waitingForReference,
+  })
+  await canvasRenderer.render(decision.fit, indicateLoading)
+  if (decision.consumeInitialFit) initialCanvasFitPending = false
 }
 
 function scheduleResolutionRender() {
@@ -1509,9 +1719,9 @@ function scheduleResolutionRender() {
 }
 async function save() {
   if (!result.value) return
+  if (!result.value.jobId) { error.value = '当前工作区没有有效任务编号，不能保存。请先使用“直接落图”创建服务器任务。'; return }
   if (result.value.jobId === 'tutorial-000207') {
     await workspacePersistence.persistDraftChanges()
-    logAudit('tutorial.saved-locally')
     showNotice('教程校对结果已保存在当前浏览器草稿。')
     return
   }
@@ -1521,6 +1731,7 @@ async function save() {
 }
 async function saveAndClose() {
   if (!result.value || saveAndCloseRunning.value) return
+  if (!result.value.jobId) { error.value = '当前工作区没有有效任务编号，不能保存。请先使用“直接落图”创建服务器任务。'; return }
   saveAndCloseRunning.value = true
   dismissError()
   error.value = ''
@@ -1542,6 +1753,7 @@ async function saveAndClose() {
 }
 async function exportPdf() {
   if (!result.value) return
+  if (!result.value.jobId) { error.value = '当前工作区没有有效任务编号，不能导出标识 PDF。请先使用“直接落图”创建服务器任务。'; return }
   loading.value = true
   try {
     const exportCandidates = await loadAllExportCandidates()
@@ -1573,23 +1785,6 @@ async function loadAllExportCandidates() {
   await Promise.all([worker(), worker(), worker()])
   return pageCandidates.flat()
 }
-async function exportCsv() {
-  if (!result.value) return
-  loading.value = true
-  try {
-    const exportCandidates = await loadAllExportCandidates()
-  const rows = [['页码', '对象类型', '编号', 'X', 'Y', '证据', '置信度', '参考匹配']]
-    exportCandidates.forEach(item => rows.push([item.page, isSpecialMarker(item) ? 'special' : (isDesignComponent(item) ? item.componentType : 'weld'), item.number, item.x.toFixed(2), item.y.toFixed(2), item.evidence, Math.round((item.confidence || 0) * 100) + '%', item.referenceLabel || '']))
-  const csv = encodeCsv(rows)
-  const link = document.createElement('a')
-  link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
-  link.download = '图纸标识识别结果.csv'
-  link.click()
-  URL.revokeObjectURL(link.href)
-    logAudit('csv.exported', { candidates: exportCandidates.length })
-  } catch (cause) { error.value = cause.message } finally { loading.value = false }
-}
-
 </script>
 
 <template>
@@ -1606,6 +1801,7 @@ async function exportCsv() {
       :user="auth.user.value"
       :projects="recognitionProjects"
       :active-project="activeRecognitionProject"
+      :button-visibility="headerButtons"
       @open-project-rules="symbolConfigDialog = true"
       @open-queue="openAnalysisQueue"
       @open-assistant="assistantOpen = true"
@@ -1667,7 +1863,7 @@ async function exportCsv() {
             <v-btn value="single" class="flex-grow-1">单个对照 PDF<v-tooltip activator="parent">选择一份已标识对照图</v-tooltip></v-btn>
             <v-btn value="folder" class="flex-grow-1">对照文件夹<v-tooltip activator="parent">读取文件夹下全部分管线 PDF，并共同参与拓扑匹配</v-tooltip></v-btn>
           </v-btn-toggle>
-          <v-file-input v-if="referenceProjectMode === 'single'" accept="application/pdf,.pdf" class="drop-file-input" label="点击或拖拽对照 PDF" prepend-icon="" clearable @update:model-value="setReferenceFiles"><v-tooltip activator="parent">可点击选择或拖入对照 PDF，配对后显示在画布右侧</v-tooltip></v-file-input>
+          <v-file-input v-if="referenceProjectMode === 'single'" :model-value="referencePdf ? [referencePdf] : []" accept="application/pdf,.pdf" class="drop-file-input" label="点击或拖拽对照 PDF" prepend-icon="" clearable @update:model-value="setReferenceFiles"><v-tooltip activator="parent">可点击选择或拖入对照 PDF，配对后显示在画布右侧</v-tooltip></v-file-input>
           <template v-else>
             <v-file-input :model-value="referencePdfs" webkitdirectory directory multiple class="drop-file-input folder-file-input" label="点击或拖拽对照 PDF 文件夹" prepend-icon="" clearable @drop.capture="handleReferenceFolderDrop" @update:model-value="handleReferenceFolderSelection"><template #selection="{ fileNames }"><span class="folder-selection">已选择 {{ fileNames.length }} 个文件</span></template><v-tooltip activator="parent">最多读取 1000 个文件；仅保留 PDF，输入框只显示文件数量</v-tooltip></v-file-input>
           </template>
@@ -1702,12 +1898,9 @@ async function exportCsv() {
           <v-text-field v-model="startNumber" type="number" min="1" label="编号开始数字"><v-tooltip activator="parent">每一页都从此编号独立开始，不跨页连续累加</v-tooltip></v-text-field>
           <v-text-field v-model="numberSuffix" label="编号后缀" maxlength="20"><v-tooltip activator="parent">可留空，例如填写 A 将生成 F1A、F2A</v-tooltip></v-text-field>
         </div>
-        <v-btn data-tour="enqueue-analysis" block color="secondary" variant="tonal" size="large" :loading="enqueueing" :disabled="!targetPdf || loading || referenceInputMissing" class="queue-submit-button mt-2" @click="enqueueForReview">推入解析队列<v-tooltip activator="parent">将图纸提前交给服务器后台解析；完成后可从顶部状态按钮直接恢复核对</v-tooltip></v-btn>
-        <div v-if="enqueueing" class="queue-upload-progress" role="status" aria-live="polite">
-          <div><span>{{ enqueueProgress.message }}</span><strong>{{ Math.round(enqueueProgress.percent) }}%</strong></div>
-          <v-progress-linear :model-value="enqueueProgress.percent" color="secondary" height="6" rounded striped />
-        </div>
-        <v-btn data-tour="analyze" block color="accent" size="large" :loading="loading" :disabled="!targetPdf || enqueueing || referenceInputMissing" class="primary-action-button mt-2" @click="analyze">智能编号<v-tooltip activator="parent">识别焊口、阀门、法兰和支架，并按类型自动生成编号</v-tooltip></v-btn>
+        <v-btn data-tour="direct-placement" block variant="tonal" size="large" :loading="directPlacementRunning" :disabled="!targetPdf || workspaceHasTask || loading || enqueueing" class="queue-submit-button direct-placement-button mt-2" @click="directPlacement">直接落图<v-tooltip activator="parent">上传当前设计 PDF，服务器优化文件并创建任务，不执行图元识别、对照解析或自动编号</v-tooltip></v-btn>
+        <v-btn data-tour="enqueue-analysis" block variant="tonal" size="large" :loading="enqueueing" :disabled="!targetPdf || workspaceHasTask || loading || referenceInputMissing" class="queue-submit-button enqueue-analysis-button mt-2" @click="enqueueForReview">推入解析队列<v-tooltip activator="parent">将图纸提前交给服务器后台解析；完成后可从顶部状态按钮直接恢复核对</v-tooltip></v-btn>
+        <v-btn data-tour="analyze" block variant="tonal" size="large" :loading="loading" :disabled="!targetPdf || workspaceHasTask || enqueueing || referenceInputMissing" class="queue-submit-button smart-numbering-button mt-2" @click="analyze">智能编号<v-tooltip activator="parent">识别焊口、阀门、法兰和支架，并按类型自动生成编号</v-tooltip></v-btn>
         </template>
         <template v-else>
           <v-alert v-if="!referenceHintPage" type="info" variant="tonal" density="compact">当前编辑页尚无可显示的对照识别结果，可切回“输入操作”完成解析或选择对照图。</v-alert>
@@ -1737,15 +1930,15 @@ async function exportCsv() {
 
     <v-main data-tour="canvas" class="main-area">
       <v-container fluid class="main-container pa-3">
-        <v-snackbar v-if="errorMessagesEnabled" v-model="errorOpen" class="app-message" color="error" location="bottom" timeout="5000" transition="fade-transition" @after-leave="finishErrorLeave">{{ error }}<template #actions><v-btn variant="text" @click="dismissError">关闭<v-tooltip activator="parent">关闭错误消息</v-tooltip></v-btn></template></v-snackbar>
-        <v-snackbar v-if="operationMessagesEnabled && !loading" v-model="noticeOpen" class="app-message" color="info" location="bottom" timeout="4000" transition="fade-transition" @after-leave="finishNoticeLeave">{{ notice }}<template #actions><v-btn variant="text" @click="clearNotice">关闭<v-tooltip activator="parent">关闭状态消息</v-tooltip></v-btn></template></v-snackbar>
+        <v-snackbar v-if="errorMessagesEnabled" v-model="errorOpen" class="app-message" color="error" :location="messageLocation" timeout="5000" transition="fade-transition" @after-leave="finishErrorLeave">{{ error }}<template #actions><v-btn variant="text" @click="dismissError">关闭<v-tooltip activator="parent">关闭错误消息</v-tooltip></v-btn></template></v-snackbar>
+        <v-snackbar v-if="operationMessagesEnabled && !loading" v-model="noticeOpen" class="app-message" color="info" :location="messageLocation" timeout="4000" transition="fade-transition" @after-leave="finishNoticeLeave">{{ notice }}<template #actions><v-btn variant="text" @click="clearNotice">关闭<v-tooltip activator="parent">关闭状态消息</v-tooltip></v-btn></template></v-snackbar>
         <v-alert v-if="result?.pcf?.degraded" type="warning" variant="tonal" density="compact" class="mb-3">PCF 当前使用内置降级解析器，拓扑完整性可能受影响：{{ result.pcf.warning }}</v-alert>
 
         <v-card v-if="!targetPdf" class="empty-card" variant="tonal" color="primary"><v-card-title>选择 ISO PDF 或整个工程文件夹</v-card-title><v-card-text>系统会先检查可恢复工作区，再渲染图纸。</v-card-text></v-card>
 
         <template v-else>
           <AnalysisProgressPanel
-            v-if="loading"
+            v-if="loading || enqueueing"
             :state="analysisProgress"
             :percent="analysisProgressPercent"
             :open="progressPanelOpen"
@@ -1784,29 +1977,41 @@ async function exportCsv() {
                 <div class="canvas-toolbar__actions">
                   <v-btn size="small" icon :disabled="!canUndo" aria-label="撤销" @click="undo"><span aria-hidden="true">↶</span></v-btn>
                   <v-btn size="small" icon :disabled="!canRedo" aria-label="重做" @click="redo"><span aria-hidden="true">↷</span></v-btn>
-                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'weld' }" aria-label="焊口修改模式" @click="toggleManualAddMode('weld')">W<v-tooltip activator="parent">焊口修改模式（W）；鼠标定位后按 A 新增</v-tooltip></v-btn>
-                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'valve' }" aria-label="阀门修改模式" @click="toggleManualAddMode('valve')">V<v-tooltip activator="parent">阀门修改模式（V）；鼠标定位后按 A 新增</v-tooltip></v-btn>
-                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'flange' }" aria-label="法兰修改模式" @click="toggleManualAddMode('flange')">F<v-tooltip activator="parent">法兰修改模式（F）；鼠标定位后按 A 新增</v-tooltip></v-btn>
-                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'support' }" aria-label="支架修改模式" @click="toggleManualAddMode('support')">S<v-tooltip activator="parent">支架修改模式（S）；鼠标定位后按 A 新增</v-tooltip></v-btn>
-                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'all' }" aria-label="全局标识修改模式" @click="toggleManualAddMode('all')">M<v-tooltip activator="parent">全局标识修改模式（M）；可调整所有标识，鼠标定位后按 A 新增特殊标识</v-tooltip></v-btn>
+                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'weld' }" aria-label="焊口修改模式" @click="toggleManualAddMode('weld')">W<v-tooltip activator="parent">焊口修改模式（W）；{{ manualAddHint }}</v-tooltip></v-btn>
+                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'valve' }" aria-label="阀门修改模式" @click="toggleManualAddMode('valve')">V<v-tooltip activator="parent">阀门修改模式（V）；{{ manualAddHint }}</v-tooltip></v-btn>
+                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'flange' }" aria-label="法兰修改模式" @click="toggleManualAddMode('flange')">F<v-tooltip activator="parent">法兰修改模式（F）；{{ manualAddHint }}</v-tooltip></v-btn>
+                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'support' }" aria-label="支架修改模式" @click="toggleManualAddMode('support')">S<v-tooltip activator="parent">支架修改模式（S）；{{ manualAddHint }}</v-tooltip></v-btn>
+                  <v-btn size="small" class="manual-mode-button" :disabled="collaborationInteractionBlocked" :class="{ 'manual-add-button--active': manualAddMode && manualAddType === 'other' }" aria-label="其他标识修改模式" @click="toggleManualAddMode('other')">M<v-tooltip activator="parent">其他标识修改模式（M）；{{ manualAddHint }}</v-tooltip></v-btn>
                   <v-btn size="small" @click="zoomBy(.8)">−</v-btn><span class="zoom-indicator">{{ Math.round(zoom * 100) }}%</span><v-btn size="small" @click="zoomBy(1.25)">+</v-btn><v-btn size="small" @click="fitCanvas">适合</v-btn>
                 </div>
               </v-toolbar>
 
-              <div ref="canvasViewport" data-tour="canvas-surface" class="canvas-viewport" :class="{ panning: canvasPanState, 'manual-adding': manualAddMode, 'region-deleting': regionDeleteMode, 'navigation-sync': pageCollaboration.synchronizing.value }" @click="onCanvasClick" @wheel.prevent="onCanvasWheel" @pointerdown.capture="clearReferenceHintSelection($event); regionDeletion.start($event)" @pointerdown="startCanvasPan" @pointermove="moveCanvasPan($event); regionDeletion.move($event)" @pointerleave="canvasPointerPosition = null" @pointerup="endCanvasPan($event); regionDeletion.finish($event)" @pointercancel="endCanvasPan($event); regionDeletion.cancelSelection()" @lostpointercapture="regionDeletion.cancelSelection()" @auxclick.prevent>
+              <div ref="canvasViewport" data-tour="canvas-surface" class="canvas-viewport" :class="{ panning: canvasPanState, 'manual-adding': manualAddMode, 'region-deleting': regionDeleteMode, 'navigation-sync': pageCollaboration.synchronizing.value }" @click="handleCanvasBackgroundClick" @wheel.prevent="onCanvasWheel" @pointerdown.capture="regionDeletion.start($event)" @pointerdown="manualMarkerDrag.start($event); startCanvasPan($event)" @pointermove="moveCanvasPan($event); regionDeletion.move($event); manualMarkerDrag.move($event)" @pointerleave="canvasPointerPosition = null" @pointerup="endCanvasPan($event); regionDeletion.finish($event); manualMarkerDrag.finish($event)" @pointercancel="endCanvasPan($event); regionDeletion.cancelSelection(); manualMarkerDrag.cancel()" @lostpointercapture="regionDeletion.cancelSelection(); manualMarkerDrag.cancel()" @auxclick.prevent>
                 <div v-if="regionDeleteMode" class="region-delete-hint" role="status">区域删除（{{ regionDeletion.scopeLabel.value }}） · 左键拖框 · Esc 退出 · Ctrl+Z 撤销</div>
                 <div v-if="collaborationReadOnly" class="canvas-readonly-hint" role="status" aria-live="polite">当前页的核对锁已失效，页面已转为只读。请切换到其他页后再重新打开。</div>
                 <div ref="canvasSurface" class="canvas-surface" :style="canvasSurfaceStyle">
                   <canvas ref="pdfCanvas" class="pdf-canvas"></canvas>
                   <div v-if="regionDeleteRectangle" class="region-delete-rectangle" :style="regionDeleteRectangleStyle" aria-hidden="true" />
-                  <div v-for="marker in (displayEmbeddedReference ? referenceDisplayMarkers : [])" :key="marker.key" class="reference-focus-marker" :class="[`reference-focus-marker--${marker.type}`, { 'reference-focus-marker--all': referenceShowAll }]" :style="marker.style" :title="marker.label"><i :style="marker.linkStyle" aria-hidden="true" /><span>{{ marker.label }}</span></div>
+                  <div v-for="marker in (displayEmbeddedReference ? referenceDisplayMarkers : [])" :key="marker.key" class="reference-focus-marker" :class="[`reference-focus-marker--${marker.type}`, { 'reference-focus-marker--all': referenceShowAll }]" :style="marker.style" :title="marker.label" @click.stop><i :style="marker.linkStyle" aria-hidden="true" /><span>{{ marker.label }}</span></div>
                   <svg v-if="result && pageData" class="leader-layer" :viewBox="`0 0 ${canvasLayout.width} ${canvasLayout.height}`" preserveAspectRatio="none" aria-hidden="true">
-                    <line v-for="item in pageData.candidates.filter(candidate => candidate.included !== false)" :key="`line-${item.id}`" :ref="element => setLeaderLineElement(item.id, element)" :x1="anchorPoint(item).x" :y1="anchorPoint(item).y" :x2="leaderEnd(item).x" :y2="leaderEnd(item).y" :style="leaderStyle(item)" />
+                    <line v-for="item in visiblePageCandidates" :key="`line-${item.id}`" :ref="element => setLeaderLineElement(item.id, element)" :x1="anchorPoint(item).x" :y1="anchorPoint(item).y" :x2="leaderEnd(item).x" :y2="leaderEnd(item).y" :style="leaderStyle(item)" />
+                    <line v-if="manualDragPreview" :x1="anchorPoint(manualDragPreview).x" :y1="anchorPoint(manualDragPreview).y" :x2="leaderEnd(manualDragPreview).x" :y2="leaderEnd(manualDragPreview).y" :style="leaderStyle(manualDragPreview)" />
                   </svg>
-                  <div v-for="item in (result && pageData && manualAddMode ? pageData.candidates.filter(candidate => candidate.included !== false && candidateMatchesModificationType(candidate)) : [])" :key="`group-${item.id}`" class="marker-group-handle" :class="{ selected: selectedId === item.id, 'marker-group-handle--temporarily-hidden': labelDragState?.id === item.id || anchorDragState?.id === item.id || groupDragState?.id === item.id }" :style="{ left: `${groupHandlePosition(item).x}px`, top: `${groupHandlePosition(item).y}px` }" role="button" tabindex="0" :aria-label="`整体移动标识 ${item.number || '?'}`" title="拖动可整体移动标识框和引线" @click.stop="selectCandidate(item)" @pointerdown="startGroupDrag($event, item)" @pointermove="moveGroup($event, item)" @pointerup="endGroupDrag($event, item)" @pointercancel="endGroupDrag($event, item)"></div>
-                  <div v-for="item in (result && pageData && manualAddMode ? pageData.candidates.filter(candidate => candidate.included !== false && candidateMatchesModificationType(candidate)) : [])" :key="`anchor-${item.id}`" class="manual-weld-anchor" :class="{ selected: selectedId === item.id, dragging: anchorDragState?.id === item.id, 'manual-weld-anchor--recognized': item.origin !== 'manual' }" :style="{ left: `${anchorPoint(item).x}px`, top: `${anchorPoint(item).y}px` }" role="button" tabindex="0" @click.stop="selectCandidate(item)" @pointerdown="startAnchorDrag($event, item)" @pointermove="moveAnchor($event, item)" @pointerup="endAnchorDrag($event, item)" @pointercancel="endAnchorDrag($event, item)"></div>
+                  <template v-if="manualDragPreview">
+                    <div class="marker-group-handle selected" :style="{ left: `${groupHandlePosition(manualDragPreview).x}px`, top: `${groupHandlePosition(manualDragPreview).y}px`, pointerEvents: 'none' }" aria-hidden="true" />
+                    <div class="manual-weld-anchor selected" :style="{ left: `${anchorPoint(manualDragPreview).x}px`, top: `${anchorPoint(manualDragPreview).y}px`, pointerEvents: 'none' }" aria-hidden="true" />
+                    <div class="weld-label" :class="{ ...markerClass(manualDragPreview), selected: true }" :style="{ ...labelPosition(manualDragPreview), pointerEvents: 'none' }" aria-hidden="true">
+                      <template v-if="candidateMarkerStyle(manualDragPreview).shape === 'split-circle'"><span class="split-circle-content split-circle-content--upper">{{ manualDragPreview.number }}</span><span class="split-circle-content split-circle-content--lower">{{ manualDragPreview.secondaryText }}</span></template>
+                      <span v-else>{{ manualDragPreview.number }}</span>
+                    </div>
+                  </template>
+                  <div v-for="item in editablePageCandidates" :key="`group-${item.id}`" class="marker-group-handle" :class="{ selected: selectedId === item.id, 'marker-group-handle--temporarily-hidden': labelDragState?.id === item.id || anchorDragState?.id === item.id || groupDragState?.id === item.id }" :style="{ left: `${groupHandlePosition(item).x}px`, top: `${groupHandlePosition(item).y}px` }" role="button" tabindex="0" :aria-label="`整体移动标识 ${item.number}`" title="拖动可整体移动标识框和引线" @click.stop="selectCandidate(item)" @pointerdown="startGroupDrag($event, item)" @pointermove="moveGroup($event, item)" @pointerup="endGroupDrag($event, item)" @pointercancel="endGroupDrag($event, item)"></div>
+                  <div v-for="item in editablePageCandidates" :key="`anchor-${item.id}`" class="manual-weld-anchor" :class="{ selected: selectedId === item.id, dragging: anchorDragState?.id === item.id, 'manual-weld-anchor--recognized': item.origin !== 'manual' }" :style="{ left: `${anchorPoint(item).x}px`, top: `${anchorPoint(item).y}px` }" role="button" tabindex="0" @click.stop="selectCandidate(item)" @pointerdown="startAnchorDrag($event, item)" @pointermove="moveAnchor($event, item)" @pointerup="endAnchorDrag($event, item)" @pointercancel="endAnchorDrag($event, item)"></div>
                   <div v-for="item in (result && pageData ? pageData.candidates : [])" :key="item.id" class="weld-label" :class="markerClass(item)" :style="labelPosition(item)" role="button" tabindex="0" @click.stop="selectCandidate(item)" @dblclick="beginInlineEdit($event, item)" @pointerdown="startLabelDrag($event, item)" @pointermove="moveLabel($event, item)" @pointerup="endLabelDrag($event, item)" @pointercancel="endLabelDrag($event, item)">
-                    <input v-if="editingId === item.id" v-model="editingValue" class="inline-weld-input" @pointerdown.stop @dblclick.stop @keydown.enter.prevent="commitInlineEdit(item)" @keydown.esc.prevent="cancelInlineEdit" /><span v-else>{{ item.number || '?' }}</span>
+                    <div v-if="editingId === item.id && candidateMarkerStyle(item).shape === 'split-circle'" class="inline-split-editor" @pointerdown.stop @dblclick.stop><label><span>上栏</span><input v-model="editingValue" class="inline-weld-input inline-weld-input--primary" aria-label="编辑分栏圆形上栏内容" @keydown.enter.prevent="commitInlineEdit(item)" @keydown.esc.prevent="cancelInlineEdit" /></label><label><span>下栏</span><input v-model="editingSecondaryValue" class="inline-weld-input" aria-label="编辑分栏圆形下栏内容" @keydown.enter.prevent="commitInlineEdit(item)" @keydown.esc.prevent="cancelInlineEdit" /></label></div>
+                    <input v-else-if="editingId === item.id" v-model="editingValue" class="inline-weld-input inline-weld-input--primary" @pointerdown.stop @dblclick.stop @keydown.enter.prevent="commitInlineEdit(item)" @keydown.esc.prevent="cancelInlineEdit" />
+                    <template v-else-if="candidateMarkerStyle(item).shape === 'split-circle'"><span class="split-circle-content split-circle-content--upper">{{ item.number }}</span><span class="split-circle-content split-circle-content--lower">{{ item.secondaryText }}</span></template>
+                    <span v-else>{{ item.number }}</span>
                   </div>
                 </div>
                 <div v-if="targetPreparation.active" class="canvas-preparation" role="status" aria-live="polite">
@@ -1830,7 +2035,7 @@ async function exportCsv() {
         <v-card-title class="review-title"><span>图纸标识</span></v-card-title>
         <template v-if="result">
           <v-divider />
-          <div class="review-scroll pa-3">
+          <div ref="reviewScroll" class="review-scroll pa-3">
             <div data-tour="marker-appearance" class="marker-appearance-card">
               <div class="marker-appearance-tabs" role="tablist" aria-label="分类标识外观">
                 <button v-for="group in markerAppearanceGroups" :key="group.key" type="button" role="tab" :aria-selected="markerAppearanceTab === group.key" :class="{ active: markerAppearanceTab === group.key }" @click="markerAppearanceTab = group.key"><i :style="{ backgroundColor: group.style.color }" />{{ group.title.replace('标识', '') }}</button>
@@ -1839,42 +2044,59 @@ async function exportCsv() {
                   <div class="marker-appearance-heading"><span><i :style="{ backgroundColor: activeMarkerAppearanceGroup.style.color }" /><strong>{{ activeMarkerAppearanceGroup.title }}</strong></span></div>
                   <div class="marker-appearance-form">
                   <div class="section-label">分类标识外观</div>
-                  <v-select v-model="activeMarkerAppearanceGroup.style.shape" :items="shapeOptions" density="compact" label="外形" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" />
-                  <div class="parameter-grid mt-2"><v-text-field v-model.number="activeMarkerAppearanceGroup.style.frameSize" type="number" min="18" max="64" density="compact" label="框尺寸" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" /><v-text-field v-model.number="activeMarkerAppearanceGroup.style.fontSize" type="number" min="7" max="24" density="compact" label="字号" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" /></div>
-                  <div class="parameter-grid mt-2"><v-text-field v-model.number="activeMarkerAppearanceGroup.style.lineWidth" type="number" min="0.5" max="4" step="0.1" density="compact" label="线宽" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" /><v-text-field v-model="activeMarkerAppearanceGroup.style.color" type="color" density="compact" label="颜色" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" /></div>
+                  <div class="marker-appearance-fields">
+                    <v-select v-model="activeMarkerAppearanceGroup.style.shape" :items="activeMarkerShapeOptions" density="compact" hide-details label="外形" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" />
+                    <div class="parameter-grid"><v-text-field v-model.number="activeMarkerAppearanceGroup.style.frameSize" type="number" min="18" max="64" density="compact" hide-details label="框尺寸" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" /><v-text-field v-model.number="activeMarkerAppearanceGroup.style.fontSize" type="number" min="7" max="24" density="compact" hide-details label="字号" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" /></div>
+                    <div class="parameter-grid"><v-text-field v-model.number="activeMarkerAppearanceGroup.style.lineWidth" type="number" min="0.5" max="4" step="0.1" density="compact" hide-details label="线宽" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" /><v-text-field v-model="activeMarkerAppearanceGroup.style.color" type="color" density="compact" hide-details label="颜色" @focus="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @blur="commitHistory" /></div>
+                  </div>
                   <v-slider v-model="activeMarkerAppearanceGroup.style.fillOpacity" min="0" max="1" step="0.05" color="accent" label="填充透明度" thumb-label class="mt-2" @start="beginHistory(`调整${activeMarkerAppearanceGroup.title}外观`)" @end="commitHistory" />
                   <v-divider class="my-4" />
                   <div class="manual-numbering-settings">
                     <div class="section-label">新增编号规则</div>
-                    <div class="parameter-grid"><v-text-field v-model="activeMarkerAppearanceGroup.numbering.prefix" maxlength="20" density="compact" label="前缀" @blur="normalizeManualNumberingInput" /><v-text-field v-model="activeMarkerAppearanceGroup.numbering.suffix" maxlength="20" density="compact" label="后缀" @blur="normalizeManualNumberingInput" /></div>
-                    <v-text-field v-model.number="activeMarkerAppearanceGroup.numbering.start" class="mt-2" type="number" min="1" step="1" density="compact" label="起始数字" @blur="normalizeManualNumberingInput" />
+                    <template v-if="activeMarkerAppearanceGroup.style.shape === 'split-circle'">
+                      <div class="split-numbering-sections">
+                        <section class="split-numbering-section"><div class="section-label">上栏</div><div class="parameter-grid"><v-text-field v-model="activeMarkerAppearanceGroup.numbering.prefix" maxlength="20" density="compact" label="上栏前缀" @blur="normalizeManualNumberingInput" /><v-text-field v-model="activeMarkerAppearanceGroup.numbering.suffix" maxlength="20" density="compact" label="上栏后缀" @blur="normalizeManualNumberingInput" /></div><v-text-field v-model.number="activeMarkerAppearanceGroup.numbering.start" type="number" min="1" step="1" density="compact" label="上栏起始数字" @blur="normalizeManualNumberingInput" /></section>
+                        <section class="split-numbering-section"><div class="section-label">下栏</div><div class="parameter-grid"><v-text-field v-model="activeMarkerAppearanceGroup.numbering.secondaryPrefix" maxlength="20" density="compact" label="下栏前缀" @blur="normalizeManualNumberingInput" /><v-text-field v-model="activeMarkerAppearanceGroup.numbering.secondarySuffix" maxlength="20" density="compact" label="下栏后缀" @blur="normalizeManualNumberingInput" /></div><v-text-field v-model.number="activeMarkerAppearanceGroup.numbering.secondaryStart" type="number" min="1" step="1" density="compact" label="下栏起始数字" @blur="normalizeManualNumberingInput" /></section>
+                      </div>
+                    </template>
+                    <template v-else>
+                      <div class="parameter-grid"><v-text-field v-model="activeMarkerAppearanceGroup.numbering.prefix" maxlength="20" density="compact" label="前缀" @blur="normalizeManualNumberingInput" /><v-text-field v-model="activeMarkerAppearanceGroup.numbering.suffix" maxlength="20" density="compact" label="后缀" @blur="normalizeManualNumberingInput" /></div>
+                      <v-text-field v-model.number="activeMarkerAppearanceGroup.numbering.start" class="mt-2" type="number" min="1" step="1" density="compact" label="起始数字" @blur="normalizeManualNumberingInput" />
+                    </template>
                   </div>
                   <v-divider class="my-4" />
-                  <div class="section-label">新增标识引线</div>
-                  <v-text-field v-model.number="manualLeaderLength" type="number" min="20" max="240" step="4" density="compact" label="引线长度" suffix="图纸单位" />
+                  <div v-if="manualAddInteraction === 'keyboard'" class="section-label">新增标识引线</div>
+                  <v-text-field v-if="manualAddInteraction === 'keyboard'" v-model.number="manualLeaderLength" type="number" min="20" max="240" step="4" density="compact" label="引线长度" suffix="图纸单位" />
                   </div>
               </div>
             </div>
-            <v-btn data-tour="position-optimization" block variant="tonal" color="secondary" class="mt-2" :disabled="collaborationInteractionBlocked" @click="reflowCurrentPageLabelPositions(true)">重新优化当前页标识位置<v-tooltip activator="parent">仅重新排列当前页标识，并避让文字、管线、焊口锚点、其他标识和引线</v-tooltip></v-btn>
-            <v-divider class="my-4" />
-            <div v-if="selectedCandidate" data-tour="selected-object">
-              <div class="section-label">选中对象</div>
-              <v-text-field v-model="selectedCandidate.number" label="编号" @focus="beginHistory('修改编号')" @blur="commitHistory"><v-tooltip activator="parent">修改选中对象的字符串编号</v-tooltip></v-text-field>
-              <div v-if="isSpecialMarker(selectedCandidate)" class="marker-appearance-card mt-3">
-                <div class="marker-appearance-heading"><span><i :style="{ backgroundColor: selectedCandidate.markerStyle.color }" /><strong>特殊标识独立外观</strong></span><small>仅影响当前选中对象</small></div>
-                <div class="marker-appearance-form">
-                  <v-select v-model="selectedCandidate.markerStyle.shape" :items="shapeOptions" density="compact" label="外形" @focus="beginHistory('调整特殊标识外观')" @blur="commitHistory" />
-                  <div class="parameter-grid mt-2"><v-text-field v-model.number="selectedCandidate.markerStyle.frameSize" type="number" min="18" max="64" density="compact" label="框尺寸" @focus="beginHistory('调整特殊标识外观')" @blur="commitHistory" /><v-text-field v-model.number="selectedCandidate.markerStyle.fontSize" type="number" min="7" max="24" density="compact" label="字号" @focus="beginHistory('调整特殊标识外观')" @blur="commitHistory" /></div>
-                  <div class="parameter-grid mt-2"><v-text-field v-model.number="selectedCandidate.markerStyle.lineWidth" type="number" min="0.5" max="4" step="0.1" density="compact" label="线宽" @focus="beginHistory('调整特殊标识外观')" @blur="commitHistory" /><v-text-field v-model="selectedCandidate.markerStyle.color" type="color" density="compact" label="颜色" @focus="beginHistory('调整特殊标识外观')" @blur="commitHistory" /></div>
-                  <v-slider v-model="selectedCandidate.markerStyle.fillOpacity" min="0" max="1" step="0.05" color="accent" label="填充透明度" thumb-label class="mt-2" @start="beginHistory('调整特殊标识外观')" @end="commitHistory" />
+            <div v-if="selectedCandidate" ref="selectedObjectCard" data-tour="selected-object" class="marker-appearance-card selected-object-card">
+              <div class="marker-appearance-heading"><span><i :style="{ backgroundColor: selectedCandidateAppearance?.color }" /><strong>选中对象</strong></span><small v-if="isSpecialMarker(selectedCandidate) || selectedCandidate.markerStyleOverride">{{ selectedAppearanceScopeLabel }}</small></div>
+              <div class="marker-appearance-form">
+                <div class="section-label">内容</div>
+                <div class="selected-marker-content-fields">
+                  <v-text-field v-model="selectedCandidate.number" :label="candidateMarkerStyle(selectedCandidate).shape === 'split-circle' ? '上栏内容' : '编号'" density="compact" @focus="beginHistory('修改编号')" @blur="commitHistory"><v-tooltip activator="parent">修改选中对象的字符串编号</v-tooltip></v-text-field>
+                  <v-text-field v-if="candidateMarkerStyle(selectedCandidate).shape === 'split-circle'" v-model="selectedCandidate.secondaryText" density="compact" label="下栏内容" @focus="beginHistory('修改分栏圆形下栏内容')" @blur="commitHistory" />
                 </div>
+                <template v-if="isSpecialMarker(selectedCandidate)">
+                  <v-divider class="my-3" />
+                  <div class="section-label">外观</div>
+                  <div class="marker-appearance-fields">
+                    <v-select v-model="selectedCandidateAppearance.shape" :items="selectedCandidateShapeOptions" density="compact" hide-details label="外形" @focus="beginHistory('调整选中对象外观')" @blur="commitHistory" />
+                    <div class="parameter-grid mb-2"><v-text-field v-model.number="selectedCandidateAppearance.frameSize" type="number" min="18" max="64" density="compact" hide-details label="框尺寸" @focus="beginHistory('调整选中对象外观')" @blur="commitHistory" /></div><div class="parameter-grid"><v-text-field v-model.number="selectedCandidateAppearance.fontSize" type="number" min="7" max="24" density="compact" hide-details label="字号" @focus="beginHistory('调整选中对象外观')" @blur="commitHistory" /><v-text-field v-model.number="selectedCandidateAppearance.lineWidth" type="number" min="0.5" max="4" step="0.1" density="compact" hide-details label="线宽" @focus="beginHistory('调整选中对象外观')" @blur="commitHistory" /></div>
+                    <v-text-field v-model="selectedCandidateAppearance.color" type="color" density="compact" hide-details label="颜色" @focus="beginHistory('调整选中对象外观')" @blur="commitHistory" />
+                  </div>
+                  <v-slider v-model="selectedCandidateAppearance.fillOpacity" min="0" max="1" step="0.05" color="accent" label="填充透明度" thumb-label class="mt-2" @start="beginHistory('调整选中对象外观')" @end="commitHistory" />
+                </template>
+                <v-list density="compact" class="evidence-list mt-3"><v-list-item title="证据" :subtitle="selectedCandidate.evidence" /><v-list-item title="置信度" :subtitle="`${Math.round(selectedCandidate.confidence * 100)}%`" /><v-list-item title="参考身份" :subtitle="selectedCandidate.referenceLabel || '未匹配'" /></v-list>
               </div>
-              <v-list density="compact" class="evidence-list mt-3"><v-list-item title="证据" :subtitle="selectedCandidate.evidence" /><v-list-item title="置信度" :subtitle="`${Math.round(selectedCandidate.confidence * 100)}%`" /><v-list-item title="参考身份" :subtitle="selectedCandidate.referenceLabel || '未匹配'" /></v-list>
-              <v-btn block class="mt-3" :disabled="collaborationInteractionBlocked" :color="selectedCandidate.included === false ? 'secondary' : 'error'" variant="tonal" @click="toggleCandidate(selectedCandidate)">{{ selectedCandidate.included === false ? '恢复这个对象' : '排除这个误识别对象' }}<v-tooltip activator="parent">切换该对象是否参与保存与导出</v-tooltip></v-btn>
             </div>
+            <v-btn data-tour="shift-numbering" block variant="tonal" color="secondary" class="mt-3" :disabled="collaborationInteractionBlocked || !selectedCandidate" @click="shiftFollowingMarkerNumbers">顺延编号<v-tooltip activator="parent">所选标识保持不变，将当前页同类、同前后缀且编号不小于它的其他标识统一加 1（{{ shortcutSettings.shiftFollowing }}）</v-tooltip></v-btn>
+            <v-btn data-tour="position-optimization" block variant="tonal" color="secondary" class="mt-2" :disabled="collaborationInteractionBlocked" @click="reflowCurrentPageLabelPositions(true)">重新优化当前页标识位置<v-tooltip activator="parent">重新排列当前页全部标识，并避让文字、管线、对象锚点、其他标识和引线</v-tooltip></v-btn>
+            <v-btn data-tour="batch-marker-button" block variant="tonal" color="secondary" class="mt-2" :disabled="collaborationInteractionBlocked || result?.status !== 'complete'" aria-label="打开批量修改标识表格" @click="openBatchMarkerEditor">批量修改标识<v-tooltip activator="parent">以表格批量修改当前任务全部页面的标识编号、内容和外观</v-tooltip></v-btn>
           </div>
           <v-divider />
-          <v-card-actions data-tour="review-actions" class="review-actions"><v-btn size="small" :loading="backendSaveState === 'saving' && !saveAndCloseRunning" :disabled="saveAndCloseRunning" @click="save">{{ result?.jobId === 'tutorial-000207' ? '保存草稿' : backendSaveButtonLabel }}<v-tooltip activator="parent">修改只保留在内存中；切换页时自动保存当前页，也可点击立即保存。教程仅保存浏览器草稿。</v-tooltip></v-btn><v-menu><template #activator="{ props }"><v-btn v-bind="props" size="small" color="primary" :disabled="saveAndCloseRunning">导出<v-tooltip activator="parent">选择导出 CSV 或标识 PDF；AI 训练样本由后端在解析完成后自动生成</v-tooltip></v-btn></template><v-list density="compact"><v-list-item title="导出 CSV" @click="exportCsv" /><v-list-item title="导出标识 PDF" @click="exportPdf" /></v-list></v-menu><v-btn size="small" :loading="saveAndCloseRunning" @click="saveAndClose">保存并关闭<v-tooltip activator="parent">保存当前校对结果，释放页面锁并关闭工作区，然后返回解析任务列表</v-tooltip></v-btn></v-card-actions>
+          <v-card-actions data-tour="review-actions" class="review-actions"><v-btn size="small" :loading="backendSaveState === 'saving' && !saveAndCloseRunning" :disabled="saveAndCloseRunning || !result?.jobId" @click="save">{{ result?.jobId === 'tutorial-000207' ? '保存草稿' : backendSaveButtonLabel }}<v-tooltip activator="parent">修改只保留在内存中；切换页时自动保存当前页，也可点击立即保存。教程仅保存浏览器草稿。</v-tooltip></v-btn><v-btn size="small" color="primary" :disabled="saveAndCloseRunning || !result?.jobId" @click="exportPdf">导出修改版本<v-tooltip activator="parent">导出当前工作区的标识 PDF</v-tooltip></v-btn><v-btn size="small" :loading="saveAndCloseRunning" :disabled="!result?.jobId" @click="saveAndClose">保存并关闭<v-tooltip activator="parent">保存当前校对结果，释放页面锁并关闭工作区，然后返回解析任务列表</v-tooltip></v-btn></v-card-actions>
         </template>
         <v-card-text v-else class="review-placeholder">
           <div class="review-placeholder__title">等待识别结果</div>
@@ -1885,7 +2107,7 @@ async function exportCsv() {
     </v-navigation-drawer>
 
     <TutorialCatalogDialog :model-value="tutorialCatalogOpen" :tutorials="tutorialCatalog" :loading-id="tutorialLoadingId" @update:model-value="updateTutorialCatalogOpen" @start="startTutorial" />
-    <TutorialTour v-model="tutorialOpen" :steps="activeTutorialSteps" :tutorial-title="activeTutorial.title" @step-change="handleTutorialStepChange" @close="finishTutorial" />
+    <TutorialTour v-model="tutorialOpen" :steps="activeTutorialSteps" :tutorial-title="activeTutorial.title" :target-ready="tutorialTargetReady" @step-change="handleTutorialStepChange" @close="finishTutorial" />
 
     <DraftManagerDialogs
       v-model:recovery-dialog="draftRecoveryDialog"
@@ -1927,6 +2149,7 @@ async function exportCsv() {
       v-model="analysisQueueDialog"
       v-model:delete-dialog="analysisQueueDeleteDialog"
       :tab="analysisQueueTab"
+      :archived-task-type="analysisQueueArchivedTaskType"
       :loading="analysisQueueLoading"
       :queue="analysisQueue"
       :jobs="visibleAnalysisQueueJobs"
@@ -1936,32 +2159,44 @@ async function exportCsv() {
       :current-job-id="result?.jobId || ''"
       @refresh="refreshAnalysisQueue"
       @update:tab="selectAnalysisQueueTab"
+      @update:archived-task-type="selectArchivedAnalysisQueueTaskType"
       @change-page="changeAnalysisQueuePage"
       @cancel="cancelQueueJob"
       @move="moveQueueJob"
       @archive="setQueueJobArchived"
       @restore="restoreQueueJob"
+      @export="exportQueueJobFile"
       @delete-request="requestDeleteQueueJob"
       @delete-confirm="confirmDeleteQueueJob"
     />
 
+    <BatchMarkerEditorDialog v-if="batchMarkerEditorOpen" :editor="batchMarkerEditor" :task-name="targetPdf?.name || result?.targetFile || ''" :tutorial-columns="tutorialOpen ? activeTutorialStep?.batchColumns || '' : ''" :tutorial-tools="tutorialOpen && Boolean(activeTutorialStep?.batchTools)" />
+
     <SystemSettingsDialog
+      :tutorial-section="tutorialSettingsSection"
       v-model="systemSettingsDialog"
       v-model:left-drawer="leftDrawerOpen"
       v-model:review-drawer="reviewDrawerOpen"
+      v-model:left-drawer-size="leftDrawerSize"
+      v-model:review-drawer-size="reviewDrawerSize"
       v-model:tooltips="tooltipsEnabled"
       v-model:operation-messages="operationMessagesEnabled"
       v-model:error-messages="errorMessagesEnabled"
+      v-model:message-location="messageLocation"
       v-model:page-button-count="pageButtonsPerGroup"
       v-model:clear-references="clearReferencesOnDesignUpload"
       v-model:auto-reference-window="autoReferenceWindow"
       v-model:reference-hint-location="referenceHintLocation"
+      v-model:auto-fit-pdf="autoFitPdf"
       v-model:performance-mode="canvasPerformanceMode"
       v-model:appearance-tab="settingsAppearanceTab"
       v-model:manual-leader-length="defaultManualLeaderLength"
+      v-model:manual-add-interaction="manualAddInteraction"
       v-model:theme-preference="themePreference"
+      v-model:header-buttons="headerButtons"
       :theme-options="themeOptions"
       :canvas-performance-options="canvasPerformanceOptions"
+      :canvas-performance-profiles="Object.values(CANVAS_PERFORMANCE_PROFILES)"
       :canvas-performance-profile="canvasPerformanceProfile"
       :marker-appearance-groups="defaultMarkerAppearanceGroups"
       :active-appearance-group="activeSettingsAppearanceGroup"
@@ -1970,6 +2205,9 @@ async function exportCsv() {
       :shortcut-editors="shortcutEditors"
       :shortcut-modifier-options="shortcutModifierOptions"
       :shortcut-conflict="shortcutConflict"
+      :header-button-options="HEADER_BUTTON_OPTIONS"
+      :drawer-size-options="DRAWER_SIZE_OPTIONS"
+      :message-location-options="messageLocationOptions"
       @open-drafts="openDraftManager"
       @update-shortcut-modifier="updateShortcutModifier"
       @capture-shortcut-key="captureShortcutKey"

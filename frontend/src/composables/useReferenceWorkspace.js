@@ -7,7 +7,7 @@ import { loadPdfDocument } from '../services/pdfDocument.js'
 
 const MAX_LAZY_REFERENCE_FILES = 5
 
-export function useReferenceWorkspace({ projectResults, result, currentPage, selectedPcfFolder, error, operations }) {
+export function useReferenceWorkspace({ projectResults, result, currentPage, selectedPcfFolder, error, operations, loadDocument = loadPdfDocument }) {
   const mode = ref('pdf')
   const projectMode = ref('single')
   const files = ref([])
@@ -62,7 +62,13 @@ export function useReferenceWorkspace({ projectResults, result, currentPage, sel
   }
 
   function changeMode(nextMode) {
+    if (mode.value === nextMode) return
     mode.value = nextMode
+    if (result.value?.jobId || result.value?.manualWorkspace) {
+      operations.scheduleDraftSave()
+      void operations.renderCanvas(true)
+      return
+    }
     clearFiles()
     pcfFiles.value = []
     selectedPcfFolder.value = null
@@ -70,7 +76,13 @@ export function useReferenceWorkspace({ projectResults, result, currentPage, sel
   }
 
   function changeProjectMode(nextMode) {
+    if (projectMode.value === nextMode) return
     projectMode.value = nextMode
+    if ((result.value?.jobId || result.value?.manualWorkspace) && files.value.length) {
+      operations.scheduleDraftSave()
+      void operations.renderCanvas(true)
+      return
+    }
     clearFiles()
     pcfFiles.value = []
     selectedPcfFolder.value = null
@@ -192,21 +204,27 @@ export function useReferenceWorkspace({ projectResults, result, currentPage, sel
       await operations.renderCanvas(fitAfter)
       return
     }
+    operations.invalidateCanvas()
+    const previousDocument = document.value
+    document.value = null
+    previousDocument?.destroy?.()
+    // Open/materialize the new reference in parallel with a design-only
+    // render. Reference arrival must not refit a view already shown to users.
+    const designRender = Promise.resolve(operations.renderCanvas(fitAfter)).then(() => null, error => error)
     try {
-      const resolvedFile = await materialize(file)
+      const resolvedFile = file?.url && typeof file?.arrayBuffer !== 'function'
+        ? file
+        : await materialize(file)
       if (token !== loadToken) return
-      const previousDocument = document.value
-      if (previousDocument) {
-        operations.invalidateCanvas()
-        document.value = null
-        previousDocument.destroy?.()
-      }
       activeFile.value = resolvedFile
-      const loadedDocument = await loadPdfDocument(resolvedFile)
+      const loadedDocument = await loadDocument(resolvedFile)
       if (token !== loadToken) { loadedDocument.destroy?.(); return }
+      const designError = await designRender
+      if (token !== loadToken) { loadedDocument.destroy?.(); return }
+      if (designError) { loadedDocument.destroy?.(); throw designError }
       document.value = loadedDocument
       await nextTick()
-      await operations.renderCanvas(fitAfter)
+      if (token === loadToken) await operations.renderCanvas(false)
     } catch (cause) {
       if (token === loadToken) error.value = `对照 PDF 渲染失败：${cause.message || cause}`
     }

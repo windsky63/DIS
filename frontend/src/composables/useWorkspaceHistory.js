@@ -1,6 +1,6 @@
 import { computed, ref, watch } from 'vue'
 
-const REVIEW_FIELDS = ['reviewRevision', 'reviewedBy', 'reviewedAt']
+const REVIEW_FIELDS = ['reviewRevision', 'reviewedBy', 'reviewedAt', 'reviewSaveRequestId']
 export const DEFAULT_TASK_HISTORY_LIMIT = 120
 
 export function useWorkspaceHistory({
@@ -28,7 +28,10 @@ export function useWorkspaceHistory({
   const canRedo = computed(() => canEdit() && redoStack.value.length > 0)
 
   function editablePage(page) {
-    const value = cloneValue(page)
+    // Obstacles describe the PDF geometry, not an edit. Exclude them before
+    // cloning so every undo entry does not duplicate the same large arrays.
+    const value = { ...page }
+    delete value.layoutObstacles
     for (const field of REVIEW_FIELDS) delete value[field]
     return value
   }
@@ -36,10 +39,27 @@ export function useWorkspaceHistory({
     if (!pageData.value) return null
     return {
       taskKey: documentKey(), key: currentKey(), page: Number(pageData.value.page), description,
-      value: editablePage(pageData.value),
+      value: cloneValue(editablePage(pageData.value)),
       markerStyle: cloneValue(markerStyle.value),
       componentMarkerStyles: cloneValue(componentMarkerStyles.value),
     }
+  }
+  function recordPageEdit(beforePage, afterPage, description) {
+    if (!result.value || Number(beforePage.page) !== Number(afterPage.page)) return
+    if (JSON.stringify(editablePage(beforePage)) === JSON.stringify(editablePage(afterPage))) return
+    const taskKey = documentKey()
+    const key = pageKey(beforePage.page, taskKey)
+    const saved = {
+      taskKey, key, page: Number(beforePage.page), description,
+      value: cloneValue(editablePage(beforePage)), markerStyle: cloneValue(markerStyle.value),
+      componentMarkerStyles: cloneValue(componentMarkerStyles.value), historyOrder: ++historySequence,
+      restoreMarkerStyle: false, restoreComponentStyles: false,
+    }
+    const stacks = history(key, taskKey)
+    stacks.undo.push(saved)
+    if (stacks.undo.length > pageHistoryLimit) stacks.undo.shift()
+    stacks.redo = []
+    trimTaskHistory(taskKey)
   }
   function trimTaskHistory(taskKey) {
     const entries = []
@@ -74,7 +94,7 @@ export function useWorkspaceHistory({
     if (stacks.undo.length > pageHistoryLimit) stacks.undo.shift()
     stacks.redo = []
     trimTaskHistory(before.taskKey)
-    scheduleSave()
+    scheduleSave({ workspace: before.restoreMarkerStyle || before.restoreComponentStyles })
   }
   function apply(saved) {
     if (!result.value || saved.key !== currentKey() || !canEdit()) return false
@@ -83,6 +103,7 @@ export function useWorkspaceHistory({
       result.value.pages = pages.value.map(page => {
         if (Number(page.page) !== saved.page) return page
         const restored = cloneValue(saved.value)
+        if (Object.hasOwn(page, 'layoutObstacles')) restored.layoutObstacles = page.layoutObstacles
         // Server versions are monotonic, never part of an edit undo.
         for (const field of REVIEW_FIELDS) {
           if (Object.hasOwn(page, field)) restored[field] = cloneValue(page[field])
@@ -94,7 +115,7 @@ export function useWorkspaceHistory({
       projectResults.value[activeProjectIndex.value] = result.value
       selectedId.value = ''
     } finally { applying.value = false }
-    scheduleSave()
+    scheduleSave({ workspace: Boolean(saved.restoreMarkerStyle || saved.restoreComponentStyles) })
     return true
   }
   function move(from, to, action, label) {
@@ -121,5 +142,5 @@ export function useWorkspaceHistory({
     if (pending.value?.key === key) pending.value = null
   }
   function clear() { histories.value.clear(); pending.value = null }
-  return { undoStack, redoStack, pending, applying, canUndo, canRedo, begin, commit, undo, redo, clear, clearPage }
+  return { undoStack, redoStack, pending, applying, canUndo, canRedo, begin, commit, undo, redo, clear, clearPage, recordPageEdit }
 }

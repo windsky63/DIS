@@ -3,7 +3,6 @@ import test from 'node:test'
 
 import { ref } from 'vue'
 
-import { numberDocumentResult } from '../src/numbering.js'
 import { useProjectWorkspace } from '../src/composables/useProjectWorkspace.js'
 
 
@@ -33,8 +32,30 @@ test('completed server pages are released back to lightweight summaries after na
   assert.equal(result.value.pages[2].candidates[0].id, 'dirty')
 })
 
+test('collaborative page preview skips unlocked hydration and renders only once', async () => {
+  const state = {
+    result: ref({ jobId: 'job-a', pages: [{ page: 1, detailsLoaded: true }, { page: 2, detailsLoaded: false, candidates: [] }] }),
+    currentPage: ref(1), previewPage: ref(1), selectedId: ref('selected'), activeFileFingerprint: ref('drawing-a'),
+    activeProjectIndex: ref(0), referenceMode: ref('none'), hydratingWorkspace: ref(false),
+  }
+  let renders = 0
+  const workspace = useProjectWorkspace({
+    state,
+    operations: {
+      targetPageCount: ref(2),
+      renderCanvas: async () => { renders += 1 },
+    },
+  })
 
-test('restoring a workspace preserves existing numbers when another candidate is blank', async () => {
+  await workspace.changePage(2, { hydrateDetails: false })
+
+  assert.equal(state.currentPage.value, 2)
+  assert.equal(state.result.value.pages[1].detailsLoaded, false)
+  assert.equal(renders, 1)
+})
+
+
+test('restoring a workspace leaves persisted candidate numbers unchanged', async () => {
   const restoredResult = {
     status: 'complete',
     analyzedRange: [1, 1],
@@ -43,7 +64,6 @@ test('restoring a workspace preserves existing numbers when another candidate is
       { id: 'blank', page: 1, x: 2, y: 2, number: '', included: false },
     ] }],
   }
-  let numberingCalls = 0
   let recoveredDirtyPages = []
   const state = {
     projectMode: ref('single'), projectPdfs: ref([]), projectResults: ref([]), activeProjectIndex: ref(0),
@@ -65,10 +85,6 @@ test('restoring a workspace preserves existing numbers when another candidate is
       cloneValue: value => JSON.parse(JSON.stringify(value)),
       materializeStoredFile: async value => value,
       restoreProjectSettings() {}, restoreMarkerAppearances() {}, setActiveReferencePage() {},
-      numberResult(value, start) {
-        numberingCalls += 1
-        numberDocumentResult(value, start, { useReferenceNumber: false, formatWeldNumber: number => String(number) })
-      },
       clearHistory() {}, showNotice() {}, logAudit() {}, renderCanvas: async () => {},
       markRecoveredPagesDirty(pages) { recoveredDirtyPages = pages },
       matchedReference: () => null, syncReferenceForPage: async () => {}, loadReferencePdf: async () => {},
@@ -80,7 +96,6 @@ test('restoring a workspace preserves existing numbers when another candidate is
 
   await workspace.restoreWorkspaceDraft()
 
-  assert.equal(numberingCalls, 0)
   assert.deepEqual(state.result.value.pages[0].candidates.map(item => item.number), ['F1A', ''])
   assert.deepEqual(recoveredDirtyPages, [1])
 })

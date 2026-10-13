@@ -6,12 +6,15 @@ Long-running recognition is delegated to independent durable queue workers.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta
+import csv
+from datetime import timedelta
+from email.utils import formatdate
 import hashlib
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 import json
+import io
 import mimetypes
 import os
 from pathlib import Path
@@ -31,29 +34,35 @@ import fitz
 try:
     from .. import ai_assistant
     from ..admin_store import AdminStore
+    from ..audit_store import AuditStore
+    from ..business_stats import BusinessStats
     from ..assistant_conversation_store import AssistantConversationStore
     from ..engine import dump_result, render_page, write_annotated_pdf
     from ..reference_rules import normalize_reference_rules
     from ..auth_store import AuthStore, InvalidCredentials, UsernameTaken
     from ..iso_weld_matcher.idf_topology import parser_availability
-    from ..job_store import ActiveJobExists, JobStore
+    from ..job_store import ActiveJobExists, JobStore, page_business_deltas
     from ..page_lock_store import PageLockConflict, PageLockStore
     from ..page_reviews import PageRevisionConflict
     from ..progress import result_progress_percent
+    from ..time_utils import beijing_from_timestamp, beijing_now, beijing_now_text
     from .exceptions import ApiError
     from .services import queue, uploads
 except ImportError:  # Direct ``python backend/server.py`` execution.
     import ai_assistant
     from admin_store import AdminStore
+    from audit_store import AuditStore
+    from business_stats import BusinessStats
     from assistant_conversation_store import AssistantConversationStore
     from engine import dump_result, render_page, write_annotated_pdf
     from reference_rules import normalize_reference_rules
     from auth_store import AuthStore, InvalidCredentials, UsernameTaken
     from iso_weld_matcher.idf_topology import parser_availability
-    from job_store import ActiveJobExists, JobStore
+    from job_store import ActiveJobExists, JobStore, page_business_deltas
     from page_lock_store import PageLockConflict, PageLockStore
     from page_reviews import PageRevisionConflict
     from progress import result_progress_percent
+    from time_utils import beijing_from_timestamp, beijing_now, beijing_now_text
     from api.exceptions import ApiError
     from api.services import queue, uploads
 
@@ -66,8 +75,8 @@ PCF_LIBRARY_ROOT = ROOT / "backend" / "PCF"
 TUTORIAL_ROOT = ROOT / "backend" / "tutorial"
 TUTORIAL_EXPORT_ROOT = ROOT / "data" / "tutorial-exports"
 AUDIT_ROOT = ROOT / "data" / "audit"
-APP_VERSION = os.environ.get("DRAWING_MARK_RECOGNITION_VERSION", "2.0.12")
-BUILD_ID = os.environ.get("DRAWING_MARK_RECOGNITION_BUILD_ID", "local")
+APP_VERSION = os.environ.get("DRAWING_MARK_RECOGNITION_VERSION", "2.0.19")
+BUILD_ID = os.environ.get("DRAWING_MARK_RECOGNITION_BUILD_ID", "20261012-marker-editor-release")
 MAX_BODY_BYTES = int(os.environ.get("DRAWING_MARK_RECOGNITION_MAX_BODY_MB", "350")) * 1024 * 1024
 MAX_JOB_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_UPLOAD_BYTES = int(os.environ.get("DRAWING_MARK_RECOGNITION_MAX_UPLOAD_FILE_MB", "350")) * 1024 * 1024
@@ -92,7 +101,7 @@ MINERU_BASE_URL = os.environ.get("MINERU_BASE_URL", "http://192.168.32.61:8081")
 # Increment whenever recognition semantics change so completed results from an
 # older engine are not silently reused for the same files and configuration.
 ANALYSIS_ALGORITHM_VERSION = os.environ.get(
-    "DRAWING_MARK_RECOGNITION_ALGORITHM_VERSION", "2026-09-16.vector-layout.1"
+    "DRAWING_MARK_RECOGNITION_ALGORITHM_VERSION", "2026-09-20.persisted-numbering.1"
 )
 
 
@@ -159,7 +168,7 @@ def _require_job_page(job_id: str, page_number: int) -> None:
 
 
 def _console(message: str) -> None:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+    print(f"[{beijing_now().strftime('%H:%M:%S')}] {message}", flush=True)
 
 
 def _rotate_audit_log() -> None:
@@ -176,6 +185,30 @@ def _rotate_audit_log() -> None:
     path.replace(path.with_name(f"{path.name}.1"))
 
 
+def _append_audit_event(
+    action: str, details: dict[str, Any], user: dict[str, object], *, source: str,
+) -> None:
+    event = {
+        "action": action,
+        "source": source,
+        "timestamp": beijing_now_text(),
+        "actor": {"userId": str(user["userId"]), "username": str(user["username"])},
+        "details": details,
+    }
+    try:
+        AUDIT_ROOT.mkdir(parents=True, exist_ok=True)
+        with LOCK:
+            _rotate_audit_log()
+            with (AUDIT_ROOT / "events.jsonl").open("a", encoding="utf-8") as target:
+                target.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        _console(f"审计事件写入失败：{exc}")
+
+
+def _page_business_deltas(before: dict[str, Any], after: dict[str, Any]) -> dict[str, int]:
+    return page_business_deltas(before, after)
+
+
 def _job_status(folder: Path) -> str:
     result_path = folder / "result.json"
     if not result_path.is_file():
@@ -186,10 +219,12 @@ def _job_status(folder: Path) -> str:
         return ""
 
 
-def _analysis_queue_snapshot(*, scope: str = "current", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+def _analysis_queue_snapshot(
+    *, scope: str = "current", page: int = 1, page_size: int = 20, task_type: str = "analysis",
+) -> dict[str, Any]:
     return queue.snapshot(
         _job_store(), DATA_ROOT, MAX_CONCURRENT_ANALYSES,
-        scope=scope, page=page, page_size=page_size,
+        scope=scope, page=page, page_size=page_size, task_type=task_type,
     )
 
 
@@ -205,7 +240,7 @@ def _set_job_archived(job_id: str, archived: bool) -> dict[str, Any]:
             raise ApiError("只有已完成的解析任务可以归档", HTTPStatus.CONFLICT)
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if archived:
-            meta["archivedAt"] = datetime.now().isoformat(timespec="seconds")
+            meta["archivedAt"] = beijing_now_text()
         else:
             meta.pop("archivedAt", None)
         _atomic_dump(meta_path, meta)
@@ -244,7 +279,7 @@ def _cleanup_expired_jobs() -> int:
     removed = 0
     if not DATA_ROOT.is_dir():
         return removed
-    cutoff = datetime.now().timestamp() - timedelta(days=JOB_RETENTION_DAYS).total_seconds()
+    cutoff = time.time() - timedelta(days=JOB_RETENTION_DAYS).total_seconds()
     for folder in DATA_ROOT.iterdir():
         if not folder.is_dir() or not JOB_ID.fullmatch(folder.name):
             continue
@@ -431,6 +466,7 @@ def _analysis_signature(payload: dict[str, Any]) -> str:
         pcf_inventory.append([path.name.casefold(), stat.st_size, stat.st_mtime_ns])
     descriptor = {
         "algorithmVersion": ANALYSIS_ALGORITHM_VERSION,
+        "taskType": str(payload.get("taskType") or "analysis"),
         "target": _payload_file_signature(payload.get("targetUpload")),
         "referencePdfs": [_payload_file_signature(item) for item in (payload.get("referenceUploads") or [])],
         "pcfFiles": [_payload_file_signature(item) for item in (payload.get("pcfUploads") or [])],
@@ -587,7 +623,7 @@ def _active_analysis(signature: str) -> dict[str, Any] | None:
     return result
 
 
-def _validated_pages(payload: Any, current: dict[str, Any]) -> list[dict[str, Any]]:
+def _validated_pages(payload: Any, current: dict[str, Any], *, require_numbers: bool = True) -> list[dict[str, Any]]:
     if not isinstance(payload, list):
         raise ApiError("pages 必须是数组")
     if len(payload) > 10_000:
@@ -625,6 +661,8 @@ def _validated_pages(payload: Any, current: dict[str, Any]) -> list[dict[str, An
             for key in ("id", "number", "referenceLabel"):
                 if key in candidate and len(str(candidate.get(key) or "")) > 200:
                     raise ApiError(f"候选对象字段 {key} 超过长度限制")
+            if require_numbers and candidate.get("included", True) and not str(candidate.get("number") or "").strip():
+                raise ApiError(f"第 {page_number} 页存在未编号的有效候选对象")
             for key in ("x", "y", "labelX", "labelY"):
                 if key not in candidate:
                     continue
@@ -659,6 +697,41 @@ def _require_complete_job(folder: Path) -> tuple[Path, dict[str, Any]]:
     return result_path, current
 
 
+def _candidate_export_type(candidate: dict[str, Any]) -> str:
+    if (
+        candidate.get("componentKind") == "special-marker"
+        or candidate.get("componentType") == "special"
+        or candidate.get("specialMarker") is True
+    ):
+        return "special"
+    if candidate.get("componentKind") == "design-component":
+        return str(candidate.get("componentType") or "component")
+    return "weld"
+
+
+def _write_candidates_csv(path: Path, candidates: list[dict[str, Any]]) -> Path:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["页码", "对象类型", "编号", "X", "Y", "证据", "置信度", "参考匹配"])
+    for candidate in candidates:
+        evidence = candidate.get("evidence") or ""
+        if isinstance(evidence, (dict, list)):
+            evidence = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+        values = [
+            candidate.get("page") or 1,
+            _candidate_export_type(candidate),
+            candidate.get("number") or "",
+            f"{float(candidate.get('x') or 0):.2f}",
+            f"{float(candidate.get('y') or 0):.2f}",
+            evidence,
+            f"{round(float(candidate.get('confidence') or 0) * 100)}%",
+            candidate.get("referenceLabel") or "",
+        ]
+        writer.writerow([f"'{value}" if re.match(r"^[\t\r\n ]*[=+\-@]", str(value)) else value for value in values])
+    path.write_text("\ufeff" + output.getvalue(), encoding="utf-8")
+    return path
+
+
 def _tutorial_reference_sources() -> list[Path]:
     return sorted((TUTORIAL_ROOT / "000207").glob("*.pdf"), key=lambda path: path.name.casefold())
 
@@ -677,7 +750,7 @@ def _create_tutorial_session() -> dict[str, Any]:
         "targetFile": "000207.pdf",
         "originalTargetName": "000207.pdf",
         "revision": 0,
-        "updatedAt": datetime.now().isoformat(timespec="seconds"),
+        "updatedAt": beijing_now_text(),
         "progressStage": "complete",
         "progressMessage": "教程预解析结果已载入",
         "referenceMode": "tutorial-reference-pdf",
@@ -722,7 +795,7 @@ def _write_training_sample(
     manifest = {
         "schema": "weld-marker.training.v1",
         "jobId": job_id,
-        "createdAt": datetime.now().isoformat(),
+        "createdAt": beijing_now_text(),
         "exportMode": "post-analysis-auto" if not confirmed_by_human else "manual-confirmed",
         "candidateCount": len(candidates),
         "candidates": candidates,
@@ -948,31 +1021,73 @@ class ApiHandler(SimpleHTTPRequestHandler):
             raise ApiError(str(exc), HTTPStatus.CONFLICT) from exc
         token = _auth_store().create_session(str(user["userId"]))
         self._request_user = user
+        _append_audit_event("auth.registered", {}, user, source="server")
         self._json(HTTPStatus.CREATED, {"user": user}, {"Set-Cookie": self._session_cookie(token)})
 
     def _login(self) -> None:
         payload = self._read_json(MAX_JOB_REQUEST_BYTES)
+        attempted_username = str(payload.get("username") or "").strip()[:40]
         try:
-            user = _auth_store().authenticate(str(payload.get("username") or ""), str(payload.get("password") or ""))
+            user = _auth_store().authenticate(attempted_username, str(payload.get("password") or ""))
         except InvalidCredentials as exc:
+            _append_audit_event(
+                "auth.login_failed", {}, {"userId": "", "username": attempted_username or "未知用户"}, source="server",
+            )
             raise ApiError(str(exc), HTTPStatus.UNAUTHORIZED) from exc
         token = _auth_store().create_session(str(user["userId"]))
         _page_lock_store().release_user(str(user["userId"]))
         self._request_user = user
+        _append_audit_event(
+            "auth.login", {"persistentSession": payload.get("rememberPassword") is True}, user, source="server",
+        )
         self._json(HTTPStatus.OK, {"user": user}, {
             "Set-Cookie": self._session_cookie(token, persistent=payload.get("rememberPassword") is True),
         })
 
     def _logout(self) -> None:
+        user = self._current_user()
         _auth_store().delete_session(self._session_token())
+        if user:
+            _append_audit_event("auth.logout", {}, user, source="server")
         self._request_user = None
         self._json(HTTPStatus.OK, {"loggedOut": True}, {"Set-Cookie": self._session_cookie("", clear=True)})
 
-    def _file(self, path: Path, download_name: str | None = None, cache_control: str | None = None) -> None:
+    def _file(
+        self,
+        path: Path,
+        download_name: str | None = None,
+        cache_control: str | None = None,
+        allow_range: bool | None = None,
+    ) -> None:
         if not path.is_file():
             self._json(HTTPStatus.NOT_FOUND, {"error": "文件不存在"})
             return
-        self.send_response(HTTPStatus.OK)
+        if allow_range is None:
+            allow_range = path.suffix.lower() == ".pdf"
+        stat = path.stat()
+        start, end = 0, max(0, stat.st_size - 1)
+        range_header = self.headers.get("Range", "") if allow_range else ""
+        if range_header:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+            if not match or (not match.group(1) and not match.group(2)):
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{stat.st_size}")
+                self.end_headers()
+                return
+            if match.group(1):
+                start = int(match.group(1))
+                end = int(match.group(2)) if match.group(2) else end
+            else:
+                suffix_length = int(match.group(2))
+                start = max(0, stat.st_size - suffix_length)
+            if start >= stat.st_size or start > end:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{stat.st_size}")
+                self.end_headers()
+                return
+            end = min(end, stat.st_size - 1)
+        partial = bool(range_header)
+        self.send_response(HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK)
         content_type = {
             ".js": "application/javascript; charset=utf-8",
             ".mjs": "application/javascript; charset=utf-8",
@@ -981,14 +1096,28 @@ class ApiHandler(SimpleHTTPRequestHandler):
             ".wasm": "application/wasm",
         }.get(path.suffix.lower(), mimetypes.guess_type(path.name)[0] or "application/octet-stream")
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(path.stat().st_size))
+        content_length = end - start + 1 if stat.st_size else 0
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Last-Modified", formatdate(stat.st_mtime, usegmt=True))
+        self.send_header("ETag", f'"{stat.st_size:x}-{stat.st_mtime_ns:x}"')
+        if allow_range:
+            self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{stat.st_size}")
         if cache_control:
             self.send_header("Cache-Control", cache_control)
         if download_name:
             self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(download_name)}")
         self.end_headers()
         with path.open("rb") as source:
-            shutil.copyfileobj(source, self.wfile)
+            source.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def do_GET(self) -> None:  # noqa: N802
         try:
@@ -1035,6 +1164,68 @@ class ApiHandler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.OK, _admin_store().users(
                 search=query.get("search", [""])[0], page=page, page_size=page_size,
             ))
+            return
+        if path == "/api/admin/sessions":
+            self._require_admin()
+            query = parse_qs(parsed.query)
+            try:
+                page = max(1, int(query.get("page", ["1"])[0]))
+                page_size = max(1, min(100, int(query.get("pageSize", ["20"])[0])))
+            except (TypeError, ValueError):
+                page, page_size = 1, 20
+            self._json(HTTPStatus.OK, _admin_store().sessions(
+                search=query.get("search", [""])[0], page=page, page_size=page_size,
+            ))
+            return
+        if path == "/api/admin/jobs":
+            self._require_admin()
+            query = parse_qs(parsed.query)
+            try:
+                page = max(1, int(query.get("page", ["1"])[0]))
+                page_size = max(1, min(100, int(query.get("pageSize", ["20"])[0])))
+            except (TypeError, ValueError):
+                page, page_size = 1, 20
+            self._json(HTTPStatus.OK, _admin_store().jobs(
+                search=query.get("search", [""])[0],
+                status=query.get("status", [""])[0],
+                page=page,
+                page_size=page_size,
+            ))
+            return
+        if path == "/api/admin/business-stats":
+            self._require_admin()
+            _job_store()  # Ensure queue/page schema migrations are applied before aggregation.
+            query = parse_qs(parsed.query)
+            stats = BusinessStats(DATA_ROOT / ".queue" / "jobs.db", AUDIT_ROOT).snapshot(
+                date_from=query.get("from", [""])[0],
+                date_to=query.get("to", [""])[0],
+                project=query.get("project", [""])[0],
+                username=query.get("username", [""])[0],
+                action=query.get("action", [""])[0],
+            )
+            self._json(HTTPStatus.OK, stats)
+            return
+        if path == "/api/admin/audit-events":
+            self._require_admin()
+            _job_store()
+            query = parse_qs(parsed.query)
+            try:
+                page = max(1, int(query.get("page", ["1"])[0]))
+                page_size = max(1, min(200, int(query.get("pageSize", ["50"])[0])))
+            except (TypeError, ValueError):
+                page, page_size = 1, 50
+            result = AuditStore(DATA_ROOT / ".queue" / "jobs.db", AUDIT_ROOT).list_events(
+                date_from=query.get("from", [""])[0],
+                date_to=query.get("to", [""])[0],
+                username=query.get("username", [""])[0],
+                action=query.get("action", [""])[0],
+                source=query.get("source", [""])[0],
+                job_id=query.get("jobId", [""])[0],
+                search=query.get("search", [""])[0],
+                page=page,
+                page_size=page_size,
+            )
+            self._json(HTTPStatus.OK, result)
             return
         if path == "/api/admin/ai-balance":
             self._require_admin()
@@ -1101,6 +1292,8 @@ class ApiHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             scope = query.get("scope", ["current"])[0]
             scope = "archived" if scope == "archived" else "current"
+            task_type = query.get("taskType", ["analysis"])[0]
+            task_type = "direct-placement" if task_type == "direct-placement" else "analysis"
             try:
                 page = max(1, int(query.get("page", ["1"])[0]))
             except (TypeError, ValueError):
@@ -1110,7 +1303,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
             except (TypeError, ValueError):
                 page_size = 20
             self._json(HTTPStatus.OK, _analysis_queue_snapshot(
-                scope=scope, page=page, page_size=page_size,
+                scope=scope, page=page, page_size=page_size, task_type=task_type,
             ))
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/locks", path)
@@ -1212,6 +1405,14 @@ class ApiHandler(SimpleHTTPRequestHandler):
         if match:
             self._file(_job_folder(match.group(1)) / "annotated.pdf", "焊口标识结果.pdf")
             return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/annotated-initial\.pdf", path)
+        if match:
+            self._file(_job_folder(match.group(1)) / "annotated-initial.pdf", "原始解析版本.pdf")
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/export\.csv", path)
+        if match:
+            self._file(_job_folder(match.group(1)) / "export.csv", "图纸标识识别结果.csv", allow_range=False)
+            return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/training-sample\.zip", path)
         if match:
             self._file(_job_folder(match.group(1)) / "training-sample.zip", "焊口AI训练样本.zip")
@@ -1258,15 +1459,14 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 details = payload.get("details") or {}
                 if not isinstance(details, dict):
                     raise ApiError("审计详情必须是对象")
+                if str(details.get("jobId") or "") == "tutorial-000207" or action.startswith("tutorial."):
+                    self._json(HTTPStatus.OK, {"logged": False, "skipped": "tutorial"})
+                    return
                 encoded_details = json.dumps(details, ensure_ascii=False)
                 if len(encoded_details.encode("utf-8")) > 64 * 1024:
                     raise ApiError("审计详情超过 64KB 限制", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                event = {"action": action, "timestamp": datetime.now().isoformat(timespec="seconds"), "details": details}
-                AUDIT_ROOT.mkdir(parents=True, exist_ok=True)
-                with LOCK:
-                    _rotate_audit_log()
-                    with (AUDIT_ROOT / "events.jsonl").open("a", encoding="utf-8") as target:
-                        target.write(json.dumps(event, ensure_ascii=False) + "\n")
+                user = self._require_user()
+                _append_audit_event(action, details, user, source="client")
                 self._json(HTTPStatus.OK, {"logged": True})
                 return
             if parsed.path == "/api/ai/chat/stream":
@@ -1299,6 +1499,9 @@ class ApiHandler(SimpleHTTPRequestHandler):
             match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/cancel", parsed.path)
             if match:
                 self._cancel_job(match.group(1))
+                _append_audit_event(
+                    "task.cancel_requested", {"jobId": match.group(1)}, self._require_user(), source="server",
+                )
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/queue-position", parsed.path)
             if match:
@@ -1306,12 +1509,23 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 direction = str(payload.get("direction") or "")
                 if direction not in {"up", "down", "front"}:
                     raise ApiError("队列调整方向无效")
-                self._json(HTTPStatus.OK, _move_queued_job(match.group(1), direction))
+                result = _move_queued_job(match.group(1), direction)
+                _append_audit_event(
+                    "task.queue_moved", {"jobId": match.group(1), "direction": direction, **result},
+                    self._require_user(), source="server",
+                )
+                self._json(HTTPStatus.OK, result)
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/archive", parsed.path)
             if match:
                 payload = self._read_json()
-                self._json(HTTPStatus.OK, _set_job_archived(match.group(1), bool(payload.get("archived", True))))
+                archived = bool(payload.get("archived", True))
+                result = _set_job_archived(match.group(1), archived)
+                _append_audit_event(
+                    "task.archived" if archived else "task.unarchived", {"jobId": match.group(1)},
+                    self._require_user(), source="server",
+                )
+                self._json(HTTPStatus.OK, result)
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/export", parsed.path)
             if match:
@@ -1361,8 +1575,14 @@ class ApiHandler(SimpleHTTPRequestHandler):
             return
         try:
             self._require_same_origin()
-            self._require_user()
+            user = self._require_user()
+            record = _job_store().get(match.group(1)) or {}
             _delete_completed_job(match.group(1))
+            _append_audit_event(
+                "task.deleted", {
+                    "jobId": match.group(1), "targetName": str(record.get("original_target_name") or ""),
+                }, user, source="server",
+            )
             self._json(HTTPStatus.OK, {"deleted": True, "jobId": match.group(1)})
         except Exception as exc:
             self._handle_exception(exc)
@@ -1399,10 +1619,14 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 if not isinstance(incoming_page, dict):
                     raise ApiError("缺少页面保存内容")
                 validated = _validated_pages([incoming_page], current)[0]
+                save_request_id = str(payload.get("saveRequestId") or "")
+                if save_request_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", save_request_id):
+                    raise ApiError("保存请求标识无效")
                 updated_page = _job_store().save_job_page(
                     job_id, page_number, validated,
                     int(payload.get("basePageRevision") or 0), user,
                     client_instance_id=client_id, lock_token=lock_token,
+                    save_request_id=save_request_id,
                 )
                 self._json(HTTPStatus.OK, {
                     "saved": True,
@@ -1410,6 +1634,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     "reviewRevision": updated_page["reviewRevision"],
                     "reviewedBy": updated_page["reviewedBy"],
                     "reviewedAt": updated_page["reviewedAt"],
+                    "reviewSaveRequestId": updated_page.get("reviewSaveRequestId", ""),
                 })
             except Exception as exc:
                 self._handle_exception(exc)
@@ -1419,6 +1644,10 @@ class ApiHandler(SimpleHTTPRequestHandler):
     def _create_job(self) -> None:
         # Files use /api/uploads, keeping job creation metadata bounded.
         payload = self._read_json(MAX_JOB_REQUEST_BYTES)
+        task_type = str(payload.get("taskType") or "analysis").strip().casefold()
+        if task_type not in {"analysis", "direct-placement"}:
+            raise ApiError("任务类型无效", HTTPStatus.BAD_REQUEST)
+        payload["taskType"] = task_type
         symbol_config = payload.get("symbolConfig") if isinstance(payload.get("symbolConfig"), dict) else {}
         detection_mode = str(symbol_config.get("detectionMode") or "placement").casefold()
         if detection_mode != "placement":
@@ -1450,7 +1679,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                         "reusedExisting": True,
                         "duplicateStatus": reused.get("status"),
                         "requiresReanalysisConfirmation": reused.get("status") == "complete",
-                        "existingUpdatedAt": datetime.fromtimestamp(existing["modified"]).isoformat(timespec="seconds"),
+                        "existingUpdatedAt": beijing_from_timestamp(existing["modified"]).isoformat(timespec="seconds"),
                     })
                     self._json(HTTPStatus.OK, reused)
                     return
@@ -1465,11 +1694,17 @@ class ApiHandler(SimpleHTTPRequestHandler):
             target = _consume_upload(payload.get("targetUpload"), folder, "target.pdf")
             if target is None or target.suffix.lower() != ".pdf":
                 raise ValueError("必须上传待标识 PDF")
-            references = _consume_uploads(payload.get("referenceUploads"), folder, "reference")
+            references = [] if task_type == "direct-placement" else _consume_uploads(
+                payload.get("referenceUploads"), folder, "reference"
+            )
             if any(reference.suffix.lower() != ".pdf" for reference in references):
                 raise ValueError("对照图必须全部是 PDF")
-            job_pcfs = _consume_uploads(payload.get("pcfUploads"), folder, "source", ".pcf")
-            library_pcfs = _resolve_pcf_library_folder(payload.get("pcfFolder"))
+            job_pcfs = [] if task_type == "direct-placement" else _consume_uploads(
+                payload.get("pcfUploads"), folder, "source", ".pcf"
+            )
+            library_pcfs = [] if task_type == "direct-placement" else _resolve_pcf_library_folder(
+                payload.get("pcfFolder")
+            )
             pcfs = [*job_pcfs, *library_pcfs]
             if any(pcf.suffix.lower() != ".pcf" for pcf in pcfs):
                 raise ValueError("管道源文件必须全部是 PCF")
@@ -1494,11 +1729,12 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 "batchIndex": int(payload.get("batchIndex") or 0),
                 "analysisSignature": analysis_signature,
                 "analysisAlgorithmVersion": ANALYSIS_ALGORITHM_VERSION,
+                "taskType": task_type,
                 "project": payload.get("project") if isinstance(payload.get("project"), dict) else {},
                 "symbolConfig": payload.get("symbolConfig") if isinstance(payload.get("symbolConfig"), dict) else {},
                 "startPage": requested_start,
                 "endPage": requested_end,
-                "createdAt": datetime.now().isoformat(timespec="seconds"),
+                "createdAt": beijing_now_text(),
                 "createdBy": created_by,
                 "queuedForReview": bool(payload.get("queuedForReview")),
             })
@@ -1506,6 +1742,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 "schema": "weld-marker.topology.v1",
                 "jobId": job_id,
                 "status": "processing",
+                "taskType": task_type,
                 "targetFile": target.name,
                 "originalTargetName": original_target_name,
                 "analyzedRange": [requested_start, requested_end],
@@ -1518,7 +1755,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 "progressCompletedUnits": 0,
                 "progressTotalUnits": max(1, len(references) + total_pages),
                 "progressPercent": 15,
-                "progressMessage": "任务已创建，等待进入解析队列",
+                "progressMessage": "直接落图任务已创建，等待优化 PDF" if task_type == "direct-placement" else "任务已创建，等待进入解析队列",
                 "project": payload.get("project") if isinstance(payload.get("project"), dict) else {},
                 "numberingConfig": payload.get("numberingConfig") if isinstance(payload.get("numberingConfig"), dict) else {},
                 "createdBy": created_by,
@@ -1537,7 +1774,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 queue_summary={
                     **initial_result,
                     "referenceFileCount": len(references),
-                    "createdAt": datetime.now().isoformat(timespec="seconds"),
+                    "createdAt": beijing_now_text(),
                 },
             )
             registered = True
@@ -1556,6 +1793,10 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 store.delete(job_id)
             shutil.rmtree(folder, ignore_errors=True)
             raise
+        if request_user:
+            _append_audit_event(
+                "task.created", {"jobId": job_id, "targetName": original_target_name}, request_user, source="server",
+            )
         self._json(HTTPStatus.ACCEPTED, initial_result)
 
     def _cancel_job(self, job_id: str) -> None:
@@ -1591,11 +1832,39 @@ class ApiHandler(SimpleHTTPRequestHandler):
         if not meta_path.exists():
             raise ApiError("任务不存在", HTTPStatus.NOT_FOUND)
         payload = self._read_json()
-        candidates = payload.get("candidates")
-        if not isinstance(candidates, list):
-            raise ApiError("缺少焊口数据")
+        export_format = str(payload.get("format") or "pdf").lower()
+        version = str(payload.get("version") or "current").lower()
+        if export_format not in {"pdf", "csv"}:
+            raise ApiError("不支持的导出格式")
+        if version not in {"initial", "current"}:
+            raise ApiError("不支持的导出版本")
+        candidates = payload.get("candidates") if version == "current" else None
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         _, embedded_result = _require_complete_job(folder)
+        if version == "initial":
+            initial_pages = _job_store().get_initial_job_pages(job_id)
+            if not initial_pages:
+                raise ApiError("该任务没有已保存的原始解析版本", HTTPStatus.CONFLICT)
+            embedded_result["pages"] = initial_pages
+        if candidates is None:
+            candidates = [
+                dict(candidate)
+                for page in embedded_result.get("pages", [])
+                for candidate in page.get("candidates", [])
+                if isinstance(candidate, dict) and candidate.get("included", True)
+            ]
+        if not isinstance(candidates, list):
+            raise ApiError("缺少焊口数据")
+        candidates = [dict(candidate) if isinstance(candidate, dict) else candidate for candidate in candidates]
+        weld_default = embedded_result.get("markerStyle") if isinstance(embedded_result.get("markerStyle"), dict) else {}
+        component_defaults = embedded_result.get("componentMarkerStyles") if isinstance(embedded_result.get("componentMarkerStyles"), dict) else {}
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or isinstance(candidate.get("markerStyle"), dict):
+                continue
+            component_type = str(candidate.get("componentType") or "").lower()
+            default_style = component_defaults.get(component_type) if component_type in {"valve", "flange", "support"} else weld_default
+            if isinstance(default_style, dict) and default_style:
+                candidate["markerStyle"] = default_style
         grouped: dict[int, list[dict[str, Any]]] = {}
         for candidate in candidates:
             if not isinstance(candidate, dict):
@@ -1604,12 +1873,19 @@ class ApiHandler(SimpleHTTPRequestHandler):
         _validated_pages(
             [{"page": page_number, "candidates": items} for page_number, items in grouped.items()],
             embedded_result,
+            require_numbers=False,
         )
         for page in embedded_result.get("pages", []):
             page_number = int(page.get("page") or 0)
             page_candidates = grouped.get(page_number, [])
             page["candidates"] = page_candidates
             page["candidateCount"] = len(page_candidates)
+        if export_format == "csv":
+            output = _write_candidates_csv(folder / "export.csv", candidates)
+            if user := getattr(self, "_request_user", None):
+                _job_store().record_business_event("csv.exported", user, job_id=job_id)
+            self._json(HTTPStatus.OK, {"downloadUrl": f"/api/jobs/{job_id}/export.csv", "size": output.stat().st_size})
+            return
         weld_style: dict[str, Any] = {}
         component_styles: dict[str, dict[str, Any]] = {}
         for candidate in candidates:
@@ -1625,13 +1901,17 @@ class ApiHandler(SimpleHTTPRequestHandler):
             "schema": "weld-marker.editable.v1",
             "jobId": job_id,
             "status": "complete",
-            "markerStyle": weld_style,
-            "componentMarkerStyles": component_styles,
-            "markerStyles": {"weld": weld_style, "components": component_styles},
+            "markerStyle": weld_style or weld_default,
+            "componentMarkerStyles": component_styles or component_defaults,
+            "markerStyles": {"weld": weld_style or weld_default, "components": component_styles or component_defaults},
             "sourceFileName": meta.get("originalTargetName") or meta.get("targetFile") or "source.pdf",
         })
-        output = write_annotated_pdf(folder / meta["targetFile"], folder / "annotated.pdf", candidates, embedded_result)
-        self._json(HTTPStatus.OK, {"downloadUrl": f"/api/jobs/{job_id}/annotated.pdf", "size": output.stat().st_size})
+        output_name = "annotated-initial.pdf" if version == "initial" else "annotated.pdf"
+        drawable_candidates = [candidate for candidate in candidates if str(candidate.get("number") or "").strip()]
+        output = write_annotated_pdf(folder / meta["targetFile"], folder / output_name, drawable_candidates, embedded_result)
+        if user := getattr(self, "_request_user", None):
+            _job_store().record_business_event("pdf.exported", user, job_id=job_id)
+        self._json(HTTPStatus.OK, {"downloadUrl": f"/api/jobs/{job_id}/{output_name}", "size": output.stat().st_size})
 
     def _export_tutorial(self) -> None:
         payload = self._read_json()

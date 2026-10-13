@@ -371,17 +371,60 @@ class EngineTests(unittest.TestCase):
             document.new_page(width=400, height=300)
             document.save(source)
             document.close()
-            for shape in ("circle", "diamond", "rectangle"):
+            for shape in ("circle", "diamond", "rectangle", "split-circle"):
                 output = folder / f"{shape}.pdf"
                 write_annotated_pdf(source, output, [{
                     "page": 1, "x": 120, "y": 160, "labelX": 190, "labelY": 110,
-                    "number": f"{shape[:1].upper()}-12", "included": True,
+                    "number": f"{shape[:1].upper()}-12", "secondaryText": "LOWER", "included": True,
                     "markerStyle": {"shape": shape, "frameSize": 32, "fontSize": 11,
                                     "lineWidth": 1.6, "color": "#245f9e", "fillOpacity": 0.4},
                 }])
                 with fitz.open(output) as annotated:
                     self.assertIn("-12", annotated[0].get_text())
+                    if shape == "split-circle":
+                        self.assertIn("LOWER", annotated[0].get_text())
                     self.assertGreaterEqual(len(annotated[0].get_drawings()), 2)
+                    spans = [span for block in annotated[0].get_text("dict")["blocks"]
+                             for line in block.get("lines", []) for span in line["spans"]]
+                    expected_font = min(11, (32 - 6) / (5 * .58)) if shape == "split-circle" else 11
+                    self.assertTrue(all(abs(span["size"] - expected_font) < 0.01 for span in spans))
+
+    def test_long_annotation_numbers_keep_the_configured_round_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            folder = Path(folder_name)
+            source = folder / "source.pdf"
+            with fitz.open() as document:
+                document.new_page(width=400, height=300)
+                document.save(source)
+            for shape in ("circle", "split-circle"):
+                for number, secondary in (("1", "2"), ("123456789012345", "2"), ("1", "123456789012345")):
+                    output = folder / "annotated.pdf"
+                    write_annotated_pdf(source, output, [{
+                        "page": 1, "x": 120, "y": 160, "labelX": 190, "labelY": 110,
+                        "number": number, "secondaryText": secondary, "included": True,
+                        "markerStyle": {"shape": shape, "frameSize": 32, "fontSize": 15},
+                    }])
+                    with fitz.open(output) as annotated:
+                        frames = [drawing["rect"] for drawing in annotated[0].get_drawings()
+                                  if any(item[0] == "c" for item in drawing["items"])]
+                        self.assertEqual(len(frames), 1)
+                        self.assertAlmostEqual(frames[0].width, 32, places=2)
+                        self.assertAlmostEqual(frames[0].height, 32, places=2)
+
+    def test_annotation_rejects_an_included_candidate_without_a_persisted_number(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            folder = Path(folder_name)
+            source = folder / "source.pdf"
+            document = fitz.open()
+            document.new_page(width=400, height=300)
+            document.save(source)
+            document.close()
+
+            with self.assertRaisesRegex(ValueError, "缺少编号"):
+                write_annotated_pdf(source, folder / "output.pdf", [{
+                    "id": "missing-number", "page": 1, "x": 120, "y": 160,
+                    "referenceLabel": "F18", "included": True,
+                }])
 
     def test_internal_pcf_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:

@@ -1,31 +1,51 @@
 import { computed, ref, watch } from 'vue'
 
 export const SHORTCUT_DEFAULTS = Object.freeze({
+  toggleHelp: 'F1',
   analyze: 'Ctrl+Enter',
   save: 'Ctrl+S',
+  undo: 'Ctrl+Z',
+  redo: 'Ctrl+Y',
+  addAtPointer: 'A',
+  copyMarker: 'Ctrl+C',
+  pasteMarker: 'Ctrl+V',
   addWeld: 'W',
   addValve: 'V',
   addFlange: 'F',
   addSupport: 'S',
   modifyAll: 'M',
   swapWeld: 'X',
+  shiftFollowing: 'Ctrl+F',
   deleteWeld: 'Backspace',
   deleteRegion: 'D',
   openReferenceWindow: 'Ctrl+M',
+  fitCanvas: '0',
+  previousPage: 'ArrowLeft',
+  nextPage: 'ArrowRight',
 })
 
 export const SHORTCUT_SETTING_ROWS = Object.freeze([
-  { action: 'analyze', label: '开始智能编号' },
-  { action: 'save', label: '保存校对结果' },
-  { action: 'addWeld', label: '进入焊口修改模式' },
-  { action: 'addValve', label: '进入阀门修改模式' },
-  { action: 'addFlange', label: '进入法兰修改模式' },
-  { action: 'addSupport', label: '进入支架修改模式' },
-  { action: 'modifyAll', label: '进入全局标识修改模式' },
-  { action: 'swapWeld', label: '交换焊口编号' },
-  { action: 'deleteRegion', label: '进入区域删除模式' },
-  { action: 'deleteWeld', label: '删除选中焊口' },
-  { action: 'openReferenceWindow', label: '打开对照图分屏窗口' },
+  { group: '常用操作', action: 'toggleHelp', label: '打开或关闭快捷键面板' },
+  { group: '常用操作', action: 'analyze', label: '开始智能编号' },
+  { group: '常用操作', action: 'save', label: '保存校对结果' },
+  { group: '常用操作', action: 'undo', label: '撤销最近编辑' },
+  { group: '常用操作', action: 'redo', label: '重做最近编辑' },
+  { group: '标识编辑', action: 'addAtPointer', label: '在鼠标位置新增标识' },
+  { group: '标识编辑', action: 'copyMarker', label: '复制选中标识' },
+  { group: '标识编辑', action: 'pasteMarker', label: '粘贴已复制标识' },
+  { group: '标识编辑', action: 'addWeld', label: '进入焊口修改模式' },
+  { group: '标识编辑', action: 'addValve', label: '进入阀门修改模式' },
+  { group: '标识编辑', action: 'addFlange', label: '进入法兰修改模式' },
+  { group: '标识编辑', action: 'addSupport', label: '进入支架修改模式' },
+  { group: '标识编辑', action: 'modifyAll', label: '进入其他标识修改模式' },
+  { group: '标识编辑', action: 'swapWeld', label: '交换焊口编号' },
+  { group: '标识编辑', action: 'shiftFollowing', label: '顺延后续标识编号（必须含 Ctrl）' },
+  { group: '标识编辑', action: 'deleteRegion', label: '进入区域删除模式' },
+  { group: '标识编辑', action: 'deleteWeld', label: '删除选中焊口' },
+  { group: '页面与画布', action: 'openReferenceWindow', label: '打开对照图分屏窗口' },
+  { group: '页面与画布', action: 'fitCanvas', label: '画布适合窗口' },
+  { group: '页面与画布', action: 'previousPage', label: '上一页' },
+  { group: '页面与画布', action: 'nextPage', label: '下一页' },
 ])
 
 export const SHORTCUT_MODIFIER_OPTIONS = Object.freeze([
@@ -62,10 +82,11 @@ export function shortcutFromEvent(event) {
       : event.key === '-'
         ? 'Minus'
         : event.key.length === 1 ? event.key.toUpperCase() : event.key
+  const implicitShift = event.key === '+'
   return [
     event.ctrlKey ? 'Ctrl' : '',
     event.altKey ? 'Alt' : '',
-    event.shiftKey ? 'Shift' : '',
+    event.shiftKey && !implicitShift ? 'Shift' : '',
     event.metaKey ? 'Meta' : '',
     key,
   ].filter(Boolean).join('+')
@@ -81,13 +102,22 @@ export function shortcutParts(value) {
   return { modifier: parts.join('+'), key }
 }
 
+function enforceRequiredModifiers(action, value) {
+  const normalized = normalizeShortcut(value)
+  if (action !== 'shiftFollowing' || !normalized) return normalized
+  const parts = shortcutParts(normalized)
+  const modifiers = parts.modifier.split('+').filter(Boolean)
+  if (!modifiers.includes('Ctrl')) modifiers.unshift('Ctrl')
+  return normalizeShortcut([...modifiers, parts.key].filter(Boolean).join('+'))
+}
+
 function loadShortcutSettings(storage) {
   try {
     const stored = JSON.parse(storage?.getItem('weld-marker.shortcuts') || '{}')
-    return {
-      ...SHORTCUT_DEFAULTS,
-      ...stored,
-    }
+    return Object.fromEntries(Object.entries(SHORTCUT_DEFAULTS).map(([action, fallback]) => [
+      action,
+      enforceRequiredModifiers(action, stored[action] ?? fallback),
+    ]))
   } catch {
     return { ...SHORTCUT_DEFAULTS }
   }
@@ -110,7 +140,8 @@ export function useShortcutSettings({ storage = globalThis.localStorage, onDefau
 
   function commitEditor(action) {
     const editor = editors.value[action] || { modifier: '', key: '' }
-    settings.value[action] = normalizeShortcut([editor.modifier, editor.key].filter(Boolean).join('+'))
+    settings.value[action] = enforceRequiredModifiers(action, [editor.modifier, editor.key].filter(Boolean).join('+'))
+    editors.value[action] = shortcutParts(settings.value[action])
   }
 
   function updateModifier(action, modifier) {

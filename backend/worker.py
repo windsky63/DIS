@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -16,9 +15,11 @@ import uuid
 try:
     from .job_runner import atomic_dump, run_job
     from .job_store import JobStore
+    from .time_utils import beijing_now
 except ImportError:  # Direct ``python backend/worker.py`` execution.
     from job_runner import atomic_dump, run_job
     from job_store import JobStore
+    from time_utils import beijing_now
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +28,7 @@ DATABASE_PATH = DATA_ROOT / ".queue" / "jobs.db"
 
 
 def _console(message: str) -> None:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+    print(f"[{beijing_now().strftime('%H:%M:%S')}] {message}", flush=True)
 
 
 def _sync_recovered_results(store: JobStore, recovered: dict[str, list[str]]) -> None:

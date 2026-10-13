@@ -1,4 +1,6 @@
 <script setup>
+import { formatBeijingTime } from '../beijingTime.js'
+
 const props = defineProps({
   entries: { type: Array, default: () => [] },
   loading: { type: Boolean, default: false },
@@ -30,8 +32,7 @@ function candidateCount(entry) {
   return (entry?.payload?.result?.pages || []).reduce((total, page) => total + (page.candidates || []).length, 0)
 }
 function savedAt(entry) {
-  const timestamp = Date.parse(entry?.savedAt || '')
-  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString('zh-CN', { hour12: false }) : '时间未知'
+  return formatBeijingTime(entry?.savedAt, '时间未知')
 }
 function hasStoredTarget(entry) {
   return Boolean(entry?.hasStoredTarget)

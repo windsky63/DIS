@@ -12,6 +12,21 @@ from backend.api.services.queue import review_summary, snapshot
 
 
 class JobStoreTests(unittest.TestCase):
+    def test_save_receipt_is_server_owned_and_cannot_be_restored_from_old_page_data(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            store = JobStore(root / "jobs.db")
+            store.initialize()
+            job_id = "a" * 32
+            self._create(store, root, job_id, "receipts")
+            store.replace_job_pages(job_id, [{"page": 1, "candidates": []}])
+            user = {"userId": "u1", "username": "reviewer"}
+            first = store.save_job_page(job_id, 1, {"page": 1, "candidates": [], "reviewSaveRequestId": "forged"}, 0, user, save_request_id="request-1")
+            self.assertEqual(first["reviewSaveRequestId"], "request-1")
+            self.assertEqual(store.get_job_page(job_id, 1)["reviewSaveRequestId"], "request-1")
+            second = store.save_job_page(job_id, 1, first, 1, user)
+            self.assertNotIn("reviewSaveRequestId", second)
+
     def _create(self, store: JobStore, root: Path, job_id: str, signature: str) -> None:
         folder = root / job_id
         folder.mkdir()
@@ -64,6 +79,55 @@ class JobStoreTests(unittest.TestCase):
         self.assertEqual(pages[0]["matchSummary"]["unmatched"], 1)
         self.assertEqual(pages[1]["candidates"][0]["id"], "p2")
         self.assertTrue(pages[1]["detailsLoaded"])
+
+    def test_final_page_replacement_preserves_first_publish_time(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            store = JobStore(root / "jobs.db")
+            store.initialize()
+            job_id = "9" * 32
+            self._create(store, root, job_id, "immutable-page-time")
+            with patch("backend.job_store._now_text", return_value="2026-09-20T08:00:00"):
+                store.publish_analysis_page(job_id, {"page": 1, "candidates": []})
+            with patch("backend.job_store._now_text", return_value="2026-09-20T09:00:00"):
+                store.replace_job_pages(job_id, [{"page": 1, "candidates": []}])
+
+            with store._connection() as connection:
+                row = connection.execute(
+                    "SELECT created_at, updated_at FROM job_pages WHERE job_id = ? AND page_number = 1",
+                    (job_id,),
+                ).fetchone()
+
+        self.assertEqual(row["created_at"], "2026-09-20T08:00:00")
+        self.assertEqual(row["updated_at"], "2026-09-20T09:00:00")
+
+    def test_initial_job_pages_remain_unchanged_after_review_and_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            store = JobStore(root / "jobs.db")
+            store.initialize()
+            job_id = "8" * 32
+            self._create(store, root, job_id, "initial-pages")
+            initial_page = {
+                "page": 1,
+                "candidates": [{"id": "w1", "page": 1, "number": "W1"}],
+            }
+            store.replace_job_pages(job_id, [initial_page])
+            store.save_job_page(
+                job_id, 1,
+                {"page": 1, "candidates": [{"id": "w1", "page": 1, "number": "W9"}]},
+                0, {"userId": "u1", "username": "审核员"},
+            )
+            store.replace_job_pages(job_id, [{
+                "page": 1,
+                "candidates": [{"id": "replacement", "page": 1, "number": "R1"}],
+            }])
+
+            initial = store.get_initial_job_pages(job_id)
+            current = store.get_job_pages(job_id)
+
+        self.assertEqual(initial, [initial_page])
+        self.assertEqual(current[0]["candidates"][0]["id"], "replacement")
 
     def test_queue_snapshot_uses_database_summary_without_reading_task_files(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -133,12 +197,29 @@ class JobStoreTests(unittest.TestCase):
 
         self.assertEqual([item["jobId"] for item in current["jobs"]], [job_ids[1], job_ids[0]])
         self.assertEqual(current["pagination"], {
-            "scope": "current", "page": 2, "pageSize": 2, "totalItems": 4, "totalPages": 2,
+            "scope": "current", "taskType": "analysis", "page": 2, "pageSize": 2, "totalItems": 4, "totalPages": 2,
         })
         self.assertEqual([item["jobId"] for item in archived["jobs"]], [job_ids[-1]])
         self.assertEqual(archived["pagination"], {
-            "scope": "archived", "page": 1, "pageSize": 2, "totalItems": 1, "totalPages": 1,
+            "scope": "archived", "taskType": "analysis", "page": 1, "pageSize": 2, "totalItems": 1, "totalPages": 1,
         })
+
+    def test_queue_pages_keep_analysis_and_direct_placement_tasks_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            store = JobStore(root / "jobs.db")
+            store.initialize()
+            analysis_id = "a" * 32
+            placement_id = "b" * 32
+            self._create(store, root, analysis_id, "analysis-signature")
+            self._create(store, root, placement_id, "placement-signature")
+            store.update_queue_summary(placement_id, {"taskType": "direct-placement"})
+
+            analysis = store.list_queue_page("current", 1, 20, "analysis")
+            placement = store.list_queue_page("current", 1, 20, "direct-placement")
+
+        self.assertEqual([item["job_id"] for item in analysis["records"]], [analysis_id])
+        self.assertEqual([item["job_id"] for item in placement["records"]], [placement_id])
 
     def test_expired_lease_is_requeued_then_failed_after_retry_limit(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -286,6 +367,35 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual([item["revision"] for item in history], [1, 2])
             self.assertEqual([item["username"] for item in history], ["张三", "李四"])
 
+    def test_saved_batch_marker_appearance_survives_reopening_without_moving_other_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            store = JobStore(root / "jobs.db")
+            store.initialize()
+            job_id = "8" * 32
+            self._create(store, root, job_id, "batch-appearance")
+            geometry = {"textRects": [[1, 2, 3, 4]]}
+            original = {"page": 1, "layoutObstacles": geometry, "candidates": [
+                {"id": "a", "page": 1, "number": "W1", "x": 20, "y": 30},
+                {"id": "b", "page": 1, "number": "W2", "x": 50, "y": 60},
+            ]}
+            store.replace_job_pages(job_id, [original])
+            style = {"shape": "split-circle", "color": "#123456", "frameSize": 36,
+                     "fontSize": 12, "lineWidth": 1.5, "fillOpacity": 0.25}
+            updated = {**original, "candidates": [
+                {**original["candidates"][0], "number": "NEW1", "secondaryText": "LOW1",
+                 "markerStyle": style, "markerStyleOverride": True},
+                original["candidates"][1],
+            ]}
+            store.save_job_page(job_id, 1, updated, 0, {"userId": "u1", "username": "tester"})
+            restored = JobStore(root / "jobs.db").get_job_page(job_id, 1)
+            self.assertEqual(restored["candidates"][0]["markerStyle"], style)
+            self.assertTrue(restored["candidates"][0]["markerStyleOverride"])
+            self.assertEqual(restored["candidates"][0]["secondaryText"], "LOW1")
+            self.assertEqual(restored["candidates"][0]["x"], 20)
+            self.assertEqual(restored["candidates"][1], original["candidates"][1])
+            self.assertEqual(restored["layoutObstacles"], geometry)
+
     def test_pages_are_stored_and_saved_as_independent_database_rows(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             root = Path(folder_name)
@@ -315,8 +425,19 @@ class JobStoreTests(unittest.TestCase):
             reopened = JobStore(root / "jobs.db")
             reopened.initialize()
             pages = reopened.get_job_pages(job_id)
+            with reopened._connection() as connection:
+                business_events = connection.execute(
+                    "SELECT action, username, amount FROM business_events ORDER BY event_id"
+                ).fetchall()
             self.assertEqual([page["candidates"][0]["number"] for page in pages], ["A1", "B1"])
             self.assertEqual([page["reviewRevision"] for page in pages], [1, 1])
+            self.assertCountEqual(
+                [(row["action"], row["username"], row["amount"]) for row in business_events],
+                [
+                    ("marker.content_corrected", "用户1", 1),
+                    ("marker.content_corrected", "用户2", 1),
+                ],
+            )
 
     def test_queue_review_summary_groups_users_by_page_and_keeps_unreviewed_pages(self) -> None:
         summary = review_summary([

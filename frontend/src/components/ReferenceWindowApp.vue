@@ -12,6 +12,7 @@ import { createDetachedReferenceFocus, resolveDetachedReferenceViewport } from '
 import { referenceHintClickDecision, sameReferenceHint } from '../referenceHintIdentity.js'
 import { loadPdfDocument } from '../services/pdfDocument.js'
 import { useCanvasViewport } from '../composables/useCanvasViewport.js'
+import { boundedCanvasPixelFactor, CANVAS_PERFORMANCE_PROFILES, selectCanvasPerformanceProfile } from '../canvasPerformance.js'
 
 import { useThemeSettings } from '../composables/useThemeSettings.js'
 
@@ -31,6 +32,10 @@ const canvas = ref(null)
 const viewportElement = ref(null)
 const layout = ref({ width: 1, height: 1 })
 const hintFocus = ref(null)
+const detectedPerformanceProfile = selectCanvasPerformanceProfile({
+  deviceMemory: navigator.deviceMemory, hardwareConcurrency: navigator.hardwareConcurrency,
+  maxTouchPoints: navigator.maxTouchPoints, viewportWidth: window.innerWidth,
+})
 const showAllHints = ref(false)
 let renderTask = null
 let loadGeneration = 0
@@ -38,11 +43,12 @@ let resolutionTimer
 
 const {
   zoom, pan, panState, surfaceStyle, fit, zoomBy, onWheel,
-  startPan, movePan, endPan,
+  startPan, movePan, endPan, consumePanClick,
 } = useCanvasViewport({
   canvasLayout: layout,
   canvasViewport: viewportElement,
   onResolutionChange: scheduleResolutionRender,
+  onPageStep: direction => stepPage(direction),
 })
 
 const title = computed(() => viewer.active.value?.fileName || '等待主窗口发送对照图')
@@ -142,7 +148,10 @@ async function renderPage(fitAfter = false) {
     if (generation !== loadGeneration) return
     const pageViewport = page.getViewport({ scale: 1.35 })
     layout.value = { width: pageViewport.width, height: pageViewport.height }
-    const pixelFactor = Math.max(1, Math.min(4, (window.devicePixelRatio || 1) * Math.max(1, zoom.value)))
+    const performanceMode = localStorage.getItem('weld-marker.canvas-performance') || 'auto'
+    const profile = CANVAS_PERFORMANCE_PROFILES[performanceMode] || detectedPerformanceProfile
+    const desiredPixelFactor = Math.max(1, Math.min(4, (window.devicePixelRatio || 1) * Math.max(1, zoom.value)))
+    const pixelFactor = boundedCanvasPixelFactor(pageViewport.width, pageViewport.height, desiredPixelFactor, profile)
     targetCanvas.width = Math.ceil(pageViewport.width * pixelFactor)
     targetCanvas.height = Math.ceil(pageViewport.height * pixelFactor)
     targetCanvas.style.width = `${pageViewport.width}px`
@@ -214,13 +223,11 @@ function toggleAllHints() {
 }
 
 function clearHintFocus() {
+  if (consumePanClick()) return
   if (!showAllHints.value) hintFocus.value = null
 }
 
 function startViewerPan(event) {
-  if (event.button === 0) {
-    Object.defineProperty(event, 'button', { configurable: true, value: 1 })
-  }
   startPan(event)
 }
 
@@ -309,8 +316,9 @@ onBeforeUnmount(() => {
         @pointermove="movePan"
         @pointerup="endPan"
         @pointercancel="endPan"
+        @click="clearHintFocus"
       >
-        <div class="reference-window-surface" :style="surfaceStyle" @click="clearHintFocus">
+        <div class="reference-window-surface" :style="surfaceStyle">
           <canvas ref="canvas" />
           <div
             v-for="marker in markerItems"

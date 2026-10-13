@@ -24,10 +24,10 @@ New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
 New-Item -ItemType Directory -Path $stagePath | Out-Null
 
 try {
-    $trackedAndUntracked = & git -C $projectRoot ls-files --cached --others --exclude-standard
+    $trackedAndUntracked = & git -c core.quotePath=false -C $projectRoot ls-files --cached --others --exclude-standard
     if ($LASTEXITCODE -ne 0) { throw 'Unable to read the Git file list.' }
 
-    $rootFiles = @('.dockerignore', '.env.example', 'compose.yaml', 'Dockerfile', 'README.md', 'requirements.txt')
+    $rootFiles = @('.dockerignore', '.env.example', 'compose.yaml', 'Dockerfile', 'README.md')
     $selected = $trackedAndUntracked | Where-Object {
         $relative = $_ -replace '\\', '/'
         $topLevelAllowed = ($rootFiles -contains $relative) -or $relative -match '^[^/]+\.bat$'
@@ -57,7 +57,13 @@ try {
         Copy-Item -LiteralPath $environmentPath -Destination (Join-Path $stagePath '.env')
     }
 
-    $requiredFiles = @('compose.yaml', 'Dockerfile', 'README.md', 'frontend/package.json', 'backend/server.py', 'docs/deployment.md')
+    $requiredFiles = @(
+        'compose.yaml', 'Dockerfile', '.env.example', 'README.md',
+        'frontend/package.json', 'frontend/package-lock.json', 'frontend/index.html',
+        'backend/server.py', 'backend/worker.py', 'backend/requirements.txt',
+        'backend/tutorial/result.json', 'backend/tutorial/000207.pdf',
+        'docs/deployment.md', 'docs/assistant-knowledge.json'
+    )
     foreach ($relative in $requiredFiles) {
         if (-not (Test-Path -LiteralPath (Join-Path $stagePath $relative) -PathType Leaf)) { throw "Required package file is missing: $relative" }
     }

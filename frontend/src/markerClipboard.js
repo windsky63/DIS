@@ -8,6 +8,7 @@ function cloneMarker(marker) {
 
 export function matchesModificationType(item, type) {
   if (type === 'all') return true
+  if (type === 'other') return isSpecialMarker(item)
   return type === 'weld' ? !isDesignComponent(item) && !isSpecialMarker(item) : item?.componentType === type
 }
 

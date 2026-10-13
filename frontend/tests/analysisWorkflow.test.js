@@ -2,10 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ref } from 'vue'
 
-import { shouldInitializeAnalysisNumbers, useAnalysisWorkflow } from '../src/composables/useAnalysisWorkflow.js'
+import { useAnalysisWorkflow } from '../src/composables/useAnalysisWorkflow.js'
 
 
-function createWorkflow({ referenceMode = 'pdf', referencePdfs = [] } = {}) {
+function createWorkflow({ referenceMode = 'pdf', referencePdfs = [], existingJob = null } = {}) {
   const error = ref('')
   const workflow = useAnalysisWorkflow({
     workspace: {
@@ -15,7 +15,7 @@ function createWorkflow({ referenceMode = 'pdf', referencePdfs = [] } = {}) {
       pcfFiles: ref([]), selectedPcfFolder: ref(null), weldSymbolConfig: ref({ referenceRules: [] }),
       activeRecognitionProject: ref({ id: 'project', name: 'Project', description: '', recognitionRules: {} }),
       useReferenceNumber: ref(true), startNumber: ref(1), numberPrefix: ref(''), numberSuffix: ref(''),
-      result: ref(null), referenceResearchReady: ref(false), currentPage: ref(1), selectedId: ref(''),
+      result: ref(existingJob), referenceResearchReady: ref(false), currentPage: ref(1), selectedId: ref(''),
       swapSourceId: ref(''), undoStack: ref([]), redoStack: ref([]), uploadCommitPending: ref(false), error,
     },
     operations: {
@@ -36,8 +36,19 @@ test('PDF comparison mode silently refuses queue submission until a comparison P
   assert.equal(error.value, '')
 })
 
-test('only a newly created analysis receives its initial numbering pass', () => {
-  assert.equal(shouldInitializeAnalysisNumbers({ reusedExisting: false, status: 'complete' }), true)
-  assert.equal(shouldInitializeAnalysisNumbers({ reusedExisting: true, status: 'complete' }), false)
-  assert.equal(shouldInitializeAnalysisNumbers({ reusedExisting: true, status: 'processing' }), true)
+test('existing server task blocks every task creation workflow', async () => {
+  const { workflow, error } = createWorkflow({ existingJob: { jobId: 'existing-job', status: 'complete' } })
+
+  await workflow.directPlacement()
+  assert.match(error.value, /已有任务/)
+  error.value = ''
+
+  await workflow.enqueue()
+  assert.match(error.value, /已有任务/)
+  error.value = ''
+
+  await workflow.analyze()
+  assert.match(error.value, /已有任务/)
+  assert.equal(workflow.loading.value, false)
+  assert.equal(workflow.enqueueing.value, false)
 })

@@ -1,5 +1,5 @@
 const DB_NAME = 'weld-marker-workspace'
-const DB_VERSION = 2
+const DB_VERSION = 3
 const storedFileKeyCache = new WeakMap()
 
 function openDatabase() {
@@ -8,7 +8,10 @@ function openDatabase() {
     request.onerror = () => reject(request.error)
     request.onupgradeneeded = () => {
       const database = request.result
-      if (!database.objectStoreNames.contains('snapshots')) database.createObjectStore('snapshots', { keyPath: 'key' })
+      const snapshotStore = database.objectStoreNames.contains('snapshots')
+        ? request.transaction.objectStore('snapshots')
+        : database.createObjectStore('snapshots', { keyPath: 'key' })
+      if (!snapshotStore.indexNames.contains('savedAt')) snapshotStore.createIndex('savedAt', 'savedAt')
       if (!database.objectStoreNames.contains('draftMetadata')) database.createObjectStore('draftMetadata', { keyPath: 'key' })
       if (!database.objectStoreNames.contains('workspaceManifests')) database.createObjectStore('workspaceManifests', { keyPath: 'key' })
       if (!database.objectStoreNames.contains('workspacePages')) database.createObjectStore('workspacePages', { keyPath: 'key' })
@@ -388,11 +391,35 @@ export function loadSnapshot(key) {
   return transaction('snapshots', 'readonly', store => store.get(key))
 }
 
+export function snapshotPruneCount(count, limit = 48) {
+  return Math.max(0, Number(count) - Math.max(0, Number(limit) || 0))
+}
+
+async function putAndPruneSnapshot(record, limit = 48) {
+  const database = await openDatabase()
+  return new Promise((resolve, reject) => {
+    const tx = database.transaction('snapshots', 'readwrite')
+    const store = tx.objectStore('snapshots')
+    store.put(record)
+    const countRequest = store.count()
+    countRequest.onsuccess = () => {
+      let remaining = snapshotPruneCount(countRequest.result, limit)
+      if (!remaining) return
+      const cursorRequest = store.index('savedAt').openKeyCursor()
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result
+        if (!cursor || !remaining) return
+        store.delete(cursor.primaryKey)
+        remaining -= 1
+        if (remaining) cursor.continue()
+      }
+    }
+    tx.onerror = () => reject(tx.error)
+    tx.onabort = () => reject(tx.error || new Error('页面位图缓存清理已中止'))
+    tx.oncomplete = () => { database.close(); resolve(true) }
+  })
+}
+
 export async function saveSnapshot(key, blob, width, height) {
-  await transaction('snapshots', 'readwrite', store => store.put({ key, blob, width, height, savedAt: Date.now() }))
-  const all = await transaction('snapshots', 'readonly', store => store.getAll())
-  if (all.length > 48) {
-    const oldest = all.sort((a, b) => a.savedAt - b.savedAt).slice(0, all.length - 48)
-    await Promise.all(oldest.map(item => transaction('snapshots', 'readwrite', store => store.delete(item.key))))
-  }
+  await putAndPruneSnapshot({ key, blob, width, height, savedAt: Date.now() })
 }

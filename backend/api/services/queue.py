@@ -114,11 +114,13 @@ def snapshot(
     scope: str = "current",
     page: int = 1,
     page_size: int = 20,
+    task_type: str = "analysis",
 ) -> dict[str, Any]:
     scope = "archived" if scope == "archived" else "current"
     page = max(1, int(page))
     page_size = min(100, max(1, int(page_size)))
-    queue_page = store.list_queue_page(scope, page, page_size)
+    task_type = "direct-placement" if task_type == "direct-placement" else "analysis"
+    queue_page = store.list_queue_page(scope, page, page_size, task_type)
     records = queue_page["records"]
     queued_ids = queue_page["queuedJobIds"]
     pending_positions = {job_id: index + 1 for index, job_id in enumerate(queued_ids)}
@@ -138,6 +140,7 @@ def snapshot(
         jobs.append({
             "jobId": job_id,
             "fileName": record.get("original_target_name") or "未命名图纸",
+            "taskType": str(summary.get("taskType") or "analysis"),
             "status": "processing" if database_status in {"queued", *running_statuses} else database_status,
             "queueState": queue_state,
             "queuePosition": pending_positions.get(job_id),
@@ -178,6 +181,7 @@ def snapshot(
         "maxConcurrent": max_concurrent,
         "pagination": {
             "scope": scope,
+            "taskType": task_type,
             "page": queue_page["page"],
             "pageSize": queue_page["pageSize"],
             "totalItems": queue_page["totalItems"],

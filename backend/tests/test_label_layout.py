@@ -131,7 +131,8 @@ class LabelLayoutTests(unittest.TestCase):
 
         item = page["candidates"][0]
         self.assertEqual(item["layoutDiagnostics"]["selectionStage"], "strict-perpendicular")
-        self.assertAlmostEqual(item["layoutDiagnostics"]["lineLength"], math.hypot(10, 10) + 12, delta=0.01)
+        width, height, _ = layout._dimensions(item)
+        self.assertAlmostEqual(item["layoutDiagnostics"]["lineLength"], max(width * 1.25, math.hypot(width / 2, height / 2) + 12), delta=0.01)
         self.assertAlmostEqual(item["labelX"], item["x"], delta=0.01)
 
     def test_perimeter_mode_uses_local_pipe_band_before_spokes(self) -> None:

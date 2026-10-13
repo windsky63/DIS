@@ -16,6 +16,7 @@ function fixture() {
   const pageData = computed(() => pages.value.find(page => page.page === currentPage.value))
   const server = new Map(pages.value.map(page => [page.page, clone(page)]))
   const calls = []
+  const saveRequests = []
   let history
   const client = {
     acquirePageLock: async (_job, page) => { calls.push(`acquire:${page}`); return { lock: { page, lockToken: `token-${page}` } } },
@@ -40,13 +41,53 @@ function fixture() {
   history = useWorkspaceHistory({
     result, pages, pageData, markerStyle, componentMarkerStyles: ref({}),
     projectResults: ref([result.value]), activeProjectIndex: ref(0), selectedId: ref(''),
-    cloneValue: clone, scheduleSave: () => collaboration.markDirty(currentPage.value),
+    cloneValue: clone, scheduleSave: options => {
+      saveRequests.push(options)
+      collaboration.markDirty(currentPage.value)
+    },
     showNotice() {}, logAudit() {},
     canEdit: () => collaboration.activeLock.value?.page === currentPage.value
       && !collaboration.readOnly.value && collaboration.saveState.value !== 'saving',
   })
-  return { currentPage, result, pages, pageData, server, client, calls, collaboration, history, markerStyle }
+  return { currentPage, result, pages, pageData, server, client, calls, saveRequests, collaboration, history, markerStyle }
 }
+
+test('cross-page batch changes can be undone and saved on their own page without rolling back server revisions', async () => {
+  const f = fixture()
+  f.pages.value.forEach(page => { page.candidates[0].number = `OLD${page.page}`; f.server.set(page.page, clone(page)) })
+  try {
+    await f.collaboration.enterPage(1)
+    const changes = f.pages.value.map(page => ({ page: page.page, id: page.candidates[0].id, revision: 0, patch: { number: `NEW${page.page}`, markerStyleOverride: true, markerStyle: { shape: 'diamond', color: '#123456' } } }))
+    const response = await f.collaboration.applyMarkerEdits(f.result.value.jobId, changes, {
+      onPageSaved: (before, after) => f.history.recordPageEdit(before, after, 'batch edit'),
+    })
+    assert.deepEqual(response.errors, [])
+    assert.equal(f.pageData.value.candidates[0].number, 'NEW1')
+    await f.collaboration.enterPage(2)
+    f.history.undo()
+    assert.equal(f.pageData.value.candidates[0].number, 'OLD2')
+    assert.equal(f.pageData.value.candidates[0].markerStyleOverride, undefined)
+    assert.equal(f.pageData.value.reviewRevision, 1)
+    assert.equal(f.pages.value[0].candidates[0].number, 'NEW1')
+    await f.collaboration.saveCurrentPage()
+    assert.equal(f.server.get(2).reviewRevision, 2)
+    f.history.redo()
+    assert.equal(f.pageData.value.candidates[0].markerStyleOverride, true)
+    assert.equal(f.pageData.value.reviewRevision, 2)
+  } finally { await f.collaboration.release() }
+})
+
+test('global marker appearance edits request a full workspace draft save', async () => {
+  const f = fixture()
+  try {
+    await f.collaboration.enterPage(1)
+    f.history.begin('change global marker style')
+    f.markerStyle.value.color = '#0f0'
+    f.history.commit()
+
+    assert.deepEqual(f.saveRequests, [{ workspace: true }])
+  } finally { await f.collaboration.release() }
+})
 
 test('delete page 1, switch page 2, return and undo/redo saves without revision conflict', async () => {
   const f = fixture()

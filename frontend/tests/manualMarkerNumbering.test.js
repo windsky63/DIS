@@ -4,17 +4,20 @@ import { computed, effectScope, ref } from 'vue'
 
 import { useMarkerEditor } from '../src/composables/useMarkerEditor.js'
 
-function fixture(type, existingCandidates, numbering, additionalPages = []) {
+function fixture(type, existingCandidates, numbering, additionalPages = [], specialAppearance, appearances = {}) {
   const scope = effectScope()
   return scope.run(() => {
     const page = { page: 1, width: 1000, height: 500, candidates: [...existingCandidates], candidateCount: existingCandidates.length }
     const allPages = [page, ...additionalPages]
-    const result = ref({ pages: allPages })
+    const result = ref({ jobId: 'server-job', pages: allPages })
     const numberingSettings = ref(numbering)
     const currentPage = ref(1)
     const pageData = computed(() => allPages.find(item => item.page === currentPage.value) || page)
     const notices = []
     const selectedAppearanceTabs = []
+    const editingId = ref('')
+    const editingValue = ref('')
+    const editingSecondaryValue = ref('')
     const editor = useMarkerEditor({
       state: {
         result, pageData, pages: computed(() => result.value.pages), candidates: computed(() => result.value.pages.flatMap(item => item.candidates)),
@@ -24,20 +27,72 @@ function fixture(type, existingCandidates, numbering, additionalPages = []) {
         canvasLayout: ref({ width: 1000, height: 500, target: { x: 0, y: 0, width: 1000, height: 500 } }),
         canvasPointerPosition: ref(null), referenceFocus: ref(null), referenceShowAll: ref(false), startNumber: ref(1),
         numberPrefix: ref(''), numberSuffix: ref(''), useReferenceNumber: ref(false), selectedId: ref(''), swapSourceId: ref(''),
-        editingId: ref(''), editingValue: ref(''),
+        editingId, editingValue, editingSecondaryValue,
         pendingHistory: ref(null), labelDragState: ref(null), anchorDragState: ref(null), groupDragState: ref(null),
-        manualLeaderLength: ref(72), manualNumberingSettings: numberingSettings, error: ref(''),
+        manualLeaderLength: ref(72), manualNumberingSettings: numberingSettings,
+        specialMarkerAppearance: ref(specialAppearance), error: ref(''),
       },
       operations: {
         cloneValue: value => structuredClone(value), beginHistory() {}, commitHistory() {},
         reflowCurrentPageLabelPositions: () => ({}), leaderEnd: () => ({}), logAudit() {},
         showNotice: message => notices.push(message), getLeaderLine: () => null, setLeaderLine() {},
+        candidateMarkerStyle: item => item.markerStyle || item.defaultMarkerStyle || { shape: 'circle' },
+        manualMarkerStyle: markerType => markerType === 'other'
+          ? (specialAppearance || { shape: 'split-circle' })
+          : (appearances[markerType] || { shape: 'circle' }),
         selectMarkerAppearanceTab: type => selectedAppearanceTabs.push(type),
       },
     })
-    return { scope, page, pages: allPages, currentPage, result, editor, notices, numberingSettings, selectedAppearanceTabs }
+    return { scope, page, pages: allPages, currentPage, result, editor, notices, numberingSettings, selectedAppearanceTabs, editingId, editingValue, editingSecondaryValue }
   })
 }
+
+test('drag previews match committed marker appearance and numbering without consuming numbers', () => {
+  for (const type of ['weld', 'valve', 'flange', 'support', 'other']) {
+    for (const shape of ['circle', 'rectangle', 'diamond', 'split-circle']) {
+      const appearance = { shape, color: '#654321', frameSize: 40, fontSize: 12, lineWidth: 2, fillOpacity: 0.3 }
+      const f = fixture(type, [], { [type]: { prefix: 'TEST-', start: 7, secondaryPrefix: 'LOW-', secondaryStart: 9 } }, [], appearance, { [type]: appearance })
+      try {
+        const start = { x: 0.5, y: 0.5 }
+        const end = { x: 0.8, y: 0.2 }
+        const firstPreview = f.editor.previewManualMarker(start, end)
+        const finalPreview = f.editor.previewManualMarker(start, end)
+        assert.deepEqual(finalPreview, firstPreview)
+        assert.equal(f.page.candidates.length, 0)
+        assert.deepEqual(f.notices, [])
+        f.editor.addManualAtClientPoint(500, 250, { x: 800, y: 100 })
+        const { id: previewId, ...preview } = finalPreview
+        const { id: committedId, ...committed } = f.page.candidates.at(-1)
+        assert.notEqual(previewId, committedId)
+        assert.deepEqual(preview, committed)
+        assert.equal(committed.number, 'TEST-7')
+        const next = f.editor.previewManualMarker(start, end)
+        assert.equal(next.number, 'TEST-8')
+        if (shape === 'split-circle') {
+          assert.equal(preview.secondaryText, 'LOW-9')
+          assert.equal(next.secondaryText, 'LOW-10')
+        }
+      } finally { f.scope.stop() }
+    }
+  }
+})
+
+test('drag placement preserves the anchor and explicit label endpoint for every marker type', () => {
+  for (const type of ['weld', 'valve', 'flange', 'support', 'other']) {
+    const f = fixture(type, [], {})
+    try {
+      f.editor.addManualAtClientPoint(500, 250, { x: 800, y: 100 })
+      const item = f.page.candidates.at(-1)
+      assert.equal(item.x, 500)
+      assert.equal(item.y, 250)
+      assert.equal(item.labelX, 800)
+      assert.equal(item.labelY, 100)
+      assert.equal(item.labelXNorm, 0.8)
+      assert.equal(item.labelYNorm, 0.2)
+      assert.equal(item.componentType || 'weld', type === 'other' ? 'special' : type)
+    } finally { f.scope.stop() }
+  }
+})
 
 test('the first manual marker starts at the configured number regardless of recognized markers', () => {
   const f = fixture('valve', [{ id: 'existing', componentType: 'valve', included: true }], {
@@ -66,6 +121,18 @@ test('manual weld numbering has no default prefix and accepts a custom suffix an
   try {
     f.editor.addManualAtClientPoint(500, 250)
     assert.equal(f.page.candidates.at(-1).number, '20-W')
+  } finally { f.scope.stop() }
+})
+
+test('manual numbering allows the numeric part to be blank', () => {
+  const f = fixture('weld', [], {
+    weld: { prefix: 'W-', suffix: '-END', start: null },
+  })
+  try {
+    f.editor.addManualAtClientPoint(500, 250)
+    f.editor.addManualAtClientPoint(600, 250)
+    assert.deepEqual(f.page.candidates.map(item => item.number), ['W--END', 'W--END'])
+    assert.equal(f.numberingSettings.value.weld.start, null)
   } finally { f.scope.stop() }
 })
 
@@ -172,15 +239,95 @@ test('entering a typed modification mode selects its matching appearance tab', a
     await f.editor.toggleManualAddMode('weld')
     assert.deepEqual(f.selectedAppearanceTabs, ['valve', 'flange', 'support', 'weld'])
 
-    await f.editor.toggleManualAddMode('all')
-    assert.deepEqual(f.selectedAppearanceTabs, ['valve', 'flange', 'support', 'weld'])
+    await f.editor.toggleManualAddMode('other')
+    assert.deepEqual(f.selectedAppearanceTabs, ['valve', 'flange', 'support', 'weld', 'other'])
   } finally { f.scope.stop() }
 })
 
-test('special markers keep their existing independent M numbering', () => {
-  const f = fixture('all', [{ id: 'special', specialMarker: true, included: true }], undefined)
+test('manual placement refuses a workspace without a server job id', async () => {
+  const f = fixture('weld', [], undefined)
+  try {
+    f.result.value.jobId = null
+    const enabled = await f.editor.ensureManualWorkspace()
+    assert.equal(enabled, false)
+    assert.equal(f.result.value.jobId, null)
+  } finally { f.scope.stop() }
+})
+
+test('M mode creates a split-circle marker with independent upper and lower content', () => {
+  const f = fixture('other', [], {
+    other: {
+      prefix: 'UP-', suffix: '-A', start: 3,
+      secondaryPrefix: 'DOWN-', secondarySuffix: '-B', secondaryStart: 8,
+    },
+  })
   try {
     f.editor.addManualAtClientPoint(500, 250)
-    assert.equal(f.page.candidates.at(-1).number, 'M2')
+    const marker = f.page.candidates.at(-1)
+    assert.equal(marker.number, 'UP-3-A')
+    assert.equal(marker.secondaryText, 'DOWN-8-B')
+    assert.equal(marker.markerStyle.shape, 'split-circle')
+
+    f.editor.addManualAtClientPoint(600, 250)
+    assert.equal(f.page.candidates.at(-1).number, 'UP-4-A')
+    assert.equal(f.page.candidates.at(-1).secondaryText, 'DOWN-9-B')
+  } finally { f.scope.stop() }
+})
+
+test('a regular marker uses separate upper and lower numbering when its appearance is split-circle', () => {
+  const f = fixture('valve', [], {
+    valve: {
+      prefix: 'V', suffix: '', start: 5,
+      secondaryPrefix: 'L-', secondarySuffix: '-X', secondaryStart: 20,
+    },
+  }, [], undefined, { valve: { shape: 'split-circle' } })
+  try {
+    f.editor.addManualAtClientPoint(500, 250)
+    assert.equal(f.page.candidates.at(-1).number, 'V5')
+    assert.equal(f.page.candidates.at(-1).secondaryText, 'L-20-X')
+  } finally { f.scope.stop() }
+})
+
+test('split-circle numbering allows either numeric part to be blank', () => {
+  const f = fixture('valve', [], {
+    valve: {
+      prefix: 'TOP', suffix: '', start: null,
+      secondaryPrefix: 'BOTTOM', secondarySuffix: '', secondaryStart: null,
+    },
+  }, [], undefined, { valve: { shape: 'split-circle' } })
+  try {
+    f.editor.addManualAtClientPoint(500, 250)
+    assert.equal(f.page.candidates.at(-1).number, 'TOP')
+    assert.equal(f.page.candidates.at(-1).secondaryText, 'BOTTOM')
+  } finally { f.scope.stop() }
+})
+
+test('M mode uses the configured other marker appearance', () => {
+  const f = fixture('other', [], undefined, [], {
+    shape: 'split-circle', frameSize: 44, fontSize: 13, lineWidth: 2,
+    color: '#228866', fillOpacity: 0.25,
+  })
+  try {
+    f.editor.addManualAtClientPoint(500, 250)
+    assert.deepEqual(f.page.candidates.at(-1).markerStyle, {
+      shape: 'split-circle', frameSize: 44, fontSize: 13, lineWidth: 2,
+      color: '#228866', fillOpacity: 0.25,
+    })
+  } finally { f.scope.stop() }
+})
+
+test('double-click editing updates both split-circle fields together', () => {
+  const marker = { id: 'special', number: 'M1', secondaryText: 'A', included: true, markerStyle: { shape: 'split-circle' } }
+  const f = fixture('other', [marker], undefined)
+  try {
+    f.editor.beginInlineEdit({ button: 0, stopPropagation() {} }, marker)
+    assert.equal(f.editingValue.value, 'M1')
+    assert.equal(f.editingSecondaryValue.value, 'A')
+    f.editingValue.value = 'M2'
+    f.editingSecondaryValue.value = 'B'
+    f.editor.commitInlineEdit(marker)
+    assert.equal(marker.number, 'M2')
+    assert.equal(marker.secondaryText, 'B')
+    assert.equal(f.editingId.value, '')
   } finally { f.scope.stop() }
 })

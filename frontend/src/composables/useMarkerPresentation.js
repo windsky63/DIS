@@ -1,4 +1,5 @@
 import { isDesignComponent, isSpecialMarker } from '../numbering.js'
+import { markerGeometry } from '../markerGeometry.js'
 import { reflowCurrentPageLabelPositions as calculateCurrentPagePosition } from '../markerLayout.js'
 
 export function midpoint(first, second) {
@@ -35,7 +36,8 @@ export function useMarkerPresentation({
     const liveStyle = isDesignComponent(item)
       ? componentMarkerStyles.value[item.componentType] || componentMarkerStyles.value.support
       : markerStyle.value
-    return { ...(item?.defaultMarkerStyle || {}), ...(item?.markerStyle || {}), ...liveStyle }
+    return { ...(item?.defaultMarkerStyle || {}), ...(item?.markerStyle || {}), ...liveStyle,
+      ...(item?.markerStyleOverride ? item.markerStyle : {}) }
   }
 
   function markerClass(item) {
@@ -53,21 +55,16 @@ export function useMarkerPresentation({
 
   function unitScale(item) {
     const target = canvasLayout.value.target
-    const page = pages.value.find(value => value.page === item.page) || pageData.value
+    const current = pageData.value
+    const page = current?.page === item.page ? current : (pages.value.find(value => value.page === item.page) || current)
     return target?.width && page?.width ? target.width / page.width : 1
   }
 
   function dimensions(item) {
     const style = styleFor(item)
     const scale = unitScale(item)
-    const size = (Number(style.frameSize) || 28) * scale
-    const textLength = String(item.number || '?').length
-    const configuredFontSize = (Number(style.fontSize) || 18) * scale
-    const width = style.shape === 'rectangle'
-      ? Math.max(size * 1.35, 10 * scale + textLength * configuredFontSize * .68)
-      : size
-    const fontSize = Math.min(configuredFontSize, Math.max(4 * scale, (width - 6 * scale) / Math.max(textLength * .58, 1)))
-    return { width, height: size, fontSize, scale }
+    const geometry = markerGeometry(item, style)
+    return { width: geometry.width * scale, height: geometry.height * scale, fontSize: geometry.fontSize * scale, scale }
   }
 
   function reflowCurrentPage(page) {

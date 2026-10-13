@@ -26,17 +26,12 @@ const initialProgress = () => ({
   message: '准备图元研究',
 })
 
-export function shouldInitializeAnalysisNumbers(createdJob) {
-  const preserveExistingResult = createdJob?.reusedExisting && createdJob?.status === 'complete'
-  return !preserveExistingResult
-}
-
 const wait = milliseconds => new Promise(resolve => window.setTimeout(resolve, milliseconds))
 
 export function useAnalysisWorkflow({ workspace, operations }) {
   const loading = ref(false)
+  const directPlacementRunning = ref(false)
   const enqueueing = ref(false)
-  const enqueueProgress = ref({ percent: 0, message: '正在准备上传' })
   const progress = ref(initialProgress())
   const activeJobId = ref('')
   const cancelling = ref(false)
@@ -97,17 +92,17 @@ export function useAnalysisWorkflow({ workspace, operations }) {
     }
   }
 
-  async function prioritize(job, fileName) {
+  async function prioritize(job, fileName, taskLabel = '智能编号') {
     if (!job?.jobId || job.status !== 'processing') return null
     try {
       const priority = await api.prioritizeQueuedJob(job.jobId)
       if (priority.queueState === 'queued' && Number(priority.previousQueuePosition) > 1) {
         const overtaken = Number(priority.previousQueuePosition) - 1
-        const message = `检测到“${fileName}”前方有 ${overtaken} 个等待任务，已将本次智能编号提升到等待队列首位；正在执行的任务不受影响。`
+        const message = `检测到“${fileName}”前方有 ${overtaken} 个等待任务，已将本次${taskLabel}提升到等待队列首位；正在执行的任务不受影响。`
         progress.value = { ...progress.value, message }
         operations.showNotice(message)
       } else if (priority.queueState === 'queued') {
-        progress.value = { ...progress.value, message: '本次智能编号已位于等待队列首位，正在执行的任务完成后将优先开始。' }
+        progress.value = { ...progress.value, message: `本次${taskLabel}已位于等待队列首位，正在执行的任务完成后将优先开始。` }
       }
       return priority
     } catch (cause) {
@@ -154,17 +149,28 @@ export function useAnalysisWorkflow({ workspace, operations }) {
   }
 
   async function enqueue() {
+    if (result.value?.jobId) {
+      error.value = '当前工作区已有任务，请先关闭当前任务再推入新的解析任务。'
+      return
+    }
     if (!targetPdf.value || enqueueing.value) {
       if (!targetPdf.value) error.value = '请先选择待解析的 ISO PDF 或工程文件夹。'
       return
     }
     if (referenceInputMissing.value) return
     enqueueing.value = true
-    enqueueProgress.value = { percent: 0, message: '正在读取待上传文件' }
+    const files = projectPdfs.value.length ? projectPdfs.value : [targetPdf.value]
+    progress.value = {
+      ...initialProgress(),
+      fileCount: files.length,
+      fileName: files[0]?.name || targetPdf.value.name,
+      phase: 'enqueueing',
+      progressStage: 'enqueueing',
+      message: '正在读取待上传文件',
+    }
     operations.dismissError()
     operations.clearNotice()
     try {
-      const files = projectPdfs.value.length ? projectPdfs.value : [targetPdf.value]
       const { referenceFiles, sourcePcfs } = await materializeInputs()
       const batchId = globalThis.crypto?.randomUUID?.() || `queue-${Date.now()}`
       let queued = 0
@@ -173,19 +179,38 @@ export function useAnalysisWorkflow({ workspace, operations }) {
         uploadCommitPending.value = true
         const uploads = await uploadJobInputs(files[index], referenceFiles, sourcePcfs, ({ loaded, total, fileName, awaitingServer }) => {
           const uploadFraction = loaded / Math.max(1, total)
-          enqueueProgress.value = {
-            percent: 100 * (index + uploadFraction * .9) / files.length,
+          progress.value = {
+            ...progress.value,
+            fileIndex: index,
+            fileCount: files.length,
+            fileName,
+            phase: 'enqueueing',
+            progressStage: 'enqueueing',
+            transferPercent: uploadFraction * 100,
+            transferLoaded: loaded,
+            transferTotal: total,
+            progressPercent: 100 * (index + uploadFraction * .9) / files.length,
             message: awaitingServer
               ? `“${fileName}”已发送，服务器正在落盘校验`
-              : `正在上传“${fileName}” ${Math.round(uploadFraction * 100)}%`,
+              : `正在上传“${fileName}”`,
           }
         })
-        enqueueProgress.value = { percent: 100 * (index + .9) / files.length, message: `服务器正在创建任务 ${index + 1}/${files.length}` }
+        progress.value = {
+          ...progress.value,
+          fileIndex: index,
+          transferPercent: 100,
+          progressPercent: 100 * (index + .9) / files.length,
+          message: `服务器正在创建任务 ${index + 1}/${files.length}`,
+        }
         const created = await api.createJob(jobPayload(uploads, files[index], batchId, index, true))
         uploadCommitPending.value = false
         if (created.status === 'complete') alreadyAvailable += 1
         else queued += 1
-        enqueueProgress.value = { percent: 100 * (index + 1) / files.length, message: `服务器已接收任务 ${index + 1}/${files.length}` }
+        progress.value = {
+          ...progress.value,
+          progressPercent: 100 * (index + 1) / files.length,
+          message: `服务器已接收任务 ${index + 1}/${files.length}`,
+        }
       }
       await operations.refreshQueue(false)
       operations.showNotice(`${queued ? `已将 ${queued} 份图纸推入解析队列` : '没有新增等待任务'}${alreadyAvailable ? `；${alreadyAvailable} 份已有可恢复结果` : ''}。`)
@@ -198,6 +223,10 @@ export function useAnalysisWorkflow({ workspace, operations }) {
   }
 
   async function analyze() {
+    if (result.value?.jobId) {
+      error.value = '当前工作区已有任务，请先关闭当前任务再启动智能编号。'
+      return
+    }
     if (!targetPdf.value) {
       error.value = '请先选择待标识 ISO PDF 或工程文件夹。'
       return
@@ -228,7 +257,6 @@ export function useAnalysisWorkflow({ workspace, operations }) {
       const { referenceFiles, sourcePcfs } = await materializeInputs()
       const analyzed = new Array(files.length).fill(null)
       const batchId = globalThis.crypto?.randomUUID?.() || `batch-${Date.now()}`
-      const pageStartNumber = Math.max(1, Number(startNumber.value) || 1)
       for (let index = 0; index < files.length; index += 1) {
         uploadCommitPending.value = true
         progress.value = {
@@ -264,7 +292,6 @@ export function useAnalysisWorkflow({ workspace, operations }) {
         }
         const interactivePriority = await prioritize(createdJob, files[index].name)
         activeJobId.value = createdJob.jobId
-        const initializeNumbers = shouldInitializeAnalysisNumbers(createdJob)
         progress.value = {
           ...progress.value,
           phase: 'analysis',
@@ -288,9 +315,6 @@ export function useAnalysisWorkflow({ workspace, operations }) {
         let publishedPageCount = 0
         analyzed[index] = await waitForJob(createdJob, async snapshot => {
           operations.mergeStagedManualCandidates(snapshot, stagedManualPages[index])
-          if (initializeNumbers) {
-            operations.numberResult(snapshot, pageStartNumber)
-          }
           analyzed[index] = snapshot
           projectResults.value = analyzed.slice()
           const nextPageCount = snapshot.pages?.length || 0
@@ -354,13 +378,112 @@ export function useAnalysisWorkflow({ workspace, operations }) {
     }
   }
 
+  async function directPlacement() {
+    if (result.value?.jobId) {
+      error.value = '当前工作区已有任务，请先关闭当前任务再创建直接落图任务。'
+      return
+    }
+    if (!targetPdf.value || loading.value || enqueueing.value) {
+      if (!targetPdf.value) error.value = '请先在设计 PDF 选择框中选择文件。'
+      return
+    }
+    loading.value = true
+    directPlacementRunning.value = true
+    operations.dismissError()
+    operations.clearNotice()
+    referenceResearchReady.value = false
+    operations.clearReferenceDisplay()
+    progress.value = {
+      ...initialProgress(),
+      fileName: targetPdf.value.name,
+      phase: 'uploading',
+      message: '正在上传设计 PDF',
+    }
+    try {
+      uploadCommitPending.value = true
+      const uploads = await uploadJobInputs(targetPdf.value, [], [], ({ loaded, total, fileName, awaitingServer }) => {
+        const percent = Math.max(0, Math.min(100, loaded / Math.max(1, total) * 100))
+        progress.value = {
+          ...progress.value,
+          phase: 'uploading',
+          transferPercent: percent,
+          transferLoaded: loaded,
+          transferTotal: total,
+          message: awaitingServer ? `“${fileName}”已发送，服务器正在落盘校验` : `正在上传“${fileName}”`,
+        }
+      })
+      progress.value = { ...progress.value, phase: 'server-validation', transferPercent: 100, message: '服务器正在创建直接落图任务' }
+      const payload = {
+        ...jobPayload(uploads, targetPdf.value, globalThis.crypto?.randomUUID?.() || `direct-${Date.now()}`, 0),
+        taskType: 'direct-placement',
+        referenceUploads: [],
+        pcfUploads: [],
+        pcfFolder: null,
+      }
+      let createdJob = await api.createJob(payload)
+      uploadCommitPending.value = false
+      if (createdJob.requiresReanalysisConfirmation) {
+        const choice = await confirmDuplicate(createdJob, targetPdf.value.name)
+        if (choice === 'cancel') {
+          const cause = new Error('已取消直接落图')
+          cause.name = 'AnalysisDialogCancelled'
+          throw cause
+        }
+        if (choice === 'reanalyze') {
+          uploadCommitPending.value = true
+          createdJob = await api.createJob({ ...payload, forceReanalyze: true })
+          uploadCommitPending.value = false
+        }
+      }
+      await prioritize(createdJob, targetPdf.value.name, '直接落图')
+      activeJobId.value = createdJob.jobId
+      const completed = await waitForJob(createdJob, async snapshot => {
+        progress.value = {
+          ...progress.value,
+          phase: 'analysis',
+          completedPages: snapshot.completedPages || 0,
+          totalPages: snapshot.totalPages || createdJob.totalPages || 1,
+          progressCompletedUnits: snapshot.progressCompletedUnits || 0,
+          progressTotalUnits: snapshot.progressTotalUnits || snapshot.totalPages || 1,
+          progressPercent: snapshot.progressPercent ?? 15,
+          progressStage: snapshot.progressStage || 'optimizing-pdf',
+          message: snapshot.progressMessage || '正在优化 PDF 并建立落图页面',
+        }
+      })
+      if (!completed?.jobId) throw new Error('服务器未返回有效任务编号，已阻止进入落图编辑')
+      result.value = completed
+      projectResults.value[activeProjectIndex.value] = completed
+      currentPage.value = completed.analyzedRange?.[0] || completed.pages?.[0]?.page || 1
+      selectedId.value = ''
+      swapSourceId.value = ''
+      referenceResearchReady.value = true
+      progress.value = { ...progress.value, progressPercent: 100, progressStage: 'complete', message: 'PDF优化完成，可以直接落图' }
+      await nextTick()
+      await operations.renderCurrentPage()
+      undoStack.value = []
+      redoStack.value = []
+      operations.scheduleDraftSave()
+      operations.logAudit('direct-placement.completed', { jobId: completed.jobId, pages: completed.pages?.length || 0 })
+      operations.showNotice('直接落图任务已创建，可以开始添加和编辑标识。')
+    } catch (cause) {
+      if (cause?.name === 'JobCancelled' || cause?.name === 'AnalysisDialogCancelled') operations.showNotice(cause.message)
+      else error.value = `直接落图失败：${cause.message || cause}`
+    } finally {
+      uploadCommitPending.value = false
+      activeJobId.value = ''
+      cancelling.value = false
+      directPlacementRunning.value = false
+      loading.value = false
+    }
+  }
+
   function dispose() {
     duplicateResolver?.('cancel')
     duplicateResolver = undefined
   }
 
   return {
-    loading, enqueueing, enqueueProgress, progress, activeJobId, cancelling, referenceInputMissing,
-    duplicateDialog, duplicateInfo, enqueue, analyze, cancel, resolveDuplicate, dispose,
+    loading, directPlacementRunning, enqueueing, progress, activeJobId, cancelling, referenceInputMissing,
+    duplicateDialog, duplicateInfo, enqueue, analyze, directPlacement, cancel, resolveDuplicate, dispose,
   }
 }

@@ -13,6 +13,7 @@ import unicodedata
 APPROVED_DOCUMENT_PATHS = frozenset({
     "README.md",
     "docs/usage.md",
+    "docs/faq.md",
     "docs/architecture.md",
     "docs/development.md",
     "docs/deployment.md",

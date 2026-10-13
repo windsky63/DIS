@@ -63,7 +63,7 @@ const parameters = computed(() => {
     </details>
     <section v-if="referenceFiles.length" class="project-rule-section" aria-label="对照文件来源">
       <div class="project-rule-section-heading"><h3>逐文件指定出图来源</h3></div>
-      <p class="project-rule-note">未指定时使用默认规则。这里只切换使用的来源，不修改规则参数。</p>
+      <p class="project-rule-note">当同一任务的对照 PDF 来自不同出图方时，可为每个文件单独选择对应识别规则。未指定的文件使用上方默认对照来源；这里只覆盖该文件的规则选择，不修改规则参数。</p>
       <div class="project-rule-files"><div v-for="(file, index) in referenceFiles" :key="file.weldMarkerReferenceIndex ?? index" class="project-rule-file">
         <span class="project-rule-filename" :title="file.name">{{ file.name || `对照文件 ${index + 1}` }}</span>
         <v-select :model-value="config.referenceRuleAssignments[String(file.weldMarkerReferenceIndex ?? index)]" :items="ruleItems" label="出图来源" placeholder="使用默认规则" variant="outlined" density="compact" hide-details clearable @update:model-value="emit('assignReferenceRule', { slot: String(file.weldMarkerReferenceIndex ?? index), ruleId: $event })" />

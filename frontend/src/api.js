@@ -1,21 +1,9 @@
 import { normalizeAssistantSource } from './assistantSources.js'
+import { createJsonRequester } from './httpRequest.js'
+import { createPageSaver } from './pageSaveRequest.js'
 
-async function request(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
-  })
-  const payload = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    const error = new Error(payload.error || `请求失败：HTTP ${response.status}`)
-    error.status = response.status
-    error.payload = payload
-    if (response.status === 401) globalThis.window?.dispatchEvent?.(new Event('drawing-marker:authentication-required'))
-    throw error
-  }
-  return payload
-}
+const request = createJsonRequester()
+const savePage = createPageSaver({ request, getPage: (jobId, page) => request(`/api/jobs/${jobId}/pages/${page}`) })
 
 async function streamAssistantChat(messages, context, onDelta, options = {}) {
   const response = await fetch('/api/ai/chat/stream', {
@@ -154,6 +142,16 @@ async function getJobTargetFile(jobId, fileName = 'target.pdf') {
   return new File([blob], fileName, { type: blob.type || 'application/pdf', lastModified: Date.now() })
 }
 
+function getJobTargetSource(jobId, fileName = 'target.pdf') {
+  return {
+    name: fileName,
+    type: 'application/pdf',
+    url: `/api/jobs/${jobId}/target`,
+    lazyTarget: true,
+    serverFingerprint: `job:${jobId}:target`,
+  }
+}
+
 async function getTutorialFile() {
   const response = await fetch('/api/tutorial/sample')
   if (!response.ok) throw new Error(`无法载入教程图纸：HTTP ${response.status}`)
@@ -173,6 +171,30 @@ export const api = {
     const query = new URLSearchParams({ search, page: String(page), pageSize: String(pageSize) })
     return request(`/api/admin/users?${query}`)
   },
+  getAdminSessions: ({ search = '', page = 1, pageSize = 20 } = {}) => {
+    const query = new URLSearchParams({ search, page: String(page), pageSize: String(pageSize) })
+    return request(`/api/admin/sessions?${query}`)
+  },
+  getAdminJobs: ({ search = '', status = '', page = 1, pageSize = 20 } = {}) => {
+    const query = new URLSearchParams({ search, status, page: String(page), pageSize: String(pageSize) })
+    return request(`/api/admin/jobs?${query}`)
+  },
+  getAdminBusinessStats: ({ from = '', to = '', project = '', username = '', action = '' } = {}) => {
+    const query = new URLSearchParams()
+    for (const [key, value] of Object.entries({ from, to, project, username, action })) {
+      if (value) query.set(key, value)
+    }
+    return request(`/api/admin/business-stats${query.size ? `?${query}` : ''}`)
+  },
+  getAdminAuditEvents: ({
+    from = '', to = '', username = '', action = '', source = '', jobId = '', search = '', page = 1, pageSize = 50,
+  } = {}) => {
+    const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize) })
+    for (const [key, value] of Object.entries({ from, to, username, action, source, jobId, search })) {
+      if (value) query.set(key, value)
+    }
+    return request(`/api/admin/audit-events?${query}`)
+  },
   getAiStatus: () => request('/api/ai/status'),
   getAiConversations: () => request('/api/ai/conversations'),
   saveAiConversations: conversations => request('/api/ai/conversations', {
@@ -181,8 +203,8 @@ export const api = {
   chatStream: (messages, context = {}, onDelta, options = {}) => streamAssistantChat(messages, context, onDelta, options),
   getPcfFolders: () => request('/api/pcf-folders'),
   getRecentBatch: () => request('/api/jobs/recent-batch'),
-  getAnalysisQueue: ({ scope = 'current', page = 1, pageSize = 20 } = {}) => {
-    const query = new URLSearchParams({ scope, page: String(page), pageSize: String(pageSize) })
+  getAnalysisQueue: ({ scope = 'current', taskType = 'analysis', page = 1, pageSize = 20 } = {}) => {
+    const query = new URLSearchParams({ scope, taskType, page: String(page), pageSize: String(pageSize) })
     return request(`/api/analysis-queue?${query}`)
   },
   moveQueuedJob: (jobId, direction) => request('/api/jobs/' + jobId + '/queue-position', { method: 'POST', body: JSON.stringify({ direction }) }),
@@ -190,6 +212,7 @@ export const api = {
   archiveJob: (jobId, archived = true) => request('/api/jobs/' + jobId + '/archive', { method: 'POST', body: JSON.stringify({ archived }) }),
   deleteJob: jobId => request('/api/jobs/' + jobId, { method: 'DELETE' }),
   getJobTargetFile,
+  getJobTargetSource,
   getTutorialSession: () => request('/api/tutorial/session?view=workspace'),
   getTutorialFile,
   getJobReferenceManifest,
@@ -218,15 +241,25 @@ export const api = {
   releasePageLock: (jobId, page, clientInstanceId, lockToken, keepalive = false) => request(`/api/jobs/${jobId}/pages/${page}/lock`, {
     method: 'DELETE', body: JSON.stringify({ clientInstanceId, lockToken }), keepalive
   }),
-  savePage: (jobId, page, pageData, basePageRevision, clientInstanceId, lockToken) => request(`/api/jobs/${jobId}/pages/${page}`, {
-    method: 'PUT', body: JSON.stringify({ page: pageData, basePageRevision, clientInstanceId, lockToken })
-  }),
+  savePage,
   exportPdf: (jobId, candidates) => request(`/api/jobs/${jobId}/export`, {
     method: 'POST',
+    timeoutMs: 120_000,
     body: JSON.stringify({ candidates })
+  }),
+  exportSavedPdf: (jobId, version = 'current') => request(`/api/jobs/${jobId}/export`, {
+    method: 'POST',
+    timeoutMs: 120_000,
+    body: JSON.stringify({ version, format: 'pdf' })
+  }),
+  exportSavedCsv: jobId => request(`/api/jobs/${jobId}/export`, {
+    method: 'POST',
+    timeoutMs: 120_000,
+    body: JSON.stringify({ version: 'current', format: 'csv' })
   }),
   exportTutorialPdf: candidates => request('/api/tutorial/export', {
     method: 'POST',
+    timeoutMs: 120_000,
     body: JSON.stringify({ candidates })
   }),
   audit: (action, details = {}) => request('/api/audit', {

@@ -39,9 +39,29 @@ class _Response:
 
 
 class ServerTests(unittest.TestCase):
+    def test_file_supports_single_http_byte_range(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            source = Path(folder_name) / "drawing.pdf"
+            source.write_bytes(b"0123456789")
+            handler = object.__new__(server.ApiHandler)
+            handler.headers = {"Range": "bytes=2-5"}
+            handler.wfile = io.BytesIO()
+            response = {}
+            handler.send_response = lambda status: response.update(status=status)
+            handler.send_header = lambda name, value: response.setdefault("headers", {}).update({name: value})
+            handler.end_headers = lambda: None
+
+            handler._file(source, allow_range=True)
+
+            self.assertEqual(response["status"], 206)
+            self.assertEqual(response["headers"]["Accept-Ranges"], "bytes")
+            self.assertEqual(response["headers"]["Content-Range"], "bytes 2-5/10")
+            self.assertEqual(response["headers"]["Content-Length"], "4")
+            self.assertEqual(handler.wfile.getvalue(), b"2345")
+
     def test_analysis_queue_route_forwards_validated_pagination(self) -> None:
         handler = object.__new__(server.ApiHandler)
-        handler.path = "/api/analysis-queue?scope=archived&page=3&pageSize=40"
+        handler.path = "/api/analysis-queue?scope=archived&taskType=direct-placement&page=3&pageSize=40"
         responses = []
         handler._json = lambda status, payload, headers=None: responses.append((status, payload))
         expected = {"jobs": [], "pagination": {"scope": "archived", "page": 3, "pageSize": 40}}
@@ -49,7 +69,9 @@ class ServerTests(unittest.TestCase):
         with patch.object(server, "_analysis_queue_snapshot", return_value=expected) as load_snapshot:
             handler._do_GET()
 
-        load_snapshot.assert_called_once_with(scope="archived", page=3, page_size=40)
+        load_snapshot.assert_called_once_with(
+            scope="archived", page=3, page_size=40, task_type="direct-placement",
+        )
         self.assertEqual(responses, [(200, expected)])
 
     def test_analysis_queue_route_normalizes_invalid_pagination(self) -> None:
@@ -60,7 +82,7 @@ class ServerTests(unittest.TestCase):
         with patch.object(server, "_analysis_queue_snapshot", return_value={"jobs": []}) as load_snapshot:
             handler._do_GET()
 
-        load_snapshot.assert_called_once_with(scope="current", page=1, page_size=100)
+        load_snapshot.assert_called_once_with(scope="current", page=1, page_size=100, task_type="analysis")
 
     def test_auth_store_bootstraps_the_default_admin_account(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
@@ -79,7 +101,7 @@ class ServerTests(unittest.TestCase):
             handler.headers = {}
             handler._read_json = lambda *_args: {"username": "Reviewer01", "password": "correct-horse-battery"}
             handler._json = lambda status, payload, headers=None: responses.append((status, payload, headers or {}))
-            with patch.object(server, "DATA_ROOT", jobs_root):
+            with patch.object(server, "DATA_ROOT", jobs_root), patch.object(server, "AUDIT_ROOT", Path(folder_name) / "audit"):
                 server.AUTH_STORES.clear()
                 handler.do_POST()
                 self.assertEqual(responses[0][0], 201)
@@ -93,6 +115,10 @@ class ServerTests(unittest.TestCase):
                 handler.path = "/api/auth/me"
                 handler.headers = {"Cookie": f"{server.SESSION_COOKIE_NAME}={token}"}
                 handler._do_GET()
+
+                audit_event = json.loads((Path(folder_name) / "audit" / "events.jsonl").read_text(encoding="utf-8").strip())
+                self.assertEqual(audit_event["action"], "auth.registered")
+                self.assertEqual(audit_event["actor"]["username"], "Reviewer01")
 
             self.assertEqual(responses[1][0], 200)
             self.assertEqual(responses[1][1]["user"]["username"], "Reviewer01")
@@ -118,7 +144,7 @@ class ServerTests(unittest.TestCase):
             handler.headers = {}
             handler._read_json = lambda *_args: {"username": "admin", "password": "123456"}
             handler._json = lambda *_args, **_kwargs: None
-            with patch.object(server, "DATA_ROOT", jobs_root):
+            with patch.object(server, "DATA_ROOT", jobs_root), patch.object(server, "AUDIT_ROOT", Path(folder_name) / "audit"):
                 server.AUTH_STORES.clear()
                 server.PAGE_LOCK_STORES.clear()
                 admin = server._auth_store().authenticate("admin", "123456")
@@ -129,16 +155,70 @@ class ServerTests(unittest.TestCase):
 
                 self.assertIsNone(locks.get("job", 1))
 
+    def test_admin_audit_route_forwards_filters_and_requires_admin(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = (
+            "/api/admin/audit-events?from=2026-09-01&to=2026-09-20&username=reviewer"
+            "&action=page.saved&source=review&jobId=abc&search=revision&page=2&pageSize=100"
+        )
+        handler.headers = {}
+        handler._request_user = {"userId": "admin-id", "username": "admin", "isAdmin": True}
+        responses = []
+        handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+        expected = {"events": [], "pagination": {"page": 2, "pageSize": 100, "total": 0, "totalPages": 1}}
+
+        with patch.object(server, "_job_store"), patch.object(server, "AuditStore") as audit_type:
+            audit_type.return_value.list_events.return_value = expected
+            handler.do_GET()
+
+        self.assertEqual(responses, [(200, expected)])
+        audit_type.return_value.list_events.assert_called_once_with(
+            date_from="2026-09-01", date_to="2026-09-20", username="reviewer",
+            action="page.saved", source="review", job_id="abc", search="revision",
+            page=2, page_size=100,
+        )
+
+    def test_admin_sessions_route_forwards_search_and_pagination(self) -> None:
+        handler = object.__new__(server.ApiHandler)
+        handler.path = "/api/admin/sessions?search=reviewer&page=2&pageSize=50"
+        handler.headers = {}
+        handler._request_user = {"userId": "admin-id", "username": "admin", "isAdmin": True}
+        responses = []
+        handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+        expected = {"sessions": [], "pagination": {"page": 2, "pageSize": 50, "total": 0, "totalPages": 1}}
+
+        with patch.object(server, "_admin_store") as load_store:
+            load_store.return_value.sessions.return_value = expected
+            handler.do_GET()
+
+        self.assertEqual(responses, [(200, expected)])
+        load_store.return_value.sessions.assert_called_once_with(search="reviewer", page=2, page_size=50)
+
     def test_admin_routes_reject_regular_users_and_return_sanitized_database_data(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             jobs_root = Path(folder_name) / "jobs"
-            with patch.object(server, "DATA_ROOT", jobs_root):
+            with patch.object(server, "DATA_ROOT", jobs_root), patch.object(server, "AUDIT_ROOT", Path(folder_name) / "audit"):
                 server.AUTH_STORES.clear()
                 server.JOB_STORES.clear()
                 server.PAGE_LOCK_STORES.clear()
                 server.ASSISTANT_CONVERSATION_STORES.clear()
                 admin = server._auth_store().authenticate("admin", "123456")
                 regular = server._auth_store().register("reviewer", "correct-horse-battery")
+                server._job_store().create_job(
+                    job_id="a" * 32,
+                    analysis_signature="admin-task-table",
+                    job_folder=jobs_root / ("a" * 32),
+                    original_target_name="admin-visible.pdf",
+                    algorithm_version="test-admin",
+                    creator_user_id=str(admin["userId"]),
+                    creator_username=str(admin["username"]),
+                    queue_summary={
+                        "totalPages": 4,
+                        "completedPages": 2,
+                        "progressPercent": 50,
+                        "project": {"name": "后台测试项目"},
+                    },
+                )
 
                 denied = object.__new__(server.ApiHandler)
                 denied.path = "/api/admin/overview"
@@ -166,6 +246,19 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(allowed_responses[0][0], 200)
                 self.assertEqual(allowed_responses[0][1]["metrics"]["totalUsers"], 2)
 
+                task_handler = object.__new__(server.ApiHandler)
+                task_handler.path = "/api/admin/jobs?search=admin-visible&status=queued&page=1&pageSize=20"
+                task_handler.headers = {}
+                task_handler._request_user = admin
+                task_responses = []
+                task_handler._json = lambda status, payload, headers=None: task_responses.append((status, payload))
+                task_handler.do_GET()
+                self.assertEqual(task_responses[0][0], 200)
+                self.assertEqual(task_responses[0][1]["pagination"]["total"], 1)
+                self.assertEqual(task_responses[0][1]["jobs"][0]["targetName"], "admin-visible.pdf")
+                self.assertEqual(task_responses[0][1]["jobs"][0]["progressPercent"], 50)
+                self.assertEqual(task_responses[0][1]["jobs"][0]["projectName"], "后台测试项目")
+
     def test_login_remember_password_controls_persistent_cookie_only(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:
             jobs_root = Path(folder_name) / "jobs"
@@ -174,7 +267,7 @@ class ServerTests(unittest.TestCase):
             handler.path = "/api/auth/login"
             handler.headers = {}
             handler._json = lambda status, payload, headers=None: responses.append((status, payload, headers or {}))
-            with patch.object(server, "DATA_ROOT", jobs_root):
+            with patch.object(server, "DATA_ROOT", jobs_root), patch.object(server, "AUDIT_ROOT", Path(folder_name) / "audit"):
                 server.AUTH_STORES.clear()
                 handler._read_json = lambda *_args: {
                     "username": "admin", "password": "123456", "rememberPassword": False,
@@ -191,6 +284,26 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn("Expires=", session_cookie)
         self.assertIn(f"Max-Age={7 * 24 * 60 * 60}", persistent_cookie)
         self.assertNotIn("123456", session_cookie + persistent_cookie)
+
+    def test_failed_login_is_audited_without_recording_password(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            handler = object.__new__(server.ApiHandler)
+            handler.path = "/api/auth/login"
+            handler.headers = {}
+            handler._read_json = lambda *_args: {"username": "unknown-user", "password": "do-not-log-this"}
+            responses = []
+            handler._json = lambda status, payload, headers=None: responses.append((status, payload))
+            with patch.object(server, "DATA_ROOT", root / "jobs"), patch.object(server, "AUDIT_ROOT", root / "audit"):
+                server.AUTH_STORES.clear()
+                handler.do_POST()
+
+            self.assertEqual(responses[0][0], 401)
+            text = (root / "audit" / "events.jsonl").read_text(encoding="utf-8")
+            event = json.loads(text)
+            self.assertEqual(event["action"], "auth.login_failed")
+            self.assertEqual(event["actor"]["username"], "unknown-user")
+            self.assertNotIn("do-not-log-this", text)
 
     def test_business_api_requires_authentication(self) -> None:
         handler = object.__new__(server.ApiHandler)
@@ -396,6 +509,7 @@ class ServerTests(unittest.TestCase):
                     handler._read_json = lambda *_args, p=page, c=client_id, t=token, n=number: {
                         "page": {"page": p, "candidates": [{"id": "a" if p == 1 else "b", "page": p, "number": n}]},
                         "basePageRevision": 0, "clientInstanceId": c, "lockToken": t,
+                        "saveRequestId": f"save-page-{p}",
                     }
                     handler._json = lambda status, payload, headers=None: responses.append((status, payload))
                     handler.do_PUT()
@@ -404,6 +518,8 @@ class ServerTests(unittest.TestCase):
                 saved_pages = page_store.get_job_pages(job_id)
 
             self.assertEqual([response[0] for response in responses], [200, 200])
+            self.assertEqual([response[1]["reviewSaveRequestId"] for response in responses], ["save-page-1", "save-page-2"])
+            self.assertEqual([page["reviewSaveRequestId"] for page in saved_pages], ["save-page-1", "save-page-2"])
             self.assertEqual([page["reviewRevision"] for page in saved_pages], [1, 1])
             self.assertEqual([page["candidates"][0]["number"] for page in saved_pages], ["A1", "B1"])
             self.assertEqual([(item["page_number"], item["username"]) for item in review_history], [(1, "张三"), (2, "李四")])
@@ -814,9 +930,11 @@ class ServerTests(unittest.TestCase):
             first = server._analysis_signature(payload)
             different_range = server._analysis_signature({**payload, "startPage": 99, "endPage": 120})
             different_mode = server._analysis_signature({**payload, "symbolConfig": {"detectionMode": "comparison"}})
+            direct_placement = server._analysis_signature({**payload, "taskType": "direct-placement"})
             different_project = server._analysis_signature({**payload, "project": {"id": "another-project", "name": "其他项目"}})
             self.assertNotEqual(first, different_range)
             self.assertNotEqual(first, different_mode)
+            self.assertNotEqual(first, direct_placement)
             self.assertNotEqual(first, different_project)
             with patch.object(server, "ANALYSIS_ALGORITHM_VERSION", "next-version"):
                 self.assertNotEqual(first, server._analysis_signature(payload))
@@ -852,7 +970,7 @@ class ServerTests(unittest.TestCase):
             }
             responses = []
             handler._json = lambda status, payload, headers=None: responses.append((status, payload))
-            with patch.object(server, "DATA_ROOT", root), patch.object(server, "UPLOAD_ROOT", upload_root):
+            with patch.object(server, "DATA_ROOT", root), patch.object(server, "UPLOAD_ROOT", upload_root), patch.object(server, "AUDIT_ROOT", root / "audit"):
                 server.JOB_STORES.clear()
                 handler._create_job()
             created = responses[0][1]
@@ -1104,6 +1222,12 @@ class ServerTests(unittest.TestCase):
             folder.mkdir()
             (folder / "result.json").write_text(json.dumps({
                 "jobId": folder.name, "status": "processing", "totalPages": 2, "pages": [],
+                "numberingConfig": {
+                    "useReferenceNumber": True,
+                    "startNumber": 7,
+                    "prefix": "W",
+                    "suffix": "A",
+                },
             }), encoding="utf-8")
             (folder / "job.json").write_text(json.dumps({
                 "targetFile": "target.pdf", "referenceFiles": [], "pcfSources": [],
@@ -1112,7 +1236,8 @@ class ServerTests(unittest.TestCase):
             parsed_pages = [{
                 "page": page, "width": 300, "height": 200,
                 "candidates": [{
-                    "id": f"w{page}", "number": str(page), "x": 100, "y": 100,
+                    "id": f"w{page}", "number": "", "x": 100, "y": 100,
+                    "referenceLabel": "F18" if page == 1 else "",
                     "labelX": 250, "labelY": 180, "included": True,
                 }],
                 "layoutObstacles": {"textRects": [], "processSegments": []},
@@ -1142,6 +1267,10 @@ class ServerTests(unittest.TestCase):
             saved = json.loads((folder / "result.json").read_text(encoding="utf-8"))
             saved_pages = store.get_job_pages(folder.name)
             self.assertNotIn("pages", saved)
+            self.assertEqual(
+                [page["candidates"][0]["number"] for page in saved_pages],
+                ["F18", "W7A"],
+            )
             self.assertTrue(all(page["candidates"][0]["labelX"] != 250 for page in saved_pages))
             self.assertNotIn("labelLayout", saved)
 
@@ -1181,6 +1310,116 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(captured["markerStyles"]["components"]["valve"]["color"], "#1769d2")
             self.assertEqual(captured["sourceFileName"], "target.pdf")
             self.assertTrue(responses)
+
+    def test_export_without_payload_uses_saved_page_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            job_id = "e" * 32
+            folder = root / job_id
+            folder.mkdir()
+            (folder / "job.json").write_text(json.dumps({"targetFile": "target.pdf"}), encoding="utf-8")
+            (folder / "result.json").write_text(json.dumps({
+                "status": "complete", "analyzedRange": [1, 1],
+                "markerStyle": {"color": "#245f99", "frameSize": 32},
+            }), encoding="utf-8")
+            (folder / "target.pdf").write_bytes(b"pdf")
+            handler = object.__new__(server.ApiHandler)
+            handler._read_json = lambda: {}
+            handler._json = lambda *_args: None
+            captured = {}
+
+            def fake_write(_source, output, candidates, _editable_data):
+                captured["candidates"] = candidates
+                output.write_bytes(b"annotated")
+                return output
+
+            with patch.object(server, "DATA_ROOT", root), patch.object(server, "write_annotated_pdf", side_effect=fake_write):
+                server.JOB_STORES.clear()
+                server._job_store().replace_job_pages(job_id, [{
+                    "page": 1,
+                    "candidates": [{"id": "saved", "page": 1, "number": "F1", "x": 10, "y": 20}],
+                }])
+                handler._export_job(job_id)
+
+            self.assertEqual([item["id"] for item in captured["candidates"]], ["saved"])
+            self.assertEqual(captured["candidates"][0]["markerStyle"]["color"], "#245f99")
+
+    def test_export_initial_version_uses_immutable_database_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            job_id = "a" * 32
+            folder = root / job_id
+            folder.mkdir()
+            (folder / "job.json").write_text(json.dumps({"targetFile": "target.pdf"}), encoding="utf-8")
+            (folder / "result.json").write_text(json.dumps({
+                "status": "complete", "analyzedRange": [1, 1],
+            }), encoding="utf-8")
+            (folder / "target.pdf").write_bytes(b"pdf")
+            handler = object.__new__(server.ApiHandler)
+            handler._read_json = lambda: {"version": "initial", "format": "pdf"}
+            responses = []
+            handler._json = lambda status, payload: responses.append((status, payload))
+            captured = {}
+
+            def fake_write(_source, output, candidates, editable_data):
+                captured["candidates"] = candidates
+                captured["pages"] = editable_data["pages"]
+                output.write_bytes(b"annotated")
+                return output
+
+            with patch.object(server, "DATA_ROOT", root), patch.object(server, "write_annotated_pdf", side_effect=fake_write):
+                server.JOB_STORES.clear()
+                store = server._job_store()
+                store.create_job(
+                    job_id=job_id, analysis_signature="initial-export", job_folder=folder,
+                    original_target_name="target.pdf", algorithm_version="test",
+                )
+                store.replace_job_pages(job_id, [{
+                    "page": 1, "candidates": [{"id": "initial", "page": 1, "number": "W1"}],
+                }])
+                store.save_job_page(
+                    job_id, 1, {"page": 1, "candidates": [{"id": "edited", "page": 1, "number": "W9"}]},
+                    0, {"userId": "u1", "username": "reviewer"},
+                )
+                handler._export_job(job_id)
+
+            self.assertEqual(captured["candidates"][0]["id"], "initial")
+            self.assertEqual(captured["pages"][0]["candidates"][0]["number"], "W1")
+            self.assertTrue(responses[0][1]["downloadUrl"].endswith("/annotated-initial.pdf"))
+
+    def test_export_with_no_numbered_candidates_still_creates_pdf_and_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            job_id = "c" * 32
+            folder = root / job_id
+            folder.mkdir()
+            (folder / "job.json").write_text(json.dumps({"targetFile": "target.pdf"}), encoding="utf-8")
+            (folder / "result.json").write_text(json.dumps({
+                "status": "complete", "analyzedRange": [1, 1],
+            }), encoding="utf-8")
+            document = fitz.open()
+            document.new_page()
+            document.save(folder / "target.pdf")
+            document.close()
+            handler = object.__new__(server.ApiHandler)
+            payload = {"version": "current", "format": "pdf"}
+            handler._read_json = lambda: payload
+            responses = []
+            handler._json = lambda status, body: responses.append((status, body))
+
+            with patch.object(server, "DATA_ROOT", root):
+                server.JOB_STORES.clear()
+                server._job_store().replace_job_pages(job_id, [{
+                    "page": 1,
+                    "candidates": [{"id": "unresolved", "page": 1, "number": "", "x": 10, "y": 20}],
+                }])
+                handler._export_job(job_id)
+                self.assertTrue((folder / "annotated.pdf").is_file())
+                payload["format"] = "csv"
+                handler._export_job(job_id)
+
+            self.assertTrue((folder / "export.csv").read_text(encoding="utf-8").startswith("\ufeff页码"))
+            self.assertTrue(responses[-1][1]["downloadUrl"].endswith("/export.csv"))
 
     def test_export_clears_stale_embedded_candidates_from_pages_omitted_by_filtered_payload(self) -> None:
         with tempfile.TemporaryDirectory() as folder_name:

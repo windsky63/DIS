@@ -76,7 +76,7 @@ test('reverse drags normalize the rectangle with transformed canvas offsets', ()
   } finally { f.scope.stop() }
 })
 
-for (const [type, removedId] of [['weld', 'weld'], ['valve', 'valve'], ['flange', 'flange'], ['support', 'support']]) {
+for (const [type, removedId] of [['weld', 'weld'], ['valve', 'valve'], ['flange', 'flange'], ['support', 'support'], ['other', 'special']]) {
   test(`region deletion in ${type} mode only deletes that type`, () => {
     const f = fixture()
     try {
@@ -89,7 +89,7 @@ for (const [type, removedId] of [['weld', 'weld'], ['valve', 'valve'], ['flange'
       assert.equal(f.manualAddMode.value, true)
       f.region.start(f.pointer(.1, .1)); f.region.finish(f.pointer(.5, .5))
       assert.deepEqual(f.audits[0][1].ids, [removedId])
-      assert.ok(f.pageData.value.candidates.some(item => item.id === 'special'))
+      if (type !== 'other') assert.ok(f.pageData.value.candidates.some(item => item.id === 'special'))
       f.history.undo()
       assert.ok(f.pageData.value.candidates.some(item => item.id === removedId))
     } finally { f.scope.stop() }

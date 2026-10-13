@@ -5,6 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable
 
+try:
+    from .time_utils import beijing_now
+except ImportError:
+    from time_utils import beijing_now
+
 
 class PageRevisionConflict(RuntimeError):
     def __init__(self, current_revision: int) -> None:
@@ -19,7 +24,7 @@ def merge_review_page(
     base_revision: int,
     user: dict[str, object],
     *,
-    now: Callable[[], datetime] = datetime.now,
+    now: Callable[[], datetime] = beijing_now,
 ) -> dict[str, Any]:
     pages = list(current.get("pages") or [])
     index = next((i for i, page in enumerate(pages) if int(page.get("page") or 0) == int(page_number)), None)

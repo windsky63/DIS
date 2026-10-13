@@ -26,14 +26,16 @@ function formatBytes(value) {
         <span>{{ state.message }}</span>
         <div class="analysis-progress-panel__actions">
           <strong>{{ Math.round(percent) }}%</strong>
-          <button v-if="activeJobId" type="button" class="analysis-progress-cancel" :disabled="cancelling" @click.stop="$emit('cancel')">{{ cancelling ? '取消中' : '取消解析' }}</button>
+          <button v-if="activeJobId" type="button" class="analysis-progress-cancel" :disabled="cancelling" @click.stop="$emit('cancel')">{{ cancelling ? '取消中' : '取消任务' }}</button>
         </div>
       </div>
       <v-progress-linear :model-value="percent" color="accent" height="8" rounded striped />
       <div class="analysis-progress-panel__meta">
         <span>{{ state.fileName }}</span>
-        <span v-if="['preparing', 'uploading', 'server-validation'].includes(state.phase)">上传 {{ formatBytes(state.transferLoaded) }} / {{ formatBytes(state.transferTotal) }} · 工程 {{ state.fileIndex + 1 }} / {{ state.fileCount }}</span>
+        <span v-if="state.phase === 'enqueueing'">上传 {{ formatBytes(state.transferLoaded) }} / {{ formatBytes(state.transferTotal) }} · 任务 {{ state.fileIndex + 1 }} / {{ state.fileCount }}</span>
+        <span v-else-if="['preparing', 'uploading', 'server-validation'].includes(state.phase)">上传 {{ formatBytes(state.transferLoaded) }} / {{ formatBytes(state.transferTotal) }} · 工程 {{ state.fileIndex + 1 }} / {{ state.fileCount }}</span>
         <span v-else-if="state.progressStage === 'optimizing-layout'">标识优化 {{ state.layoutCompletedPages || 0 }} / {{ state.layoutTotalPages || state.totalPages || 0 }} 页 · 工程 {{ projectProgress }} / {{ projectCount || 1 }}</span>
+        <span v-else-if="state.progressStage === 'direct-placement'">落图页面 {{ state.completedPages || 0 }} / {{ state.totalPages || 0 }}</span>
         <span v-else>对照 {{ state.completedReferenceFiles || 0 }} / {{ state.totalReferenceFiles || 0 }} · 设计页 {{ state.completedPages }} / {{ state.totalPages }} · 工程 {{ projectProgress }} / {{ projectCount || 1 }}</span>
       </div>
     </div>

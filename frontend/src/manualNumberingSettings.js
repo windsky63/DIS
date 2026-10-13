@@ -1,10 +1,11 @@
-const TYPES = ['weld', 'valve', 'flange', 'support']
+const TYPES = ['weld', 'valve', 'flange', 'support', 'other']
 
 export const MANUAL_NUMBERING_DEFAULTS = Object.freeze({
-  weld: Object.freeze({ prefix: '', suffix: '', start: 1 }),
-  valve: Object.freeze({ prefix: 'V', suffix: '', start: 1 }),
-  flange: Object.freeze({ prefix: 'FL', suffix: '', start: 1 }),
-  support: Object.freeze({ prefix: 'SP', suffix: '', start: 1 }),
+  weld: Object.freeze({ prefix: '', suffix: '', start: 1, secondaryPrefix: '', secondarySuffix: '', secondaryStart: 1 }),
+  valve: Object.freeze({ prefix: 'V', suffix: '', start: 1, secondaryPrefix: '', secondarySuffix: '', secondaryStart: 1 }),
+  flange: Object.freeze({ prefix: 'FL', suffix: '', start: 1, secondaryPrefix: '', secondarySuffix: '', secondaryStart: 1 }),
+  support: Object.freeze({ prefix: 'SP', suffix: '', start: 1, secondaryPrefix: '', secondarySuffix: '', secondaryStart: 1 }),
+  other: Object.freeze({ prefix: 'M', suffix: '', start: 1, secondaryPrefix: '', secondarySuffix: '', secondaryStart: 1 }),
 })
 
 function text(value, fallback) {
@@ -12,7 +13,9 @@ function text(value, fallback) {
 }
 
 function startingNumber(value, fallback) {
-  return Math.max(1, Number.parseInt(value ?? fallback, 10) || 1)
+  if (value === '' || value === null) return null
+  const source = value === undefined ? fallback : value
+  return Math.max(1, Number.parseInt(source, 10) || 1)
 }
 
 export function createManualNumberingSettings(value = {}) {
@@ -23,6 +26,9 @@ export function createManualNumberingSettings(value = {}) {
       prefix: text(supplied.prefix, fallback.prefix),
       suffix: text(supplied.suffix, fallback.suffix),
       start: startingNumber(supplied.start, fallback.start),
+      secondaryPrefix: text(supplied.secondaryPrefix, fallback.secondaryPrefix),
+      secondarySuffix: text(supplied.secondarySuffix, fallback.secondarySuffix),
+      secondaryStart: startingNumber(supplied.secondaryStart, fallback.secondaryStart),
     }]
   }))
 }
@@ -45,19 +51,25 @@ export function saveManualNumberingSettings(storage, userId, value) {
 
 function ruleFor(value, type) {
   const settings = createManualNumberingSettings(value)
-  return settings[type] || { prefix: 'M', suffix: '', start: 1 }
+  return settings[type] || settings.other
 }
 
-export function manualNumberingSequenceKey(value, type) {
+export function manualNumberingSequenceKey(value, type, splitCircle = false) {
   const rule = ruleFor(value, type)
-  return JSON.stringify([type, rule.prefix, rule.suffix, rule.start])
+  const fields = [type, rule.prefix, rule.suffix, rule.start]
+  if (splitCircle) fields.push(rule.secondaryPrefix, rule.secondarySuffix, rule.secondaryStart)
+  return JSON.stringify(fields)
 }
 
-export function manualMarkerNumber(value, type, existingCount = 0) {
+export function manualMarkerNumber(value, type, existingCount = 0, splitCircle = false) {
   const rule = ruleFor(value, type)
-  const number = rule.start + Math.max(0, Number.parseInt(existingCount, 10) || 0)
+  const offset = Math.max(0, Number.parseInt(existingCount, 10) || 0)
+  const number = rule.start == null ? '' : rule.start + offset
   return {
     number: `${rule.prefix}${number}${rule.suffix}`,
     prefix: rule.prefix,
+    secondaryText: splitCircle
+      ? `${rule.secondaryPrefix}${rule.secondaryStart == null ? '' : rule.secondaryStart + offset}${rule.secondarySuffix}`
+      : undefined,
   }
 }

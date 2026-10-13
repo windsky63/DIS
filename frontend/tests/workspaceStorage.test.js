@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import * as workspaceStorage from '../src/workspaceStorage.js'
 
-const { fileFingerprint, prepareDraftV2, sha256Hex } = workspaceStorage
+const { fileFingerprint, prepareDraftV2, sha256Hex, snapshotPruneCount } = workspaceStorage
 
 test('SHA-256 fallback works when Web Crypto subtle is unavailable', async () => {
   const bytes = new TextEncoder().encode('abc')
@@ -93,4 +93,11 @@ test('orphan file cleanup treats malformed legacy manifests as unreferenced', ()
     workspaceStorage.orphanStoredFileKeys([null, {}, { fileGroups: { targetFile: null } }], ['old-pdf']),
     ['old-pdf'],
   )
+})
+
+test('snapshot pruning removes only records beyond the cache limit', () => {
+  assert.equal(snapshotPruneCount(47, 48), 0)
+  assert.equal(snapshotPruneCount(48, 48), 0)
+  assert.equal(snapshotPruneCount(49, 48), 1)
+  assert.equal(snapshotPruneCount(73, 48), 25)
 })

@@ -11,6 +11,7 @@ from typing import Any, Callable
 import fitz
 
 try:
+    from .marker_geometry import marker_geometry
     from .ep3d_components import extract_ep3d_component_callouts
     from .design_components import extract_design_component_symbols
     from .reference_rules import normalize_reference_rules, reference_rule_for_slot, extract_contractor_callouts
@@ -27,6 +28,7 @@ try:
     from .iso_weld_matcher.idf_topology import analyze_pcf
     from .iso_weld_matcher.pdf_vectors import analyze_page, augment_weld_anchor_candidates
 except ImportError:  # Direct ``python backend/server.py`` execution.
+    from marker_geometry import marker_geometry
     from ep3d_components import extract_ep3d_component_callouts
     from design_components import extract_design_component_symbols
     from reference_rules import normalize_reference_rules, reference_rule_for_slot, extract_contractor_callouts
@@ -2161,13 +2163,15 @@ def write_annotated_pdf(
             page = document[page_number - 1]
             for item in items:
                 point = fitz.Point(float(item["x"]), float(item["y"]))
-                number = str(item.get("number") or item.get("referenceLabel") or "?")
+                number = str(item.get("number") or "").strip()
+                if not number:
+                    raise ValueError(f"第 {page_number} 页标识 {item.get('id') or 'unknown'} 缺少编号，无法导出")
+                secondary_text = str(item.get("secondaryText") or "").strip()
                 style = item.get("markerStyle") if isinstance(item.get("markerStyle"), dict) else {}
                 shape = str(style.get("shape") or "rectangle")
-                if shape not in {"circle", "diamond", "rectangle"}:
+                if shape not in {"circle", "diamond", "rectangle", "split-circle"}:
                     shape = "rectangle"
-                frame_size = max(18.0, min(64.0, float(style.get("frameSize") or 28.0)))
-                font_size = max(7.0, min(24.0, float(style.get("fontSize") or 10.0)))
+                box_width, frame_size, font_size = marker_geometry(item, {**style, "shape": shape})
                 line_width = max(0.5, min(4.0, float(style.get("lineWidth") or 1.35)))
                 fill_opacity = max(0.0, min(1.0, float(style.get("fillOpacity", 0.58))))
                 color_text = str(style.get("color") or "#d4143c")
@@ -2178,8 +2182,7 @@ def write_annotated_pdf(
                     float(item.get("labelX", point.x + 24.0)),
                     float(item.get("labelY", point.y - 18.0)),
                 )
-                box_width = frame_size if shape != "rectangle" else max(frame_size * 1.35, 10.0 + len(number) * font_size * 0.68)
-                fitted_font_size = min(font_size, max(4.0, (box_width - 6.0) / max(len(number) * 0.58, 1.0)))
+                fitted_font_size = font_size
                 label_box = fitz.Rect(
                     label_point.x - box_width / 2,
                     label_point.y - frame_size / 2,
@@ -2190,7 +2193,7 @@ def write_annotated_pdf(
                 distance = math.hypot(dx, dy)
                 if distance > 1e-6:
                     ux, uy = dx / distance, dy / distance
-                    if shape == "circle":
+                    if shape in {"circle", "split-circle"}:
                         boundary = frame_size / 2
                     elif shape == "diamond":
                         boundary = (frame_size / 2) / max(abs(ux) + abs(uy), 1e-6)
@@ -2203,8 +2206,14 @@ def write_annotated_pdf(
                     # The research convention starts directly at the weld coordinate:
                     # no endpoint glyph is drawn, so the source weld symbol stays visible.
                     page.draw_line(point, leader_end, color=color, width=max(0.5, line_width * 0.78), stroke_opacity=0.68, overlay=True)
-                if shape == "circle":
+                if shape in {"circle", "split-circle"}:
                     page.draw_circle(label_point, frame_size / 2, color=color, fill=(1, 1, 1), width=line_width, stroke_opacity=0.86, fill_opacity=fill_opacity, overlay=True)
+                    if shape == "split-circle":
+                        page.draw_line(
+                            fitz.Point(label_point.x - frame_size / 2, label_point.y),
+                            fitz.Point(label_point.x + frame_size / 2, label_point.y),
+                            color=color, width=line_width, stroke_opacity=0.86, overlay=True,
+                        )
                 elif shape == "diamond":
                     radius = frame_size / 2
                     page.draw_polyline([
@@ -2213,19 +2222,25 @@ def write_annotated_pdf(
                     ], color=color, fill=(1, 1, 1), width=line_width, closePath=True, stroke_opacity=0.86, fill_opacity=fill_opacity, overlay=True)
                 else:
                     page.draw_rect(label_box, color=color, fill=(1, 1, 1), width=line_width, stroke_opacity=0.86, fill_opacity=fill_opacity, overlay=True, radius=0.08)
-                text_width = label_font.text_length(number, fontsize=fitted_font_size)
-                baseline_y = label_point.y + (
-                    label_font.ascender + label_font.descender
-                ) * fitted_font_size / 2.0
-                page.insert_text(
-                    fitz.Point(label_point.x - text_width / 2.0, baseline_y),
-                    number,
-                    fontsize=fitted_font_size,
-                    fontname="hebo",
-                    color=color,
-                    fill_opacity=0.92,
-                    overlay=True,
-                )
+                texts = [(number, 0.0)] if shape != "split-circle" else [
+                    (number, -fitted_font_size * 0.65), (secondary_text, fitted_font_size * 0.65),
+                ]
+                for text, vertical_offset in texts:
+                    if not text:
+                        continue
+                    text_width = label_font.text_length(text, fontsize=fitted_font_size)
+                    baseline_y = label_point.y + vertical_offset + (
+                        label_font.ascender + label_font.descender
+                    ) * fitted_font_size / 2.0
+                    page.insert_text(
+                        fitz.Point(label_point.x - text_width / 2.0, baseline_y),
+                        text,
+                        fontsize=fitted_font_size,
+                        fontname="hebo",
+                        color=color,
+                        fill_opacity=0.92,
+                        overlay=True,
+                    )
         if embedded_result:
             document.embfile_add(
                 "weld-marker-result.json",

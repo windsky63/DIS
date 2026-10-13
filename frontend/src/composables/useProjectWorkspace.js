@@ -36,7 +36,16 @@ export function useProjectWorkspace({ state, operations }) {
   }
 
   function changeProjectMode(mode) {
-    tutorialSessionActive.value = false; projectMode.value = mode; startPage.value = 1; endPage.value = ''; clearProject()
+    if (projectMode.value === mode) return
+    tutorialSessionActive.value = false
+    projectMode.value = mode
+    if (result.value?.jobId || result.value?.manualWorkspace) {
+      operations.scheduleDraftSave?.()
+      return
+    }
+    startPage.value = 1
+    endPage.value = ''
+    clearProject()
   }
 
   async function setProjectFiles(value) {
@@ -83,7 +92,8 @@ export function useProjectWorkspace({ state, operations }) {
   async function loadTargetPdf(inputFile, fitAfter = true, checkRecovery = true, initialPage = 1) {
     const token = ++targetLoadToken
     const requestedFile = inputFile
-    const file = await operations.materializeStoredFile(inputFile)
+    const remoteSource = inputFile?.url && typeof inputFile?.arrayBuffer !== 'function'
+    const file = remoteSource ? inputFile : await operations.materializeStoredFile(inputFile)
     if (token !== targetLoadToken || !file) return false
     if (targetPdf.value === requestedFile) targetPdf.value = file
     const projectFileIndex = projectPdfs.value.indexOf(requestedFile)
@@ -97,7 +107,10 @@ export function useProjectWorkspace({ state, operations }) {
     }
     try {
       const documentPromise = loadPdfDocument(file).then(document => { markStep(); return document })
-      const fingerprintPromise = fileFingerprint(file).then(async fingerprint => ({ fingerprint, draft: checkRecovery ? await loadDraft(fingerprint).catch(() => null) : null })).then(value => { markStep(); return value })
+      const fingerprintPromise = (remoteSource
+        ? Promise.resolve(String(file.serverFingerprint || `server:${file.url}`))
+        : fileFingerprint(file)
+      ).then(async fingerprint => ({ fingerprint, draft: checkRecovery ? await loadDraft(fingerprint).catch(() => null) : null })).then(value => { markStep(); return value })
       const recentPromise = checkRecovery ? api.getRecentBatch().catch(() => null).then(value => { markStep(); return value }) : Promise.resolve(null)
       const document = await documentPromise
       if (token !== targetLoadToken) { document.destroy?.(); return false }
@@ -109,6 +122,7 @@ export function useProjectWorkspace({ state, operations }) {
       const embedded = embeddedAssets?.embedded || null
       if (token !== targetLoadToken) { document.destroy?.(); return false }
       targetDocument.value = document; activeFileFingerprint.value = fingerprint
+      operations.requestInitialCanvasFit?.()
       previewPage.value = Math.max(1, Math.min(document.numPages, Number(initialPage) || 1)); await nextTick()
       if (!checkRecovery) { await operations.renderCanvas(fitAfter); return true }
       const options = []
@@ -224,7 +238,7 @@ export function useProjectWorkspace({ state, operations }) {
     if (result.value && referenceMode.value === 'pdf') await operations.syncReferenceForPage(currentPage.value, true)
   }
 
-  async function changePage(pageNumber, { preserveLocal = false } = {}) {
+  async function changePage(pageNumber, { preserveLocal = false, hydrateDetails = true } = {}) {
     const previousHydration = hydratingWorkspace.value
     hydratingWorkspace.value = true
     try {
@@ -233,7 +247,7 @@ export function useProjectWorkspace({ state, operations }) {
       selectedId.value = ''
       if (result.value && referenceMode.value === 'pdf') await operations.syncReferenceForPage(currentPage.value, true); else await operations.renderCanvas(true)
       if (generation !== pageChangeGeneration) return
-      if (!preserveLocal && result.value?.jobId && requested && requested.detailsLoaded === false) {
+      if (hydrateDetails && !preserveLocal && result.value?.jobId && requested && requested.detailsLoaded === false) {
         try {
           const isServerJob = result.value.jobId && result.value.jobId !== 'tutorial-000207'
           const localPage = !isServerJob && activeFileFingerprint.value ? await loadDraftPage(activeFileFingerprint.value, activeProjectIndex.value, pageNumber).catch(() => null) : null
@@ -241,7 +255,6 @@ export function useProjectWorkspace({ state, operations }) {
           else { const hydrated = await api.getJobPage(result.value.jobId, pageNumber); Object.assign(requested, hydrated.page || hydrated, { detailsLoaded: true }) }
         } catch { /* light page remains usable */ }
         if (generation !== pageChangeGeneration) return
-        if (referenceMode.value === 'pdf') await operations.syncReferenceForPage(pageNumber, false); else await operations.renderCanvas(false)
       }
     } finally {
       hydratingWorkspace.value = previousHydration

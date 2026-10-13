@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { reflowLabelPositions } from '../src/markerLayout.js'
+import { markerGeometry } from '../src/markerGeometry.js'
 
 
 test('marker layout places included labels inside the page', () => {
@@ -107,7 +108,8 @@ test('strict perpendicular stage selects the shortest reference length', () => {
   reflowLabelPositions([page], () => ({ shape: 'circle', frameSize: 20, fontSize: 12 }))
   const item = page.candidates[0]
   assert.equal(item.layoutDiagnostics.selectionStage, 'strict-perpendicular')
-  assert.ok(Math.abs(item.layoutDiagnostics.lineLength - (Math.hypot(10, 10) + 12)) < .01)
+  const size = markerGeometry(item, { shape: 'circle', frameSize: 20, fontSize: 12 }).width
+  assert.ok(Math.abs(item.layoutDiagnostics.lineLength - Math.max(size * 1.25, Math.hypot(size / 2, size / 2) + 12)) < .01)
   assert.ok(Math.abs(item.labelX - item.x) < .01)
 })
 

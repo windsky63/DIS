@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -13,6 +12,11 @@ import sqlite3
 import time
 from typing import Callable, Iterator
 import uuid
+
+try:
+    from .time_utils import beijing_from_timestamp
+except ImportError:
+    from time_utils import beijing_from_timestamp
 
 
 SCRYPT_PARAMETERS = {"n": 16384, "r": 8, "p": 1, "dklen": 32}
@@ -118,7 +122,7 @@ class AuthStore:
         user_id = uuid.uuid4().hex
         salt = secrets.token_bytes(16)
         password_hash = self._password_hash(password, salt, SCRYPT_PARAMETERS)
-        created_at = datetime.fromtimestamp(self._now()).isoformat(timespec="seconds")
+        created_at = beijing_from_timestamp(self._now()).isoformat(timespec="seconds")
         try:
             with self._connection() as connection:
                 connection.execute(
@@ -187,7 +191,7 @@ class AuthStore:
                 raise InvalidCredentials("用户名或密码错误")
             connection.execute(
                 "UPDATE users SET last_login_at = ? WHERE user_id = ?",
-                (datetime.fromtimestamp(self._now()).isoformat(timespec="seconds"), row["user_id"]),
+                (beijing_from_timestamp(self._now()).isoformat(timespec="seconds"), row["user_id"]),
             )
         return self._public_user(row)
 

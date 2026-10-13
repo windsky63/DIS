@@ -65,12 +65,15 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 
 - `README.md`
 - `docs/usage.md`
+- `docs/faq.md`
 - `docs/architecture.md`
 - `docs/development.md`
 - `docs/deployment.md`
 - `docs/ai-assistant.md`
 
 路径必须与后端允许集合完全一致。后端将项目根目录和候选文件解析为真实路径，拒绝绝对路径、未登记路径、缺失文件、重复 ID、符号链接文件及越过项目根目录的路径。`data/`、`releases/`、`docs/superpowers/`、`.env` 和源代码均不能通过工具读取。
+
+`docs/faq.md` 对应稳定文档 ID `operation-faq`，覆盖直接落图、按键和拖拽新增、独立框尺寸、分栏编号、编号顺延、批量筛选与跨分页全选、锁冲突保存以及默认设置作用范围。使用指南记录完整流程，速查文档优先回答具体操作问题；检索仍只提供系统说明，不读取任务内容。
 
 索引在第一次访问时构建于 API 进程内存。每次检索都会比较清单摘要以及文档真实路径、字节大小和纳秒修改时间；任一变化都会自动重建，无需重启服务。
 

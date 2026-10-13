@@ -16,8 +16,8 @@ RUN npm run build
 
 FROM ${PYTHON_IMAGE} AS runtime
 
-ARG APP_VERSION=2.0.12
-ARG BUILD_ID=local
+ARG APP_VERSION=2.0.19
+ARG BUILD_ID=20261012-marker-editor-release
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
 ENV PYTHONUNBUFFERED=1 \

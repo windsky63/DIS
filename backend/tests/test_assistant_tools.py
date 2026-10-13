@@ -111,6 +111,12 @@ class AssistantToolTests(unittest.TestCase):
             ("小屏幕工具栏按钮重叠", "usage-guide", "界面与屏幕适配"),
             ("后台管理用户表和密钥余额", "usage-guide", "后台管理"),
             ("如何部署 Docker 并配置 HTTPS", "deployment-guide", "Docker 部署"),
+            ("长编号会把圆框撑大吗", "operation-faq", "长编号"),
+            ("批量表格全选为什么超过 15 行", "operation-faq", "全选"),
+            ("按 A 没有反应怎么办", "operation-faq", "人工新增"),
+            ("插入 F4 后怎样顺延编号", "operation-faq", "顺延"),
+            ("批量保存有些页面失败", "operation-faq", "批量保存"),
+            ("自动标识占比是否就是识别准确率", "operation-faq", "识别准确率"),
         ]
 
         for query, document_id, section in cases:

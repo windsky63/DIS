@@ -5,6 +5,44 @@ import { usePageCollaboration } from '../src/composables/usePageCollaboration.js
 
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 20))
+const deferred = () => {
+  let resolve, reject
+  const promise = new Promise((accept, fail) => { resolve = accept; reject = fail })
+  return { promise, resolve, reject }
+}
+
+test('confirming an older save advances only server metadata and keeps subsequent edits dirty', async () => {
+  const confirmed = { reviewRevision: 1, reviewSaveRequestId: 'old-save', reviewedAt: 'now' }
+  const { collaboration, pages } = harness({ client: { savePage: async () => {
+    throw Object.assign(new Error('older save confirmed'), { confirmedSave: confirmed })
+  } } })
+  try {
+    await collaboration.enterPage(1)
+    pages.get(1).candidates = [{ id: 'w1', number: 'new-content' }]
+    collaboration.markDirty(1)
+    await assert.rejects(collaboration.saveCurrentPage())
+    assert.equal(pages.get(1).reviewRevision, 1)
+    assert.equal(pages.get(1).candidates[0].number, 'new-content')
+    assert.equal(collaboration.dirtyPages.value.has(1), true)
+  } finally { collaboration.dispose() }
+})
+
+test('edits arriving during a pending save retain dirty status instead of closing as fully saved', async () => {
+  const gate = deferred()
+  const { collaboration, pages } = harness({ client: { savePage: () => gate.promise } })
+  try {
+    await collaboration.enterPage(1)
+    pages.get(1).candidates = [{ id: 'w1', number: '1' }]
+    collaboration.markDirty(1)
+    const saving = collaboration.saveCurrentPage()
+    pages.get(1).candidates[0].number = '2'
+    gate.resolve({ saved: true, reviewRevision: 1 })
+    await assert.rejects(saving, /新修改/)
+    assert.equal(pages.get(1).candidates[0].number, '2')
+    assert.equal(pages.get(1).reviewRevision, 1)
+    assert.equal(collaboration.dirtyPages.value.has(1), true)
+  } finally { gate.resolve({ reviewRevision: 1 }); collaboration.dispose() }
+})
 
 function harness(overrides = {}) {
   const calls = []
@@ -29,6 +67,7 @@ function harness(overrides = {}) {
     getCurrentPage: () => currentPage,
     getPageData: page => pages.get(page),
     saveDraftBoundary: async () => { calls.push('draft') },
+    savePageDraftBoundary: overrides.savePageDraftBoundary,
     hasPendingDraftChanges: overrides.hasPendingDraftChanges || (() => false),
     switchPage: async (page, options) => {
       calls.push(`render:${page}`)
@@ -50,6 +89,39 @@ test('draft-only workspace changes save on navigation without dirtying either re
   assert.deepEqual(calls, ['render:2', 'draft', 'acquire:2', 'release:1'])
   assert.equal(getCurrentPage(), 2)
   assert.deepEqual([...collaboration.dirtyPages.value], [])
+})
+
+test('opening a page summary loads its markers even when the server revision is unchanged', async () => {
+  const { collaboration, pages } = harness({
+    client: {
+      getJobPage: async (_job, page) => ({
+        page: { page, reviewRevision: 0, candidates: [{ id: `marker-${page}`, number: 'W1' }] },
+      }),
+    },
+  })
+  pages.set(2, { page: 2, reviewRevision: 0, candidateCount: 1, candidates: [], detailsLoaded: false })
+
+  await collaboration.enterPage(2)
+
+  assert.equal(pages.get(2).detailsLoaded, true)
+  assert.deepEqual(pages.get(2).candidates, [{ id: 'marker-2', number: 'W1' }])
+  await collaboration.release()
+})
+
+test('dirty page navigation persists only the changed page draft when incremental storage is available', async () => {
+  const pageDrafts = []
+  const { collaboration, calls } = harness({
+    savePageDraftBoundary: async page => { pageDrafts.push(page); calls.push(`page-draft:${page}`) },
+  })
+  await collaboration.enterPage(1)
+  calls.length = 0
+  collaboration.markDirty(1)
+
+  await collaboration.enterPage(2)
+
+  assert.deepEqual(pageDrafts, [1])
+  assert.equal(calls.includes('draft'), false)
+  assert.deepEqual(calls, ['render:2', 'save:1', 'page-draft:1', 'acquire:2', 'release:1'])
 })
 
 test('editing only marks dirty and never starts timer persistence', async () => {
@@ -229,12 +301,152 @@ test('rapid optimistic navigation acquires only the latest target lock', async (
   finishSave()
   const [secondResult, thirdResult] = await Promise.all([secondPage, thirdPage])
 
-  assert.equal(secondResult, 2)
+  assert.equal(secondResult, null)
   assert.equal(thirdResult, 3)
   assert.equal(getCurrentPage(), 3)
   assert.equal(collaboration.activeLock.value.page, 3)
   assert.deepEqual([...heldLocks], [3])
   assert.equal(calls.includes('acquire:2'), false)
+})
+
+test('an old heartbeat cannot restore the previous page lock after navigation', async () => {
+  for (const failed of [false, true]) {
+    const response = deferred()
+    const { collaboration } = harness({ client: { heartbeatPageLock: () => response.promise } })
+    await collaboration.enterPage(1)
+    const heartbeat = collaboration.heartbeat().catch(() => null)
+    await collaboration.enterPage(2)
+    if (failed) response.reject(Object.assign(new Error('old token expired'), { status: 423 }))
+    else response.resolve({ lock: { page: 1 } })
+    await heartbeat
+    assert.equal(collaboration.activeLock.value.page, 2)
+    assert.equal(collaboration.readOnly.value, false)
+    assert.equal(collaboration.leaseUncertain.value, false)
+    await collaboration.release()
+  }
+})
+
+test('a superseded lock conflict does not cancel the latest navigation or report another user', async () => {
+  const conflict = deferred()
+  const { collaboration, getCurrentPage } = harness({ client: {
+    acquirePageLock: async (_job, page) => page === 2 ? conflict.promise : { lock: { page, lockToken: `token-${page}` } },
+  } })
+  await collaboration.enterPage(1)
+  const older = collaboration.enterPage(2)
+  await tick()
+  const newer = collaboration.enterPage(3)
+  conflict.reject(Object.assign(new Error('other reviewer'), { status: 423, payload: { lock: { page: 2, owner: { username: 'reviewer' } } } }))
+  assert.deepEqual(await Promise.all([older, newer]), [null, 3])
+  assert.equal(getCurrentPage(), 3)
+  assert.equal(collaboration.activeLock.value.page, 3)
+  await collaboration.release()
+})
+
+test('navigation requested while the original lock is being released still acquires the latest page', async () => {
+  const release = deferred()
+  const releasing = deferred()
+  const { collaboration, getCurrentPage } = harness({ client: {
+    releasePageLock: async (_job, page) => {
+      if (page === 1) { releasing.resolve(); await release.promise }
+      return { released: true }
+    },
+  } })
+  await collaboration.enterPage(1)
+  const older = collaboration.enterPage(2)
+  await releasing.promise
+  const newer = collaboration.enterPage(3)
+  release.resolve()
+  assert.deepEqual(await Promise.all([older, newer]), [null, 3])
+  assert.equal(getCurrentPage(), 3)
+  assert.equal(collaboration.activeLock.value.page, 3)
+  await collaboration.release()
+})
+
+test('a rapid return to the origin retains its token and can still save edits', async () => {
+  const acquiring = deferred()
+  const finishAcquire = deferred()
+  const locks = new Map()
+  let sequence = 0
+  const { collaboration, calls, getCurrentPage } = harness({ client: {
+    acquirePageLock: async (_job, page) => {
+      const lock = { page, lockToken: `lease-${++sequence}` }
+      locks.set(page, lock)
+      if (page === 2) { acquiring.resolve(); await finishAcquire.promise }
+      return { lock }
+    },
+    releasePageLock: async (_job, page, _client, token) => {
+      if (locks.get(page)?.lockToken === token) locks.delete(page)
+      return { released: true }
+    },
+    savePage: async (_job, page, _data, _revision, _client, token) => {
+      assert.equal(locks.get(page)?.lockToken, token)
+      calls.push(`save:${page}`)
+      return { reviewRevision: 1 }
+    },
+  } })
+  await collaboration.enterPage(1)
+  const originalToken = collaboration.activeLock.value.lockToken
+  const older = collaboration.enterPage(2)
+  await acquiring.promise
+  const newer = collaboration.enterPage(1)
+  finishAcquire.resolve()
+  assert.deepEqual(await Promise.all([older, newer]), [null, 1])
+  assert.equal(getCurrentPage(), 1)
+  assert.equal(collaboration.activeLock.value.lockToken, originalToken)
+  assert.deepEqual([...locks.keys()], [1])
+  collaboration.markDirty(1)
+  await collaboration.saveCurrentPage()
+  assert.equal(collaboration.dirtyPages.value.size, 0)
+  await collaboration.release()
+})
+
+test('a heartbeat failure for the current lease still blocks editing', async () => {
+  const { collaboration } = harness({ client: {
+    heartbeatPageLock: async () => { throw Object.assign(new Error('lease lost'), { status: 423 }) },
+  } })
+  await collaboration.enterPage(1)
+  await assert.rejects(collaboration.heartbeat(), /lease lost/)
+  assert.equal(collaboration.readOnly.value, true)
+  await collaboration.release()
+})
+
+test('closing the workspace during a lock request cleans up its eventual lease without restarting navigation', async () => {
+  const acquiring = deferred(), finishAcquire = deferred()
+  const released = []
+  const { collaboration } = harness({ client: {
+    acquirePageLock: async (_job, page) => {
+      if (page === 2) { acquiring.resolve(); await finishAcquire.promise }
+      return { lock: { page, lockToken: `token-${page}` } }
+    },
+    releasePageLock: async (_job, page) => { released.push(page); return { released: true } },
+  } })
+  await collaboration.enterPage(1)
+  const navigation = collaboration.enterPage(2)
+  await acquiring.promise
+  collaboration.dispose()
+  finishAcquire.resolve()
+  assert.equal(await navigation, null)
+  assert.equal(collaboration.activeLock.value, null)
+  assert.equal(collaboration.synchronizing.value, false)
+  assert.deepEqual(released.sort(), [1, 2])
+})
+
+test('an older lock-list response cannot restore a released-page indicator', async () => {
+  const resolvers = []
+  const { collaboration } = harness({
+    client: {
+      getPageLocks: async () => new Promise(resolve => { resolvers.push(resolve) }),
+    },
+  })
+
+  const older = collaboration.refreshLocks()
+  const newer = collaboration.refreshLocks()
+  resolvers[1]({ locks: [] })
+  await newer
+  resolvers[0]({ locks: [{ page: 2, clientInstanceId: 'stale-tab', owner: { username: '旧锁' } }] })
+  await older
+
+  assert.deepEqual(collaboration.lockSummaries.value, [])
 })
 
 test('confirmed recovery overwrite saves every dirty page with latest revisions and writes one browser draft', async () => {
